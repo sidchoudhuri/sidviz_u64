@@ -3,37 +3,42 @@
 sidviz_c64.py -- SID/audio waveform visualizer -> C64 via U64 API
 Uses sidviz.prg (from sidviz.asm) running on C64 as display driver.
 
-version 1.0.0 (2026-04-16-1)
+version 1.1.1 (2026-04-17-2)
 
 Memory protocol:
-  $C000 = frame flag  (Python writes 1, ASM clears to 0)
-  $C001 = color flag  (Python writes 1=white, 2=rainbow, ASM applies+clears)
-  $C100 = frame buffer, 1000 bytes PETSCII screen codes
+  $C000     = frame flag  (Python writes 1, ASM clears to 0)
+  $C001     = color flag  (Python writes 1=white, 2=rainbow, ASM applies+clears)
+  $C100     = frame buffer, 920 bytes PETSCII (rows 2-24, $C100-$C497)
+  $C500     = ticker buffer, up to 253 PETSCII chars
+  $C5FE     = ticker length (Python writes)
 
 Usage:
   1. Assemble: 64tass -a -B -o sidviz.prg sidviz.asm
   2. Run: python3 sidviz_c64.py [file]
 """
 
-VERSION = "1.0.0"
-BUILD   = "2026-04-16-1"
+VERSION = "1.1.1"
+BUILD   = "2026-04-17-2"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
-import argparse, threading, termios, tty, re
+import argparse, threading, termios, tty, re, json, select as _select
 
-FIFO_PATH   = "/tmp/sidpipe.wav"
-WIDTH       = 40
-HEIGHT      = 25
-FRAME_BUF   = 0xC100
-FRAME_FLAG  = 0xC000
-COLOR_FLAG  = 0xC001
-PRG_LOCAL   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidviz.prg")
-PRG_REMOTE  = "sidviz.prg"
-TIMEOUT     = 5.0
-CHARS       = [32, 46, 58, 42, 35, 64]
-SID_EXTS    = {".sid"}
-U64         = ""
-FPS         = 10
+FIFO_PATH    = "/tmp/sidpipe.wav"
+WIDTH        = 40
+HEIGHT       = 23              # rows 2-24
+FRAME_BUF    = 0xC100
+FRAME_FLAG   = 0xC000
+COLOR_FLAG   = 0xC001
+TICKER_BUF   = 0xC500
+TICKER_LEN   = 0xC5FE
+TICKER_ROW   = 0x0428          # screen RAM row 1
+PRG_LOCAL    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidviz.prg")
+PRG_REMOTE   = "sidviz.prg"
+TIMEOUT      = 5.0
+CHARS        = [32, 46, 58, 42, 35, 64]
+SID_EXTS     = {".sid"}
+U64          = ""
+FPS          = 10
 
 # ---------------------------------------------------------------------------
 # Args
@@ -55,50 +60,126 @@ def parse_args():
     return p.parse_args()
 
 # ---------------------------------------------------------------------------
-# SID info
+# Metadata
 # ---------------------------------------------------------------------------
 
-def show_sid_info(filepath):
-    """Run sidplayfp -v, parse and display SID metadata."""
+def ascii_to_petscii(s):
+    """Convert ASCII string to C64 PETSCII screen codes (uppercase)."""
+    result = []
+    for ch in s.upper():
+        c = ord(ch)
+        if 64 <= c <= 95:
+            result.append(c - 64)
+        elif 32 <= c <= 63:
+            result.append(c)
+        else:
+            result.append(32)
+    return result
+
+def get_sid_info(filepath):
+    """Run sidplayfp -v, read header, kill immediately, parse metadata."""
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["sidplayfp", "-v", filepath],
-            capture_output=True, text=True, timeout=5
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        output = result.stdout + result.stderr
+        output = ""
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            r, _, _ = _select.select([proc.stdout, proc.stderr], [], [], 0.1)
+            for fd in r:
+                chunk = fd.read(512)
+                if chunk:
+                    output += chunk.decode(errors="replace")
+            if "Song Length" in output:
+                break
+        proc.kill()
+        proc.wait()
     except Exception as e:
-        print(f"[!] Could not get SID info: {e}")
-        return
+        print(f"[!] sidplayfp -v failed: {e}")
+        return {}
 
-    # Fields to extract and their display labels
-    fields = [
-        ("Title",       "Title"),
-        ("Author",      "Author"),
-        ("Released",    "Released"),
-        ("File format", "Format"),
-        ("Playlist",    "Playlist"),
-        ("Song Speed",  "Speed"),
-        ("Song Length", "Length"),
-        ("Addresses",   "Addresses"),
-        ("Condition",   "Condition"),
-    ]
+    info = {}
+    fields = ["Title", "Author", "Released", "File format",
+              "Song Speed", "Song Length", "Addresses", "Condition"]
+    for field in fields:
+        pattern = rf"\|\s*{re.escape(field)}\s*:\s*(.+?)(?:\s*\|)?\s*$"
+        for line in output.splitlines():
+            m = re.search(pattern, line)
+            if m:
+                info[field] = m.group(1).strip()
+                break
+    return info
 
+def get_audio_info(filepath):
+    """Use ffprobe to extract metadata from audio files."""
+    try:
+        r = subprocess.run([
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", filepath
+        ], capture_output=True, text=True, timeout=5)
+        data = json.loads(r.stdout)
+        fmt  = data.get("format", {})
+        tags = fmt.get("tags", {})
+        info = {}
+        tag_map = {"title": "Title", "artist": "Artist", "album": "Album",
+                   "date": "Date", "genre": "Genre"}
+        for k, v in tags.items():
+            mapped = tag_map.get(k.lower())
+            if mapped:
+                info[mapped] = v
+        dur = float(fmt.get("duration", 0))
+        if dur:
+            m, s = divmod(int(dur), 60)
+            info["Duration"] = f"{m}:{s:02d}"
+        br = int(fmt.get("bit_rate", 0))
+        if br:
+            info["Bitrate"] = f"{br // 1000} kbps"
+        fname = fmt.get("format_long_name", "")
+        if fname:
+            info["Format"] = fname
+        return info
+    except Exception:
+        return {}
+
+def build_ticker_string(info, mode):
+    """Build scrolling ticker — values only, no labels, separated by *."""
+    if mode == "sid":
+        order = ["Title", "Author", "Released", "Song Speed",
+                 "Song Length", "File format", "Addresses"]
+    else:
+        order = ["Title", "Artist", "Album", "Date",
+                 "Genre", "Duration", "Bitrate", "Format"]
+
+    parts = [info[k] for k in order if k in info]
+    if not parts:
+        parts = [os.path.basename(info.get("filename", "UNKNOWN"))]
+
+    ticker = "   *   ".join(parts) + "        "
+    # Cap at 253 chars (ticker_buf is $C500-$C5FC, 253 bytes safe)
+    if len(ticker) > 253:
+        ticker = ticker[:253]
+    return ticker
+
+def show_info_header(info, mode, filepath):
     width = 54
     print("+" + "-" * width + "+")
     print(f"|  sidviz_c64  v{VERSION}  build {BUILD}".ljust(width + 1) + "|")
     print("+" + "-" * width + "+")
-
-    for key, label in fields:
-        # Match "| Key   : Value  |" or "| Key   : Value"
-        pattern = rf"\|\s*{re.escape(key)}\s*:\s*(.+?)(?:\s*\|)?\s*$"
-        for line in output.splitlines():
-            m = re.search(pattern, line)
-            if m:
-                value = m.group(1).strip()
-                row = f"  {label:<12} {value}"
-                print(f"|{row:<{width}}|")
-                break
-
+    print(f"|  File: {os.path.basename(filepath)}".ljust(width + 1) + "|")
+    if mode == "sid":
+        show_fields = [("Title", "Title"), ("Author", "Author"),
+                       ("Released", "Released"), ("Song Speed", "Speed"),
+                       ("Song Length", "Length"), ("File format", "Format"),
+                       ("Addresses", "Addresses")]
+    else:
+        show_fields = [("Title", "Title"), ("Artist", "Artist"),
+                       ("Album", "Album"), ("Date", "Date"),
+                       ("Genre", "Genre"), ("Duration", "Duration"),
+                       ("Bitrate", "Bitrate"), ("Format", "Format")]
+    for key, label in show_fields:
+        if key in info:
+            print(f"|  {label:<12} {info[key]}".ljust(width + 1) + "|")
     print("+" + "-" * width + "+")
     print()
 
@@ -153,6 +234,13 @@ def smoke_test():
     if r:
         print(f"[*] U64 OK: {r.decode(errors='replace').strip()}"); return True
     print("[!] U64 not responding."); return False
+
+def send_ticker(ticker_str):
+    petscii = ascii_to_petscii(ticker_str)
+    length  = len(petscii)
+    print(f"[*] Ticker: {length} chars")
+    write_mem(TICKER_BUF, petscii)
+    write_byte(TICKER_LEN, length)
 
 # ---------------------------------------------------------------------------
 # Audio mode detection
@@ -275,13 +363,14 @@ def main():
 
     mode = detect_mode(filepath, force_sid=args.sid, force_audio=args.audio)
 
-    # Show SID metadata before doing anything else
-    if mode == "sid":
-        show_sid_info(filepath)
+    # Get and display metadata
+    info = get_sid_info(filepath) if mode == "sid" else get_audio_info(filepath)
+    show_info_header(info, mode, filepath)
+    ticker_str = build_ticker_string(info, mode)
 
     if not os.path.isfile(PRG_LOCAL):
         print(f"[!] sidviz.prg not found at {PRG_LOCAL}")
-        print(f"    Build it: 64tass -a -B -o sidviz.prg sidviz.asm")
+        print(f"    Build: 64tass -a -B -o sidviz.prg sidviz.asm")
         sys.exit(1)
     print(f"[*] sidviz.prg: {os.path.getsize(PRG_LOCAL)} bytes")
 
@@ -297,9 +386,14 @@ def main():
     if not run_prg_from_temp(PRG_REMOTE): sys.exit(1)
     time.sleep(1.0)
 
+    # Set color mode
     if not rainbow:
         write_byte(COLOR_FLAG, 1)
 
+    # Send ticker to C64
+    send_ticker(ticker_str)
+
+    # Start processes
     sid_audio_proc = None
     procs = []
 
@@ -324,7 +418,7 @@ def main():
 
     try:
         while not state["quit"]:
-            # Stop as soon as sidplayfp audio finishes
+            # Stop when sidplayfp audio finishes
             if sid_audio_proc is not None and sid_audio_proc.poll() is not None:
                 print("\n[*] Song ended.")
                 break
@@ -352,6 +446,15 @@ def main():
         for p in procs:
             try: p.terminate()
             except: pass
+        # Clean up display
+        write_byte(FRAME_FLAG, 0)
+        write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
+        # Restore original IRQ vector to stop ticker
+        orig = u64_get("machine:readmem?address=F9&length=2")
+        if orig and len(orig) == 2:
+            u64_put("machine:writemem", {"address": "314",
+                                          "data": f"{orig[0]:02X}{orig[1]:02X}"})
+        write_mem(TICKER_ROW, [0x20] * 40)
         try: os.remove(FIFO_PATH)
         except: pass
         print("[*] Done.")

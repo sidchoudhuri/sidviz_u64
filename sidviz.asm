@@ -2,7 +2,7 @@
 ; 64tass assembler
 ; autostart SYS 2064
 ;
-; version 1.1.1 (2026-04-17-2)
+; version 1.2.0 (2026-04-17-3)
 ;
 ; Memory map:
 ;   $C000     = frame ready flag  (Python writes 1, ASM clears to 0)
@@ -58,6 +58,7 @@ wave_col    = $d850     ; row 2 color RAM
 
 frame_flag  = $c000
 color_flag  = $c001
+color_mode  = $c5fc     ; current mode: 0=rainbow, 1=density white (ASM owns)
 frame_buf   = $c100     ; 920 bytes, occupies $C100-$C497
 
 ticker_buf  = $c500     ; up to 253 PETSCII chars
@@ -95,6 +96,7 @@ init:
         ; Clear comms flags
         sta frame_flag
         sta color_flag
+        sta color_mode
         sta ticker_pos
 
         ; Init IRQ tick counter
@@ -140,9 +142,15 @@ main_loop:
         cmp #$01
         bne do_rainbow
         jsr fill_color_white
-        jmp clr_cflag
+        jmp do_white_mode
 do_rainbow:
         jsr fill_color_rainbow
+        lda #$00
+        sta color_mode          ; mode = rainbow
+        jmp clr_cflag
+do_white_mode:
+        lda #$01
+        sta color_mode          ; mode = density white
 clr_cflag:
         lda #$00
         sta color_flag
@@ -151,6 +159,9 @@ check_frame:
         lda frame_flag
         beq main_loop
         jsr copy_frame
+        lda color_mode
+        beq main_loop           ; 0=rainbow, skip density pass
+        jsr density_colors      ; 1=white mode, apply density colors
         jmp main_loop
 
 ; ---------------------------------------------------------------------------
@@ -378,6 +389,70 @@ fr0_lp: sta (dst_lo),y
         iny
         cpy #40
         bne fr0_lp
+        rts
+
+; ---------------------------------------------------------------------------
+; density_colors: map screen chars in wave area to density-based colors
+; char -> color: space=$20->0(blk), .=$2E->11, :=$3A->12, *=$2A->15, #=$23->1, @=$40->1
+; Reads $0450-$07E7, writes $D850-$DBE7 (920 bytes)
+; ---------------------------------------------------------------------------
+
+density_colors:
+        lda #<wave_scr
+        sta src_lo
+        lda #>wave_scr
+        sta src_hi
+        lda #<wave_col
+        sta dst_lo
+        lda #>wave_col
+        sta dst_hi
+
+        ldx #3
+dc_pg:  ldy #0
+dc_lp:  lda (src_lo),y
+        jsr char_to_color
+        sta (dst_lo),y
+        iny
+        bne dc_lp
+        inc src_hi
+        inc dst_hi
+        dex
+        bne dc_pg
+
+        ldy #0
+dc_rm:  lda (src_lo),y
+        jsr char_to_color
+        sta (dst_lo),y
+        iny
+        cpy #152
+        bne dc_rm
+        rts
+
+; char_to_color: A=screen char in, A=color out
+; space($20)->0, .($2E)->11, :($3A)->12, *($2A)->15, #($23)->1, @($40)->1
+char_to_color:
+        cmp #$20
+        beq ctc_black
+        cmp #$2e
+        beq ctc_dkgray
+        cmp #$3a
+        beq ctc_mdgray
+        cmp #$2a
+        beq ctc_ltgray
+        ; default (#=$23, @=$40, anything else) -> white
+        lda #1
+        rts
+ctc_black:
+        lda #0
+        rts
+ctc_dkgray:
+        lda #11
+        rts
+ctc_mdgray:
+        lda #12
+        rts
+ctc_ltgray:
+        lda #15
         rts
 
 ; ---------------------------------------------------------------------------

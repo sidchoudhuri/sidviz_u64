@@ -3,7 +3,7 @@
 sidviz_c64.py -- SID/audio waveform visualizer -> C64 via U64 API
 Uses sidviz.prg (from sidviz.asm) running on C64 as display driver.
 
-version 1.1.1 (2026-04-17-2)
+version 1.2.0 (2026-04-17-3)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -17,8 +17,8 @@ Usage:
   2. Run: python3 sidviz_c64.py [file]
 """
 
-VERSION = "1.1.1"
-BUILD   = "2026-04-17-2"
+VERSION = "1.2.0"
+BUILD   = "2026-04-17-3"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, termios, tty, re, json, select as _select
@@ -276,7 +276,8 @@ def start_ffmpeg_waveform_fifo():
     print("[*] ffmpeg waveform (FIFO) started."); return p
 
 def start_ffmpeg_waveform_file(filepath):
-    cmd = ["ffmpeg", "-loglevel", "quiet", "-i", filepath,
+    cmd = ["ffmpeg", "-loglevel", "quiet",
+           "-i", filepath,
            "-filter_complex",
            f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
@@ -332,6 +333,12 @@ def make_keypress_listener(state):
 
 def pixel_to_char(val):
     return CHARS[val * (len(CHARS) - 1) // 255]
+
+# ---------------------------------------------------------------------------
+# Frame reader thread — continuously drains ffmpeg pipe, keeps only latest
+# ---------------------------------------------------------------------------
+
+# (frame reader removed - using direct blocking read with process poll for sync)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -395,6 +402,7 @@ def main():
 
     # Start processes
     sid_audio_proc = None
+    ffplay_proc    = None
     procs = []
 
     if mode == "sid":
@@ -406,20 +414,25 @@ def main():
         procs = [sid_fifo_proc, sid_audio_proc, ffmpeg_proc]
     else:
         ffmpeg_proc = start_ffmpeg_waveform_file(filepath)
-        procs = [start_ffplay_audio(filepath), ffmpeg_proc]
+        ffplay_proc = start_ffplay_audio(filepath)
+        procs = [ffplay_proc, ffmpeg_proc]
+
+    frame_size = WIDTH * HEIGHT
 
     state   = {"rainbow": rainbow, "color_pending": False, "quit": False}
     kthread = make_keypress_listener(state)
     kthread.start()
 
-    frame_size = WIDTH * HEIGHT
     frame_num  = 0
     print(f"[*] Streaming to C64 at {FPS}fps -- [c] color, [q] quit\n")
 
     try:
         while not state["quit"]:
-            # Stop when sidplayfp audio finishes
+            # Stop when audio process finishes (song ended)
             if sid_audio_proc is not None and sid_audio_proc.poll() is not None:
+                print("\n[*] Song ended.")
+                break
+            if ffplay_proc is not None and ffplay_proc.poll() is not None:
                 print("\n[*] Song ended.")
                 break
 
@@ -427,6 +440,7 @@ def main():
                 state["color_pending"] = False
                 write_byte(COLOR_FLAG, 2 if state["rainbow"] else 1)
 
+            # Simple blocking read - ffmpeg produces frames at FPS rate
             raw = ffmpeg_proc.stdout.read(frame_size)
             if len(raw) < frame_size:
                 print("\n[*] Stream ended."); break

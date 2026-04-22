@@ -1,34 +1,42 @@
 #!/usr/bin/env python3
 """
 sidviz_c64.py -- SID/audio waveform visualizer -> C64 via U64 API
-Uses sidviz.prg (from sidviz.asm) running on C64 as display driver.
+Experimental fork: plays SID audio on real C64 hardware via PSID player.
 
-version 1.2.0 (2026-04-17-3)
+version 1.4.0-exp (2026-04-17-exp2)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
-  $C001     = color flag  (Python writes 1=white, 2=rainbow, ASM applies+clears)
-  $C100     = frame buffer, 920 bytes PETSCII (rows 2-24, $C100-$C497)
+  $C001     = color flag  (2=rainbow, 1=white density, 3=fire density)
+  $C002     = sid_ready   (Python sets 1 after uploading SID code)
+  $C003     = sid_play_flag (IRQ sets 1, main loop calls play and clears)
+  $C100     = frame buffer, 680 bytes PETSCII (rows 8-24, $C100-$C3A7)
   $C500     = ticker buffer, up to 253 PETSCII chars
+  $C5FC     = color_mode  (ASM owns: 0=rainbow, 1=white, 2=fire)
+  $C5FD     = irq_tick    (ASM owns)
   $C5FE     = ticker length (Python writes)
+  $C5FF     = ticker read position (ASM owns)
+  $C600     = JMP initAddress trampoline (Python writes)
+  $C610     = JMP playAddress trampoline (Python writes)
 
 Usage:
   1. Assemble: 64tass -a -B -o sidviz.prg sidviz.asm
   2. Run: python3 sidviz_c64.py [file]
 """
 
-VERSION = "1.2.0"
-BUILD   = "2026-04-17-3"
+VERSION = "1.4.0-exp"
+BUILD   = "2026-04-17-exp2"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
-import argparse, threading, termios, tty, re, json, select as _select
+import argparse, threading, termios, tty, re, json, select as _select, struct
 
 FIFO_PATH    = "/tmp/sidpipe.wav"
 WIDTH        = 40
-HEIGHT       = 23              # rows 2-24
+HEIGHT       = 17              # rows 8-24 — protects SID driver at $0400-$04FF
 FRAME_BUF    = 0xC100
 FRAME_FLAG   = 0xC000
 COLOR_FLAG   = 0xC001
+C64_AUDIO_FLAG = 0xC002  # 0=off, 1=waiting, 2=SID ready
 TICKER_BUF   = 0xC500
 TICKER_LEN   = 0xC5FE
 TICKER_ROW   = 0x0428          # screen RAM row 1
@@ -55,6 +63,8 @@ def parse_args():
     p.add_argument("--no-color", action="store_true",    help="Start with flat white")
     p.add_argument("--sid",      action="store_true",    help="Force sidplayfp mode")
     p.add_argument("--audio",    action="store_true",    help="Force ffmpeg audio mode")
+    p.add_argument("--c64audio", action="store_true",    help="Play SID audio on C64 hardware")
+    p.add_argument("--macaudio", action="store_true",    help="Play SID audio on Mac (default)")
     p.add_argument("--fps",      type=int, default=10,   help="Frame rate (default 10)")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
@@ -156,7 +166,6 @@ def build_ticker_string(info, mode):
         parts = [os.path.basename(info.get("filename", "UNKNOWN"))]
 
     ticker = "   *   ".join(parts) + "        "
-    # Cap at 253 chars (ticker_buf is $C500-$C5FC, 253 bytes safe)
     if len(ticker) > 253:
         ticker = ticker[:253]
     return ticker
@@ -272,7 +281,7 @@ def start_ffmpeg_waveform_fifo():
            "-filter_complex",
            f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     print("[*] ffmpeg waveform (FIFO) started."); return p
 
 def start_ffmpeg_waveform_file(filepath):
@@ -281,24 +290,112 @@ def start_ffmpeg_waveform_file(filepath):
            "-filter_complex",
            f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     print("[*] ffmpeg waveform (file) started."); return p
 
 def start_ffplay_audio(filepath):
     p = subprocess.Popen(
         ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", filepath],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("[*] ffplay audio started."); return p
 
-def start_sidplayfp_fifo(filepath):
-    p = subprocess.Popen(["sidplayfp", f"-w{FIFO_PATH}", filepath],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def start_sidplayfp_fifo(filepath, duration_secs=None):
+    cmd = ["sidplayfp"]
+    if duration_secs:
+        cmd += [f"-t{duration_secs}"]
+    cmd += [f"-w{FIFO_PATH}", filepath]
+    print(f"[*] sidplayfp FIFO cmd: {' '.join(cmd)}")
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("[*] sidplayfp -> FIFO started."); return p
 
-def start_sidplayfp_audio(filepath):
-    p = subprocess.Popen(["sidplayfp", filepath],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def start_sidplayfp_audio(filepath, duration_secs=None):
+    cmd = ["sidplayfp"]
+    if duration_secs:
+        cmd += [f"-t{duration_secs}"]
+    cmd += [filepath]
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("[*] sidplayfp -> audio started."); return p
+
+# ---------------------------------------------------------------------------
+# PSID parser and C64 audio uploader (EXP)
+# ---------------------------------------------------------------------------
+
+def parse_psid(filepath):
+    """Parse PSID/RSID header, return dict with load/init/play addresses and data."""
+    with open(filepath, "rb") as f:
+        raw = f.read()
+
+    magic = raw[0:4]
+    if magic not in (b"PSID", b"RSID"):
+        print(f"[!] Not a PSID/RSID file (magic: {magic})")
+        return None
+
+    data_offset = struct.unpack_from(">H", raw, 6)[0]
+    load_addr   = struct.unpack_from(">H", raw, 8)[0]
+    init_addr   = struct.unpack_from(">H", raw, 10)[0]
+    play_addr   = struct.unpack_from(">H", raw, 12)[0]
+    sid_data    = raw[data_offset:]
+
+    # Read title from header to confirm we're parsing the right file
+    title = raw[0x16:0x36].rstrip(b"\x00").decode(errors="replace")
+    author = raw[0x36:0x56].rstrip(b"\x00").decode(errors="replace")
+    print(f"[*] PSID title: {title!r}  author: {author!r}")
+
+    # If load_addr is 0, first 2 bytes of data are the load address (little-endian)
+    if load_addr == 0:
+        load_addr = struct.unpack_from("<H", sid_data, 0)[0]
+        sid_data  = sid_data[2:]
+
+    print(f"[*] PSID: load=${load_addr:04X} init=${init_addr:04X} play=${play_addr:04X} size={len(sid_data)} bytes")
+
+    if play_addr == 0:
+        print(f"[*] play_addr=0 — SID installs play via IRQ vector during init")
+        print(f"[*] Python will read $0314/$0315 after init to get real play address")
+
+    if load_addr <= 0x07E7 and (load_addr + len(sid_data)) >= 0x0400:
+        print(f"[!] PSID driver overlaps screen RAM ($0400-$07E7) — rows 0-7 may show driver artifacts")
+
+    return {"load_addr": load_addr, "init_addr": init_addr,
+            "play_addr": play_addr, "data": sid_data}
+
+def upload_sid_to_c64(psid):
+    """Upload PSID code to C64 RAM, write trampolines, signal PRG to proceed."""
+    load_addr = psid["load_addr"]
+    init_addr = psid["init_addr"]
+    play_addr = psid["play_addr"]
+    data      = psid["data"]
+
+    print(f"[*] Uploading SID code ({len(data)} bytes) to ${load_addr:04X}...")
+    write_mem(load_addr, data)
+
+    # JMP initAddress trampoline at $C600 ($4C = JMP absolute opcode)
+    print(f"[*] Writing init trampoline at $C600 -> ${init_addr:04X}...")
+    write_mem(0xC600, [0x4C, init_addr & 0xFF, (init_addr >> 8) & 0xFF])
+
+    if play_addr != 0:
+        # JMP playAddress trampoline at $C610
+        print(f"[*] Writing play trampoline at $C610 -> ${play_addr:04X}...")
+        write_mem(0xC610, [0x4C, play_addr & 0xFF, (play_addr >> 8) & 0xFF])
+        # Signal PRG: $02 = SID ready, call init then play via $C610
+        write_byte(C64_AUDIO_FLAG, 2)
+        print(f"[*] SID uploaded and patched — signalling PRG ($C002=2).")
+    else:
+        # play_addr == 0: SID installs its play address into $0314/$0315 during init
+        # Write RTS at $C610 as placeholder — safe no-op until we patch the real address
+        write_mem(0xC610, [0x60])  # RTS placeholder
+        # Signal PRG: $02 = SID ready, call init
+        write_byte(C64_AUDIO_FLAG, 2)
+        print(f"[*] SID uploaded — signalling PRG to run init (play_addr=0, $C002=2)...")
+        # Give PRG time to call init, which installs real play addr into $0314/$0315
+        time.sleep(0.3)
+        # Read back the real play address from $0314/$0315
+        vec = u64_get("machine:readmem?address=314&length=2")
+        if vec and len(vec) == 2:
+            real_play = vec[0] | (vec[1] << 8)
+            print(f"[*] SID installed play address: ${real_play:04X} — patching $C610...")
+            write_mem(0xC610, [0x4C, real_play & 0xFF, (real_play >> 8) & 0xFF])
+        else:
+            print(f"[!] Could not read $0314 — play may not work")
 
 # ---------------------------------------------------------------------------
 # Keypress toggle
@@ -308,16 +405,18 @@ def make_keypress_listener(state):
     def _listen():
         fd  = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
+        state["_term_fd"]  = fd
+        state["_term_old"] = old
         try:
             tty.setraw(fd)
             while not state["quit"]:
                 ch = sys.stdin.read(1)
                 if not ch: break
                 if ch in ("c", "C"):
-                    state["rainbow"]       = not state["rainbow"]
+                    state["color_mode"]    = (state["color_mode"] + 1) % 3
                     state["color_pending"] = True
-                    label = "rainbow" if state["rainbow"] else "white"
-                    sys.stdout.write(f"\n[*] Color -> {label}\n")
+                    label = ["rainbow", "white", "fire"][state["color_mode"]]
+                    sys.stdout.write(f"\r\n[*] Color -> {label}\r\n")
                     sys.stdout.flush()
                 elif ch in ("q", "Q", "\x03"):
                     state["quit"] = True
@@ -333,12 +432,6 @@ def make_keypress_listener(state):
 
 def pixel_to_char(val):
     return CHARS[val * (len(CHARS) - 1) // 255]
-
-# ---------------------------------------------------------------------------
-# Frame reader thread — continuously drains ffmpeg pipe, keeps only latest
-# ---------------------------------------------------------------------------
-
-# (frame reader removed - using direct blocking read with process poll for sync)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -362,13 +455,25 @@ def main():
     U64 = f"http://{args.ip}"
     FPS = args.fps
 
-    if args.color:      rainbow = True
-    elif args.no_color: rainbow = False
+    if args.color:      color_mode_init = 0
+    elif args.no_color: color_mode_init = 1
     else:
-        ans     = input("Rainbow color? [Y/n]: ").strip().lower()
-        rainbow = ans not in ("n", "no")
+        ans = input("Color mode? [0=rainbow, 1=white, 2=fire] (default 0): ").strip()
+        color_mode_init = int(ans) if ans in ("0","1","2") else 0
 
     mode = detect_mode(filepath, force_sid=args.sid, force_audio=args.audio)
+
+    # Determine audio destination for SID files only
+    c64_audio = False
+    if mode == "sid":
+        if args.c64audio:
+            c64_audio = True
+        elif args.macaudio:
+            c64_audio = False
+        else:
+            ans = input("Audio output? [m=Mac (default), c=C64]: ").strip().lower()
+            c64_audio = ans in ("c", "c64")
+        print(f"[*] SID audio: {'C64 hardware (PSID player)' if c64_audio else 'Mac (sidplayfp)'}")
 
     # Get and display metadata
     info = get_sid_info(filepath) if mode == "sid" else get_audio_info(filepath)
@@ -376,10 +481,10 @@ def main():
     ticker_str = build_ticker_string(info, mode)
 
     if not os.path.isfile(PRG_LOCAL):
-        print(f"[!] sidviz.prg not found at {PRG_LOCAL}")
+        print(f"[!] {PRG_REMOTE} not found at {PRG_LOCAL}")
         print(f"    Build: 64tass -a -B -o sidviz.prg sidviz.asm")
         sys.exit(1)
-    print(f"[*] sidviz.prg: {os.path.getsize(PRG_LOCAL)} bytes")
+    print(f"[*] {PRG_REMOTE}: {os.path.getsize(PRG_LOCAL)} bytes")
 
     if not smoke_test(): sys.exit(1)
 
@@ -387,74 +492,123 @@ def main():
     u64_put("machine:reboot")
     time.sleep(4.0)
 
-    print("[*] Uploading sidviz.prg...")
+    print(f"[*] Uploading {PRG_REMOTE}...")
     if not ftp_upload(PRG_LOCAL, PRG_REMOTE): sys.exit(1)
-    print("[*] Running sidviz.prg...")
-    if not run_prg_from_temp(PRG_REMOTE): sys.exit(1)
-    time.sleep(1.0)
 
-    # Set color mode
-    if not rainbow:
-        write_byte(COLOR_FLAG, 1)
-
-    # Send ticker to C64
-    send_ticker(ticker_str)
-
-    # Start processes
-    sid_audio_proc = None
-    ffplay_proc    = None
-    procs = []
+    # For C64 audio: parse PSID before running PRG so we're ready to upload immediately
+    sid_audio_proc    = None
+    ffplay_proc       = None
+    sid_duration_secs = None
+    psid              = None
+    procs             = []
 
     if mode == "sid":
+        raw_len = info.get("Song Length", "")
+        if raw_len:
+            try:
+                parts = raw_len.split(".")[0].split(":")
+                sid_duration_secs = int(parts[0]) * 60 + int(parts[1])
+                print(f"[*] SID duration: {raw_len} = {sid_duration_secs}s")
+            except Exception:
+                pass
+
+        if c64_audio:
+            psid = parse_psid(filepath)
+            if not psid:
+                print("[!] PSID parse failed, falling back to Mac audio")
+                c64_audio = False
+
+    # Run PRG — PRG clears $C002 in init, so no stale values from previous runs
+    print(f"[*] Running {PRG_REMOTE}...")
+    if not run_prg_from_temp(PRG_REMOTE): sys.exit(1)
+    # If C64 audio: write $C002=$01 IMMEDIATELY after run_prg_from_temp
+    # PRG clears $C002 at start of init, then spends ~300ms on display setup
+    # before checking it — plenty of time for us to set it
+    # Mac/MP3 modes: never write $C002, it stays $00 after PRG clears it
+    if c64_audio:
+        print("[*] Signalling C64 audio mode to PRG ($C002=1)...")
+        write_byte(C64_AUDIO_FLAG, 1)
+
+    time.sleep(1.0)  # wait for PRG to finish init
+
+    # Force PAL 50Hz CIA1 timer A — only needed in C64 audio mode
+    # where the SID play routine expects PAL timing.
+    # For Mac/MP3 modes the KERNAL timer is already correct.
+    if c64_audio:
+        print("[*] Setting CIA1 timer for PAL 50Hz...")
+        write_mem(0xDC04, [0xF8, 0x4C])   # timer A latch lo=$F8, hi=$4C
+        write_byte(0xDC0E, 0x11)           # start timer A continuous, force reload
+
+    # Send initial color mode and ticker
+    _cflag_map = {0: 2, 1: 1, 2: 3}
+    write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
+    send_ticker(ticker_str)
+
+    # Start audio/waveform processes
+    if mode == "sid":
         make_fifo(FIFO_PATH)
-        ffmpeg_proc    = start_ffmpeg_waveform_fifo()
+        ffmpeg_proc   = start_ffmpeg_waveform_fifo()
         time.sleep(0.3)
-        sid_fifo_proc  = start_sidplayfp_fifo(filepath)
-        sid_audio_proc = start_sidplayfp_audio(filepath)
-        procs = [sid_fifo_proc, sid_audio_proc, ffmpeg_proc]
+        sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
+
+        if c64_audio:
+            # Upload SID code + write trampolines + write $C002=$02 to release PRG
+            upload_sid_to_c64(psid)
+            procs = [sid_fifo_proc, ffmpeg_proc]
+        else:
+            # Mac audio — $C002 stays $00, PRG already in main loop
+            sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
+            procs = [sid_fifo_proc, sid_audio_proc, ffmpeg_proc]
     else:
+        # MP3/audio mode — $C002 stays $00, PRG already in main loop
         ffmpeg_proc = start_ffmpeg_waveform_file(filepath)
         ffplay_proc = start_ffplay_audio(filepath)
         procs = [ffplay_proc, ffmpeg_proc]
 
-    frame_size = WIDTH * HEIGHT
-
-    state   = {"rainbow": rainbow, "color_pending": False, "quit": False}
-    kthread = make_keypress_listener(state)
+    frame_size   = WIDTH * HEIGHT
+    sid_end_time = (time.time() + sid_duration_secs) if mode == "sid" and sid_duration_secs else None
+    state        = {"color_mode": color_mode_init, "color_pending": False, "quit": False}
+    kthread      = make_keypress_listener(state)
     kthread.start()
 
-    frame_num  = 0
+    frame_num = 0
     print(f"[*] Streaming to C64 at {FPS}fps -- [c] color, [q] quit\n")
 
     try:
         while not state["quit"]:
-            # Stop when audio process finishes (song ended)
+            # Stop when audio process finishes
             if sid_audio_proc is not None and sid_audio_proc.poll() is not None:
-                print("\n[*] Song ended.")
-                break
+                print("\r\n[*] Song ended."); break
             if ffplay_proc is not None and ffplay_proc.poll() is not None:
-                print("\n[*] Song ended.")
-                break
+                print("\r\n[*] Song ended."); break
+            # Stop at parsed song duration (wall clock override for SONGLENGTHS cutoff)
+            if sid_end_time is not None and time.time() >= sid_end_time:
+                print("\r\n[*] Song ended."); break
 
             if state["color_pending"]:
                 state["color_pending"] = False
-                write_byte(COLOR_FLAG, 2 if state["rainbow"] else 1)
+                write_byte(COLOR_FLAG, _cflag_map[state["color_mode"]])
 
-            # Simple blocking read - ffmpeg produces frames at FPS rate
+            # Check if data available before blocking read (allows q to work)
+            ready, _, _ = _select.select([ffmpeg_proc.stdout], [], [], 0.5)
+            if not ready:
+                continue
+
+            # Blocking read — ffmpeg throttles to FPS naturally via FIFO or file rate
             raw = ffmpeg_proc.stdout.read(frame_size)
             if len(raw) < frame_size:
-                print("\n[*] Stream ended."); break
+                print("\r\n[*] Stream ended."); break
 
             screen = bytes(pixel_to_char(p) for p in raw)
             write_mem(FRAME_BUF, screen)
             write_byte(FRAME_FLAG, 1)
 
             frame_num += 1
-            ind = "R" if state["rainbow"] else "W"
+            ind = ["R","W","F"][state["color_mode"]]
             print(f"\r[*] Frame {frame_num:05d} [{ind}]", end="", flush=True)
 
     except KeyboardInterrupt:
-        print("\n[*] Interrupted.")
+        print("\r\n[*] Interrupted.")
     finally:
         state["quit"] = True
         for p in procs:
@@ -463,7 +617,7 @@ def main():
         # Clean up display
         write_byte(FRAME_FLAG, 0)
         write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
-        # Restore original IRQ vector to stop ticker
+        # Restore original IRQ vector (saved at $F9/$FA by PRG) to stop ticker
         orig = u64_get("machine:readmem?address=F9&length=2")
         if orig and len(orig) == 2:
             u64_put("machine:writemem", {"address": "314",
@@ -471,6 +625,12 @@ def main():
         write_mem(TICKER_ROW, [0x20] * 40)
         try: os.remove(FIFO_PATH)
         except: pass
+        # Restore terminal
+        if "_term_fd" in state and "_term_old" in state:
+            try:
+                termios.tcsetattr(state["_term_fd"], termios.TCSADRAIN, state["_term_old"])
+            except Exception:
+                pass
         print("[*] Done.")
 
 if __name__ == "__main__":

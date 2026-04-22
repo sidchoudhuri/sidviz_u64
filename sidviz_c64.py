@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sidviz_c64_exp.py -- SID/audio waveform visualizer -> C64 via U64 API
+sidviz_c64.py -- SID/audio waveform visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 
 version 1.4.0-exp (2026-04-17-exp2)
@@ -20,8 +20,8 @@ Memory protocol:
   $C610     = JMP playAddress trampoline (Python writes)
 
 Usage:
-  1. Assemble: 64tass -a -B -o sidviz_exp.prg sidviz_exp.asm
-  2. Run: python3 sidviz_c64_exp.py [file]
+  1. Assemble: 64tass -a -B -o sidviz.prg sidviz.asm
+  2. Run: python3 sidviz_c64.py [file]
 """
 
 VERSION = "1.4.0-exp"
@@ -40,8 +40,8 @@ C64_AUDIO_FLAG = 0xC002  # 0=off, 1=waiting, 2=SID ready
 TICKER_BUF   = 0xC500
 TICKER_LEN   = 0xC5FE
 TICKER_ROW   = 0x0428          # screen RAM row 1
-PRG_LOCAL    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidviz_exp.prg")
-PRG_REMOTE   = "sidviz_exp.prg"
+PRG_LOCAL    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidviz.prg")
+PRG_REMOTE   = "sidviz.prg"
 TIMEOUT      = 5.0
 CHARS        = [32, 46, 58, 42, 35, 64]
 SID_EXTS     = {".sid"}
@@ -54,7 +54,7 @@ FPS          = 10
 
 def parse_args():
     p = argparse.ArgumentParser(
-        prog="sidviz_c64_exp",
+        prog="sidviz_c64",
         description=f"SID/audio waveform visualizer for C64 via U64 API  v{VERSION} build {BUILD}"
     )
     p.add_argument("file",       nargs="?",              help="Audio/SID file")
@@ -173,7 +173,7 @@ def build_ticker_string(info, mode):
 def show_info_header(info, mode, filepath):
     width = 54
     print("+" + "-" * width + "+")
-    print(f"|  sidviz_c64_exp  v{VERSION}  build {BUILD}".ljust(width + 1) + "|")
+    print(f"|  sidviz_c64  v{VERSION}  build {BUILD}".ljust(width + 1) + "|")
     print("+" + "-" * width + "+")
     print(f"|  File: {os.path.basename(filepath)}".ljust(width + 1) + "|")
     if mode == "sid":
@@ -443,7 +443,7 @@ def main():
     args = parse_args()
 
     if args.version:
-        print(f"sidviz_c64_exp  v{VERSION}  build {BUILD}")
+        print(f"sidviz_c64  v{VERSION}  build {BUILD}")
         sys.exit(0)
 
     filepath = os.path.expanduser(args.file) if args.file else \
@@ -482,7 +482,7 @@ def main():
 
     if not os.path.isfile(PRG_LOCAL):
         print(f"[!] {PRG_REMOTE} not found at {PRG_LOCAL}")
-        print(f"    Build: 64tass -a -B -o sidviz_exp.prg sidviz_exp.asm")
+        print(f"    Build: 64tass -a -B -o sidviz.prg sidviz.asm")
         sys.exit(1)
     print(f"[*] {PRG_REMOTE}: {os.path.getsize(PRG_LOCAL)} bytes")
 

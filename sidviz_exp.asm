@@ -2,25 +2,29 @@
 ; 64tass assembler
 ; autostart SYS 2064
 ;
-; version 1.4.0-exp (2026-04-17-exp1)
+; version 1.4.0-exp (2026-04-17-exp3)
 ;
-; EXPERIMENTAL: built-in PSID player
-; Python parses PSID header, uploads SID code via writemem,
-; patches sid_init_lo/hi and sid_play_lo/hi before running this PRG.
+; Single PRG handles all modes via $C002 flag:
+;   $C002 = $00  Mac/MP3 mode   — no SID player, normal display
+;   $C002 = $01  C64 audio      — Python is uploading SID, wait
+;   $C002 = $02  C64 audio      — SID uploaded, call init + enable play
 ;
 ; Memory map:
-;   $C000     = frame ready flag  (Python writes 1, ASM clears to 0)
-;   $C001     = color toggle flag (2=rainbow, 1=white, 3=fire)
-;   $C100     = frame buffer, 920 bytes PETSCII (rows 2-24)
-;   $C500     = ticker buffer, up to 253 PETSCII chars
-;   $C5FD     = irq_tick counter
-;   $C5FE     = ticker length
-;   $C5FF     = ticker read position
-;   $C5FC     = color_mode (0=rainbow, 1=white, 2=fire)
+;   $C000     = frame flag      (Python writes 1, ASM clears to 0)
+;   $C001     = color flag      (2=rainbow, 1=white density, 3=fire density)
+;   $C002     = c64_audio_flag  (0=off, 1=wait, 2=ready — Python controls)
+;   $C003     = sid_play_flag   (IRQ sets 1, main loop calls play+clears)
+;   $C100     = frame buffer    (680 bytes, rows 8-24)
+;   $C500     = ticker buffer   (up to 253 PETSCII chars)
+;   $C5FC     = color_mode      (ASM owns: 0=rainbow, 1=white, 2=fire)
+;   $C5FD     = irq_tick        (ASM owns)
+;   $C5FE     = ticker length   (Python writes)
+;   $C5FF     = ticker position (ASM owns)
+;   $C600     = JMP initAddress trampoline (Python writes when c64_audio)
+;   $C610     = JMP playAddress trampoline (Python writes when c64_audio)
 ;
 ; ZP usage:
-;   $F7/$F8   = FREE (not used — play address is at $C610 trampoline)
-;   $F9/$FA   = saved original IRQ vector
+;   $F9/$FA   = saved original IRQ vector (for chain)
 ;   $FB/$FC   = src pointer
 ;   $FD/$FE   = dst pointer
 
@@ -48,34 +52,25 @@ irq_vec_hi  = $0315
 
 ticker_scr  = $0428
 ticker_col  = $d828
-wave_scr    = $0540     ; row 8 — safely above SID driver at $0400-$04FF
+wave_scr    = $0540     ; row 8 — above SID driver zone $0400-$04FF
 wave_col    = $d940
 
 ; ---------------------------------------------------------------------------
 ; Python comms
 ; ---------------------------------------------------------------------------
 
-frame_flag  = $c000
-color_flag  = $c001
-sid_ready   = $c002     ; Python sets 1 after uploading SID code
-sid_tick    = $c003     ; SID play rate counter
-frame_buf   = $c100
-ticker_buf  = $c500
-irq_tick    = $c5fd
-ticker_len  = $c5fe
-ticker_pos  = $c5ff
-color_mode  = $c5fc
+frame_flag      = $c000
+color_flag      = $c001
+c64_audio_flag  = $c002   ; 0=off, 1=wait for SID upload, 2=SID ready
+sid_play_flag   = $c003   ; IRQ sets 1, main loop calls play and clears
+frame_buf       = $c100
+ticker_buf      = $c500
+color_mode      = $c5fc
+irq_tick        = $c5fd
+ticker_len      = $c5fe
+ticker_pos      = $c5ff
 
 SCROLL_RATE = 6
-
-; SID init address — Python patches this before running PRG
-; Stored as a JMP instruction at $C600 so Python only needs to
-; write 2 bytes for the address
-sid_init_jmp = $c600       ; Python writes: $4C, lo, hi (JMP initAddress)
-sid_init_rts = $c603       ; RTS after JMP so we can JSR to $C600... 
-                           ; actually we just JSR sid_init_jmp which JMPs
-                           ; to init — init ends with RTS returning here.
-                           ; But JMP doesn't return... use trampoline instead.
 
 ; ---------------------------------------------------------------------------
 ; BASIC stub: SYS 2064
@@ -102,13 +97,14 @@ init:
         sta border
         sta bgcol
 
-        ; Clear comms flags
+        ; Clear ALL comms flags including c64_audio_flag
+        ; Python must re-write $C002=$01 after run_prg if C64 audio wanted
         sta frame_flag
         sta color_flag
         sta color_mode
         sta ticker_pos
-        sta sid_ready
-        sta sid_tick
+        sta sid_play_flag
+        sta c64_audio_flag
 
         ; Init IRQ tick counter
         lda #SCROLL_RATE
@@ -120,7 +116,7 @@ init:
         jsr fill_row0_color
         jsr clear_screen
 
-        ; Pre-fill ticker buffer with spaces
+        ; Pre-fill ticker buffer with spaces until Python sends real content
         lda #$20
         ldy #0
 ptb_lp: sta ticker_buf,y
@@ -129,22 +125,31 @@ ptb_lp: sta ticker_buf,y
         lda #40
         sta ticker_len
 
-        ; Save CURRENT IRQ vector (clean KERNAL vector, before SID init hooks it)
+        ; Save clean KERNAL IRQ vector BEFORE any SID init can hook it
         lda irq_vec_lo
         sta orig_irq_lo
         lda irq_vec_hi
         sta orig_irq_hi
 
-        ; Wait for Python to upload SID code and set sid_ready=$C002
-wait_sid:   lda sid_ready
-        beq wait_sid
+        ; Check if C64 audio mode requested
+        lda c64_audio_flag
+        beq no_c64_audio    ; $00 = Mac/MP3 mode, skip SID setup
 
-        ; Call SID INIT — SID player will hook $0314/$0315 during init
-        jsr sid_call_init
+        ; C64 audio mode: wait for Python to upload SID ($C002 -> $02)
+wait_sid:
+        lda c64_audio_flag
+        cmp #$02
+        bne wait_sid
 
-        ; Re-hook IRQ to our handler AFTER SID init
-        ; orig_irq_lo/hi still points to clean KERNAL handler (pre-SID)
-        ; so chaining skips the SID's $0314 hook — no double-play
+        ; Call SID INIT via trampoline at $C600
+        ; Python wrote: JMP initAddress at $C600
+        ; JSR $C600 -> JMP initAddr -> init runs -> RTS returns here
+        jsr $c600
+
+no_c64_audio:
+        ; Hook IRQ to our handler
+        ; If C64 audio: orig_irq_lo/hi has pre-SID KERNAL vector (safe chain)
+        ; If Mac/MP3:   orig_irq_lo/hi has KERNAL vector (normal chain)
         lda #<irq_handler
         sta irq_vec_lo
         lda #>irq_handler
@@ -157,14 +162,17 @@ wait_sid:   lda sid_ready
 ; ---------------------------------------------------------------------------
 
 main_loop:
-        ; Call SID play if IRQ has flagged it
+        ; Call SID play if IRQ flagged it AND C64 audio is active
         lda sid_play_flag
-        beq no_sid_play
+        beq check_color
         lda #$00
         sta sid_play_flag
-        jsr sid_play_trampoline
-no_sid_play:
+        lda c64_audio_flag
+        cmp #$02
+        bne check_color     ; not in C64 audio mode, skip play
+        jsr $c610           ; JMP playAddress trampoline (Python wrote this)
 
+check_color:
         lda color_flag
         beq check_frame
 
@@ -207,25 +215,9 @@ do_density_white:
         jmp main_loop
 
 ; ---------------------------------------------------------------------------
-; SID call trampoline
-; sid_call_init: Python writes JMP initAddr at $C600
-; We JSR $C600 — it JMPs to initAddr — initAddr RTSs back here
-; This works because JSR pushes PC, JMP goes to init,
-; init's RTS pops back to after our JSR. Clean.
-; ---------------------------------------------------------------------------
-
-sid_call_init:
-        jsr $c600              ; $C600 contains JMP initAddress (patched by Python)
-        rts
-
-; ---------------------------------------------------------------------------
 ; IRQ handler — saves/restores all registers
-; Sets sid_play_flag for main loop to call SID play outside IRQ context
-; This avoids stack depth issues with complex SID play routines
-; Scrolls ticker
+; Sets sid_play_flag for main loop, scrolls ticker
 ; ---------------------------------------------------------------------------
-
-sid_play_flag = $c003
 
 irq_handler:
         pha
@@ -234,11 +226,11 @@ irq_handler:
         tya
         pha
 
-        ; Signal main loop to call SID play on next iteration
+        ; Signal main loop to call SID play (main loop checks c64_audio_flag)
         lda #$01
         sta sid_play_flag
 
-        ; Ticker scroll
+        ; Ticker scroll every SCROLL_RATE IRQs
         dec irq_tick
         bne irq_done
 
@@ -269,19 +261,10 @@ irq_done:
         pla
         tax
         pla
-        ; Chain to original KERNAL IRQ (pre-SID vector) for housekeeping
-        ; This is safe because we saved orig_irq_lo/hi BEFORE SID init
-        ; so it does NOT call the SID's play hook at $0314
         jmp (orig_irq_lo)
 
-; sid_play_trampoline: fixed address trampoline at $C610
-; Python writes JMP playAddress ($4C lo hi) at $C610 before signalling ready
-; No ZP involved — SID play routine cannot clobber our pointer
-sid_play_trampoline:
-        jmp $c610              ; $C610 contains JMP playAddress (patched by Python)
-
 ; ---------------------------------------------------------------------------
-; copy_frame: $C100 -> $0540 (680 bytes = 17 rows, rows 8-24)
+; copy_frame: $C100 -> $0540 (680 bytes = 17 rows x 40 cols)
 ; ---------------------------------------------------------------------------
 
 copy_frame:
@@ -294,6 +277,7 @@ copy_frame:
         lda #>wave_scr
         sta dst_hi
 
+        ; 2 full pages = 512 bytes
         ldx #2
 cf_pg:  ldy #0
 cf_lp:  lda (src_lo),y
@@ -305,6 +289,7 @@ cf_lp:  lda (src_lo),y
         dex
         bne cf_pg
 
+        ; Remaining 168 bytes (680 - 512)
         ldy #0
 cf_rm:  lda (src_lo),y
         sta (dst_lo),y
@@ -317,7 +302,7 @@ cf_rm:  lda (src_lo),y
         rts
 
 ; ---------------------------------------------------------------------------
-; clear_screen
+; clear_screen: fill $0400-$07E7 (1000 bytes) with space
 ; ---------------------------------------------------------------------------
 
 clear_screen:
@@ -342,7 +327,7 @@ cs_rm:  sta (dst_lo),y
         rts
 
 ; ---------------------------------------------------------------------------
-; fill_color_rainbow
+; fill_color_rainbow: color RAM rows 8-24 ($D940-$DBE7, 680 bytes)
 ; ---------------------------------------------------------------------------
 
 fill_color_rainbow:
@@ -352,7 +337,6 @@ fill_color_rainbow:
         sta dst_hi
         ldx #0
 
-        ; Page 0 (256 bytes)
         ldy #0
 fcr_p0: lda rainbow_table,x
         sta (dst_lo),y
@@ -364,7 +348,6 @@ fcr_p0n:iny
         bne fcr_p0
         inc dst_hi
 
-        ; Page 1 (256 bytes) — total 512 bytes
         ldy #0
 fcr_p1: lda rainbow_table,x
         sta (dst_lo),y
@@ -376,7 +359,6 @@ fcr_p1n:iny
         bne fcr_p1
         inc dst_hi
 
-        ; Remaining 168 bytes (680 - 512)
         ldy #0
 fcr_rm: lda rainbow_table,x
         sta (dst_lo),y
@@ -390,7 +372,7 @@ fcr_rmn:iny
         rts
 
 ; ---------------------------------------------------------------------------
-; fill_color_white
+; fill_color_white: color RAM rows 8-24, all white (1)
 ; ---------------------------------------------------------------------------
 
 fill_color_white:
@@ -415,7 +397,7 @@ fcw_rm: sta (dst_lo),y
         rts
 
 ; ---------------------------------------------------------------------------
-; fill_ticker_color
+; fill_ticker_color: row 1 ($D828, 40 bytes) color 13 (light green)
 ; ---------------------------------------------------------------------------
 
 fill_ticker_color:
@@ -432,7 +414,7 @@ ftc_lp: sta (dst_lo),y
         rts
 
 ; ---------------------------------------------------------------------------
-; fill_row0_color
+; fill_row0_color: row 0 ($D800, 40 bytes) color 0 (black)
 ; ---------------------------------------------------------------------------
 
 fill_row0_color:
@@ -449,7 +431,8 @@ fr0_lp: sta (dst_lo),y
         rts
 
 ; ---------------------------------------------------------------------------
-; density_colors (white palette)
+; density_colors: white density palette
+; space->0, .->11, :->12, *->15, #/@->1
 ; ---------------------------------------------------------------------------
 
 density_colors:
@@ -503,11 +486,13 @@ ctc_dkgray:
 ctc_mdgray:
         lda #12
         rts
-ctc_ltgray: lda #15
+ctc_ltgray:
+        lda #15
         rts
 
 ; ---------------------------------------------------------------------------
-; density_colors_fire (fire palette)
+; density_colors_fire: fire palette
+; space->0, .->9(brown), :->10(ltred), *->8(orange), #/@->2(red)
 ; ---------------------------------------------------------------------------
 
 density_colors_fire:
@@ -561,11 +546,12 @@ cfire_brown:
 cfire_ltred:
         lda #10
         rts
-cfire_orange: lda #8
+cfire_orange:
+        lda #8
         rts
 
 ; ---------------------------------------------------------------------------
-; Rainbow table
+; Rainbow table: 40 color indices, one per column
 ; ---------------------------------------------------------------------------
 
 rainbow_table:

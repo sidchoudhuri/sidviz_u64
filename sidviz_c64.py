@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sidviz_c64.py -- SID/audio waveform visualizer -> C64 via U64 API
+sidviz_u64.py -- SID/audio waveform visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 
 version 1.4.0-exp (2026-04-17-exp2)
@@ -21,11 +21,11 @@ Memory protocol:
 
 Usage:
   1. Assemble: 64tass -a -B -o sidviz.prg sidviz.asm
-  2. Run: python3 sidviz_c64.py [file]
+  2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.4.0-exp"
-BUILD   = "2026-04-17-exp2"
+VERSION = "1.5.0"
+BUILD   = "2026-04-23"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, termios, tty, re, json, select as _select, struct
@@ -54,7 +54,7 @@ FPS          = 10
 
 def parse_args():
     p = argparse.ArgumentParser(
-        prog="sidviz_c64",
+        prog="sidviz_u64",
         description=f"SID/audio waveform visualizer for C64 via U64 API  v{VERSION} build {BUILD}"
     )
     p.add_argument("file",       nargs="?",              help="Audio/SID file")
@@ -66,6 +66,7 @@ def parse_args():
     p.add_argument("--c64audio", action="store_true",    help="Play SID audio on C64 hardware")
     p.add_argument("--macaudio", action="store_true",    help="Play SID audio on Mac (default)")
     p.add_argument("--fps",      type=int, default=10,   help="Frame rate (default 10)")
+    p.add_argument("--save",     metavar="FILE.mp3",     help="Save YouTube stream to MP3 (YouTube mode only)")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -152,6 +153,60 @@ def get_audio_info(filepath):
     except Exception:
         return {}
 
+def get_youtube_info(url):
+    """Use yt-dlp to extract metadata from a YouTube URL."""
+    try:
+        r = subprocess.run(
+            ["yt-dlp", "--dump-json", "--no-playlist", url],
+            capture_output=True, text=True, timeout=30
+        )
+        data = json.loads(r.stdout)
+    except Exception as e:
+        print(f"[!] yt-dlp metadata failed: {e}")
+        return None
+    info = {}
+    if data.get("title"):       info["Title"]  = data["title"]
+    if data.get("uploader"):    info["Artist"] = data["uploader"]
+    if data.get("upload_date"):
+        d = data["upload_date"]
+        info["Date"] = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    dur = data.get("duration")
+    if dur:
+        m, s = divmod(int(dur), 60)
+        info["Duration"] = f"{m}:{s:02d}"
+    info["Format"]   = "YouTube"
+    info["filename"] = url
+    return info
+
+def start_ffmpeg_waveform_youtube(url):
+    """Stream audio from YouTube via yt-dlp piped to ffmpeg for waveform generation."""
+    yt_proc = subprocess.Popen(
+        ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist", url],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
+           "-filter_complex",
+           f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
+           "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
+    p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    yt_proc.stdout.close()  # let ffmpeg own the pipe; yt_proc gets SIGPIPE if ffmpeg exits early
+    print("[*] ffmpeg waveform (YouTube) started.")
+    return yt_proc, p
+
+def start_ffplay_youtube(url):
+    """Stream audio from YouTube via yt-dlp piped to ffplay."""
+    yt_proc = subprocess.Popen(
+        ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist", url],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    p = subprocess.Popen(
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
+        stdin=yt_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    yt_proc.stdout.close()
+    print("[*] ffplay audio (YouTube) started.")
+    return yt_proc, p
+
 def build_ticker_string(info, mode):
     """Build scrolling ticker — values only, no labels, separated by *."""
     if mode == "sid":
@@ -173,9 +228,13 @@ def build_ticker_string(info, mode):
 def show_info_header(info, mode, filepath):
     width = 54
     print("+" + "-" * width + "+")
-    print(f"|  sidviz_c64  v{VERSION}  build {BUILD}".ljust(width + 1) + "|")
+    print(f"|  sidviz_u64  v{VERSION}  build {BUILD}".ljust(width + 1) + "|")
     print("+" + "-" * width + "+")
-    print(f"|  File: {os.path.basename(filepath)}".ljust(width + 1) + "|")
+    if is_url(filepath):
+        label = filepath if len(filepath) <= 47 else filepath[:44] + "..."
+    else:
+        label = os.path.basename(filepath)
+    print(f"|  File: {label}".ljust(width + 1) + "|")
     if mode == "sid":
         show_fields = [("Title", "Title"), ("Author", "Author"),
                        ("Released", "Released"), ("Song Speed", "Speed"),
@@ -188,7 +247,11 @@ def show_info_header(info, mode, filepath):
                        ("Bitrate", "Bitrate"), ("Format", "Format")]
     for key, label in show_fields:
         if key in info:
-            print(f"|  {label:<12} {info[key]}".ljust(width + 1) + "|")
+            val = info[key]
+            max_val = width - 15  # 39 chars: box width minus |  label(12) space prefix
+            if len(val) > max_val:
+                val = val[:max_val - 3] + "..."
+            print(f"|  {label:<12} {val}".ljust(width + 1) + "|")
     print("+" + "-" * width + "+")
     print()
 
@@ -255,7 +318,13 @@ def send_ticker(ticker_str):
 # Audio mode detection
 # ---------------------------------------------------------------------------
 
+def is_url(s):
+    return s.startswith(("http://", "https://"))
+
 def detect_mode(filepath, force_sid=False, force_audio=False):
+    if is_url(filepath):
+        print("[*] Detected mode: youtube (URL input)")
+        return "youtube"
     ext = os.path.splitext(filepath)[1].lower()
     if force_sid:   return "sid"
     if force_audio: return "audio"
@@ -443,13 +512,13 @@ def main():
     args = parse_args()
 
     if args.version:
-        print(f"sidviz_c64  v{VERSION}  build {BUILD}")
+        print(f"sidviz_u64  v{VERSION}  build {BUILD}")
         sys.exit(0)
 
     filepath = os.path.expanduser(args.file) if args.file else \
                os.path.expanduser(input("Audio/SID file path: ").strip())
 
-    if not os.path.isfile(filepath):
+    if not is_url(filepath) and not os.path.isfile(filepath):
         print(f"[!] File not found: {filepath}"); sys.exit(1)
 
     U64 = f"http://{args.ip}"
@@ -476,9 +545,18 @@ def main():
         print(f"[*] SID audio: {'C64 hardware (PSID player)' if c64_audio else 'Mac (sidplayfp)'}")
 
     # Get and display metadata
-    info = get_sid_info(filepath) if mode == "sid" else get_audio_info(filepath)
-    show_info_header(info, mode, filepath)
-    ticker_str = build_ticker_string(info, mode)
+    if mode == "sid":
+        info = get_sid_info(filepath)
+    elif mode == "youtube":
+        info = get_youtube_info(filepath)
+        if info is None:
+            print("[!] Failed to fetch YouTube metadata — is yt-dlp installed and the URL valid?")
+            sys.exit(1)
+    else:
+        info = get_audio_info(filepath)
+    display_mode = "sid" if mode == "sid" else "audio"
+    show_info_header(info, display_mode, filepath)
+    ticker_str = build_ticker_string(info, display_mode)
 
     if not os.path.isfile(PRG_LOCAL):
         print(f"[!] {PRG_REMOTE} not found at {PRG_LOCAL}")
@@ -559,6 +637,16 @@ def main():
             # Mac audio — $C002 stays $00, PRG already in main loop
             sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
             procs = [sid_fifo_proc, sid_audio_proc, ffmpeg_proc]
+    elif mode == "youtube":
+        yt_viz_proc,   ffmpeg_proc = start_ffmpeg_waveform_youtube(filepath)
+        yt_audio_proc, ffplay_proc = start_ffplay_youtube(filepath)
+        procs = [yt_viz_proc, ffmpeg_proc, yt_audio_proc, ffplay_proc]
+        if args.save:
+            print(f"[*] Saving stream to: {args.save}")
+            save_proc = subprocess.Popen(
+                ["yt-dlp", "-q", "-x", "--audio-format", "mp3", "-o", args.save, filepath],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            procs.append(save_proc)
     else:
         # MP3/audio mode — $C002 stays $00, PRG already in main loop
         ffmpeg_proc = start_ffmpeg_waveform_file(filepath)

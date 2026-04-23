@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sidviz_c64.py -- SID/audio waveform visualizer -> C64 via U64 API
+sidviz_u64.py -- SID/audio waveform visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 
 version 1.4.0-exp (2026-04-17-exp2)
@@ -21,11 +21,11 @@ Memory protocol:
 
 Usage:
   1. Assemble: 64tass -a -B -o sidviz.prg sidviz.asm
-  2. Run: python3 sidviz_c64.py [file]
+  2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.4.0-exp"
-BUILD   = "2026-04-17-exp2"
+VERSION = "1.5.0"
+BUILD   = "2026-04-23"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, termios, tty, re, json, select as _select, struct
@@ -54,7 +54,7 @@ FPS          = 10
 
 def parse_args():
     p = argparse.ArgumentParser(
-        prog="sidviz_c64",
+        prog="sidviz_u64",
         description=f"SID/audio waveform visualizer for C64 via U64 API  v{VERSION} build {BUILD}"
     )
     p.add_argument("file",       nargs="?",              help="Audio/SID file")
@@ -228,7 +228,7 @@ def build_ticker_string(info, mode):
 def show_info_header(info, mode, filepath):
     width = 54
     print("+" + "-" * width + "+")
-    print(f"|  sidviz_c64  v{VERSION}  build {BUILD}".ljust(width + 1) + "|")
+    print(f"|  sidviz_u64  v{VERSION}  build {BUILD}".ljust(width + 1) + "|")
     print("+" + "-" * width + "+")
     if is_url(filepath):
         label = filepath if len(filepath) <= 47 else filepath[:44] + "..."
@@ -512,7 +512,7 @@ def main():
     args = parse_args()
 
     if args.version:
-        print(f"sidviz_c64  v{VERSION}  build {BUILD}")
+        print(f"sidviz_u64  v{VERSION}  build {BUILD}")
         sys.exit(0)
 
     filepath = os.path.expanduser(args.file) if args.file else \

@@ -247,7 +247,11 @@ def show_info_header(info, mode, filepath):
                        ("Bitrate", "Bitrate"), ("Format", "Format")]
     for key, label in show_fields:
         if key in info:
-            print(f"|  {label:<12} {info[key]}".ljust(width + 1) + "|")
+            val = info[key]
+            max_val = width - 15  # 39 chars: box width minus |  label(12) space prefix
+            if len(val) > max_val:
+                val = val[:max_val - 3] + "..."
+            print(f"|  {label:<12} {val}".ljust(width + 1) + "|")
     print("+" + "-" * width + "+")
     print()
 

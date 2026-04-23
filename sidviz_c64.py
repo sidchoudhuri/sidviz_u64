@@ -163,7 +163,7 @@ def get_youtube_info(url):
         data = json.loads(r.stdout)
     except Exception as e:
         print(f"[!] yt-dlp metadata failed: {e}")
-        return {"filename": url}
+        return None
     info = {}
     if data.get("title"):       info["Title"]  = data["title"]
     if data.get("uploader"):    info["Artist"] = data["uploader"]
@@ -178,20 +178,34 @@ def get_youtube_info(url):
     info["filename"] = url
     return info
 
-def get_youtube_stream_url(url):
-    """Use yt-dlp to get a direct audio-only stream URL."""
-    try:
-        r = subprocess.run(
-            ["yt-dlp", "-f", "bestaudio", "-g", "--no-playlist", url],
-            capture_output=True, text=True, timeout=30
-        )
-        stream_url = r.stdout.strip().splitlines()[0]
-        if not stream_url:
-            raise ValueError("empty URL from yt-dlp")
-        return stream_url
-    except Exception as e:
-        print(f"[!] yt-dlp stream URL failed: {e}")
-        return None
+def start_ffmpeg_waveform_youtube(url):
+    """Stream audio from YouTube via yt-dlp piped to ffmpeg for waveform generation."""
+    yt_proc = subprocess.Popen(
+        ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist", url],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
+           "-filter_complex",
+           f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
+           "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
+    p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    yt_proc.stdout.close()  # let ffmpeg own the pipe; yt_proc gets SIGPIPE if ffmpeg exits early
+    print("[*] ffmpeg waveform (YouTube) started.")
+    return yt_proc, p
+
+def start_ffplay_youtube(url):
+    """Stream audio from YouTube via yt-dlp piped to ffplay."""
+    yt_proc = subprocess.Popen(
+        ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist", url],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    p = subprocess.Popen(
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
+        stdin=yt_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    yt_proc.stdout.close()
+    print("[*] ffplay audio (YouTube) started.")
+    return yt_proc, p
 
 def build_ticker_string(info, mode):
     """Build scrolling ticker — values only, no labels, separated by *."""
@@ -531,21 +545,14 @@ def main():
         info = get_sid_info(filepath)
     elif mode == "youtube":
         info = get_youtube_info(filepath)
+        if info is None:
+            print("[!] Failed to fetch YouTube metadata — is yt-dlp installed and the URL valid?")
+            sys.exit(1)
     else:
         info = get_audio_info(filepath)
     display_mode = "sid" if mode == "sid" else "audio"
     show_info_header(info, display_mode, filepath)
     ticker_str = build_ticker_string(info, display_mode)
-
-    # For YouTube: fetch direct stream URL early so we fail fast before rebooting C64
-    youtube_stream_url = None
-    if mode == "youtube":
-        print("[*] Fetching YouTube stream URL (yt-dlp)...")
-        youtube_stream_url = get_youtube_stream_url(filepath)
-        if not youtube_stream_url:
-            print("[!] Failed to get YouTube stream URL — is yt-dlp installed?")
-            sys.exit(1)
-        print("[*] Stream URL obtained.")
 
     if not os.path.isfile(PRG_LOCAL):
         print(f"[!] {PRG_REMOTE} not found at {PRG_LOCAL}")
@@ -627,9 +634,9 @@ def main():
             sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
             procs = [sid_fifo_proc, sid_audio_proc, ffmpeg_proc]
     elif mode == "youtube":
-        ffmpeg_proc = start_ffmpeg_waveform_file(youtube_stream_url)
-        ffplay_proc = start_ffplay_audio(youtube_stream_url)
-        procs       = [ffplay_proc, ffmpeg_proc]
+        yt_viz_proc,   ffmpeg_proc = start_ffmpeg_waveform_youtube(filepath)
+        yt_audio_proc, ffplay_proc = start_ffplay_youtube(filepath)
+        procs = [yt_viz_proc, ffmpeg_proc, yt_audio_proc, ffplay_proc]
         if args.save:
             print(f"[*] Saving stream to: {args.save}")
             save_proc = subprocess.Popen(

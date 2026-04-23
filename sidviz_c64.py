@@ -66,6 +66,7 @@ def parse_args():
     p.add_argument("--c64audio", action="store_true",    help="Play SID audio on C64 hardware")
     p.add_argument("--macaudio", action="store_true",    help="Play SID audio on Mac (default)")
     p.add_argument("--fps",      type=int, default=10,   help="Frame rate (default 10)")
+    p.add_argument("--save",     metavar="FILE.mp3",     help="Save YouTube stream to MP3 (YouTube mode only)")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -152,6 +153,46 @@ def get_audio_info(filepath):
     except Exception:
         return {}
 
+def get_youtube_info(url):
+    """Use yt-dlp to extract metadata from a YouTube URL."""
+    try:
+        r = subprocess.run(
+            ["yt-dlp", "--dump-json", "--no-playlist", url],
+            capture_output=True, text=True, timeout=30
+        )
+        data = json.loads(r.stdout)
+    except Exception as e:
+        print(f"[!] yt-dlp metadata failed: {e}")
+        return {"filename": url}
+    info = {}
+    if data.get("title"):       info["Title"]  = data["title"]
+    if data.get("uploader"):    info["Artist"] = data["uploader"]
+    if data.get("upload_date"):
+        d = data["upload_date"]
+        info["Date"] = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    dur = data.get("duration")
+    if dur:
+        m, s = divmod(int(dur), 60)
+        info["Duration"] = f"{m}:{s:02d}"
+    info["Format"]   = "YouTube"
+    info["filename"] = url
+    return info
+
+def get_youtube_stream_url(url):
+    """Use yt-dlp to get a direct audio-only stream URL."""
+    try:
+        r = subprocess.run(
+            ["yt-dlp", "-f", "bestaudio", "-g", "--no-playlist", url],
+            capture_output=True, text=True, timeout=30
+        )
+        stream_url = r.stdout.strip().splitlines()[0]
+        if not stream_url:
+            raise ValueError("empty URL from yt-dlp")
+        return stream_url
+    except Exception as e:
+        print(f"[!] yt-dlp stream URL failed: {e}")
+        return None
+
 def build_ticker_string(info, mode):
     """Build scrolling ticker — values only, no labels, separated by *."""
     if mode == "sid":
@@ -175,7 +216,11 @@ def show_info_header(info, mode, filepath):
     print("+" + "-" * width + "+")
     print(f"|  sidviz_c64  v{VERSION}  build {BUILD}".ljust(width + 1) + "|")
     print("+" + "-" * width + "+")
-    print(f"|  File: {os.path.basename(filepath)}".ljust(width + 1) + "|")
+    if is_url(filepath):
+        label = filepath if len(filepath) <= 47 else filepath[:44] + "..."
+    else:
+        label = os.path.basename(filepath)
+    print(f"|  File: {label}".ljust(width + 1) + "|")
     if mode == "sid":
         show_fields = [("Title", "Title"), ("Author", "Author"),
                        ("Released", "Released"), ("Song Speed", "Speed"),
@@ -255,7 +300,13 @@ def send_ticker(ticker_str):
 # Audio mode detection
 # ---------------------------------------------------------------------------
 
+def is_url(s):
+    return s.startswith(("http://", "https://"))
+
 def detect_mode(filepath, force_sid=False, force_audio=False):
+    if is_url(filepath):
+        print("[*] Detected mode: youtube (URL input)")
+        return "youtube"
     ext = os.path.splitext(filepath)[1].lower()
     if force_sid:   return "sid"
     if force_audio: return "audio"
@@ -449,7 +500,7 @@ def main():
     filepath = os.path.expanduser(args.file) if args.file else \
                os.path.expanduser(input("Audio/SID file path: ").strip())
 
-    if not os.path.isfile(filepath):
+    if not is_url(filepath) and not os.path.isfile(filepath):
         print(f"[!] File not found: {filepath}"); sys.exit(1)
 
     U64 = f"http://{args.ip}"
@@ -476,9 +527,25 @@ def main():
         print(f"[*] SID audio: {'C64 hardware (PSID player)' if c64_audio else 'Mac (sidplayfp)'}")
 
     # Get and display metadata
-    info = get_sid_info(filepath) if mode == "sid" else get_audio_info(filepath)
-    show_info_header(info, mode, filepath)
-    ticker_str = build_ticker_string(info, mode)
+    if mode == "sid":
+        info = get_sid_info(filepath)
+    elif mode == "youtube":
+        info = get_youtube_info(filepath)
+    else:
+        info = get_audio_info(filepath)
+    display_mode = "sid" if mode == "sid" else "audio"
+    show_info_header(info, display_mode, filepath)
+    ticker_str = build_ticker_string(info, display_mode)
+
+    # For YouTube: fetch direct stream URL early so we fail fast before rebooting C64
+    youtube_stream_url = None
+    if mode == "youtube":
+        print("[*] Fetching YouTube stream URL (yt-dlp)...")
+        youtube_stream_url = get_youtube_stream_url(filepath)
+        if not youtube_stream_url:
+            print("[!] Failed to get YouTube stream URL — is yt-dlp installed?")
+            sys.exit(1)
+        print("[*] Stream URL obtained.")
 
     if not os.path.isfile(PRG_LOCAL):
         print(f"[!] {PRG_REMOTE} not found at {PRG_LOCAL}")
@@ -559,6 +626,16 @@ def main():
             # Mac audio — $C002 stays $00, PRG already in main loop
             sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
             procs = [sid_fifo_proc, sid_audio_proc, ffmpeg_proc]
+    elif mode == "youtube":
+        ffmpeg_proc = start_ffmpeg_waveform_file(youtube_stream_url)
+        ffplay_proc = start_ffplay_audio(youtube_stream_url)
+        procs       = [ffplay_proc, ffmpeg_proc]
+        if args.save:
+            print(f"[*] Saving stream to: {args.save}")
+            save_proc = subprocess.Popen(
+                ["yt-dlp", "-q", "-x", "--audio-format", "mp3", "-o", args.save, filepath],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            procs.append(save_proc)
     else:
         # MP3/audio mode — $C002 stays $00, PRG already in main loop
         ffmpeg_proc = start_ffmpeg_waveform_file(filepath)

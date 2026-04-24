@@ -746,6 +746,10 @@ def main():
         print("\r\n[*] Interrupted.")
     finally:
         state["quit"] = True
+        # Silence SID chip first — clears gate bits, waveforms, and volume on
+        # all three voices so the last note doesn't ring on after we stop
+        if c64_audio:
+            write_mem(0xD400, [0] * 25)
         for p in procs:
             try: p.terminate()
             except: pass

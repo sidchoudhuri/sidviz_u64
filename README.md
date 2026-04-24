@@ -69,6 +69,8 @@ pip install yt-dlp
 ### Linux (Arch)
 ```
 sudo pacman -S --needed ffmpeg sidplayfp yt-dlp 64tass
+# sidplayfp and 64tass may need to be installed via AUR:
+yay -S sidplayfp 64tass
 ```
 
 #### IDUN Cartridge Linux (Arch 33-bit)

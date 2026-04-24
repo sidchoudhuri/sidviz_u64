@@ -3,7 +3,7 @@
 sidviz_u64.py -- SID/audio waveform visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 
-version 1.4.0-exp (2026-04-17-exp2)
+version 1.6.5 (2026-04-24)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -24,7 +24,7 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.6.0"
+VERSION = "1.6.5"
 BUILD   = "2026-04-24"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
@@ -67,6 +67,8 @@ def parse_args():
     p.add_argument("--macaudio", action="store_true",    help="Play SID audio locally via sidplayfp (default)")
     p.add_argument("--fps",      type=int, default=10,   help="Frame rate (default 10)")
     p.add_argument("--save",     metavar="FILE.mp3",     help="Save YouTube stream to MP3 (YouTube mode only)")
+    p.add_argument("--yt-search", metavar="QUERY",        help="Search YouTube by title/artist and choose a result")
+    p.add_argument("--yt-max",   type=int, default=10,    help="Max YouTube search results (default 10)")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -276,6 +278,67 @@ def resolve_stream_url(url, info):
         print(f"[!] Spotify YouTube search failed: {e}")
         return None
 
+def youtube_search(query, max_results=10):
+    """Search YouTube via yt-dlp and return a list of candidate videos."""
+    max_results = max(1, int(max_results or 10))
+    try:
+        r = subprocess.run(
+            ["yt-dlp", "--dump-json", "--flat-playlist", "--no-playlist", f"ytsearch{max_results}:{query}"],
+            capture_output=True, text=True, timeout=30
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            raise ValueError(r.stderr.strip() or "no output from yt-dlp")
+    except Exception as e:
+        print(f"[!] YouTube search failed: {e}")
+        return []
+
+    results = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        vid = data.get("id", "")
+        url = (data.get("webpage_url") or data.get("url") or
+               (f"https://www.youtube.com/watch?v={vid}" if vid else ""))
+        if not url:
+            continue
+        dur = data.get("duration")
+        if isinstance(dur, (int, float)):
+            m, s = divmod(int(dur), 60)
+            dur_s = f"{m}:{s:02d}"
+        else:
+            dur_s = "?:??"
+        results.append({
+            "title": data.get("title", "Untitled"),
+            "uploader": data.get("uploader", "Unknown"),
+            "duration": dur_s,
+            "url": url,
+        })
+    return results
+
+def choose_youtube_result(results):
+    """Prompt for selection from yt search results and return chosen URL."""
+    if not results:
+        return None
+    print("\n[*] YouTube search results:")
+    for i, item in enumerate(results, start=1):
+        print(f"    {i:2d}. {item['title']}  [{item['duration']}]  -  {item['uploader']}")
+    while True:
+        ans = input(f"Select video [1-{len(results)}] (default 1, q=cancel): ").strip().lower()
+        if ans in ("", "1"):
+            return results[0]["url"]
+        if ans in ("q", "quit", "n", "no"):
+            return None
+        if ans.isdigit():
+            idx = int(ans)
+            if 1 <= idx <= len(results):
+                return results[idx - 1]["url"]
+        print("[!] Invalid selection.")
+
 def start_ffmpeg_waveform_stream(url):
     """Stream audio via yt-dlp piped to ffmpeg for waveform generation."""
     yt_proc = subprocess.Popen(
@@ -284,7 +347,7 @@ def start_ffmpeg_waveform_stream(url):
     )
     cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
            "-filter_complex",
-           f"[0:a]loudnorm=I=-16:TP=-1.5:LRA=11,showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
+           f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     yt_proc.stdout.close()  # let ffmpeg own the pipe; yt_proc gets SIGPIPE if ffmpeg exits early
@@ -620,8 +683,25 @@ def main():
         print(f"sidviz_u64  v{VERSION}  build {BUILD}")
         sys.exit(0)
 
-    filepath = os.path.expanduser(args.file) if args.file else \
-               os.path.expanduser(input("Audio/SID file path: ").strip())
+    if args.yt_search:
+        query = args.yt_search.strip()
+        if not query:
+            print("[!] --yt-search requires a non-empty query")
+            sys.exit(1)
+        print(f"[*] Searching YouTube: {query} (max {args.yt_max})")
+        candidates = youtube_search(query, args.yt_max)
+        if not candidates:
+            print("[!] No YouTube results found")
+            sys.exit(1)
+        chosen = choose_youtube_result(candidates)
+        if not chosen:
+            print("[*] Search cancelled.")
+            sys.exit(0)
+        filepath = chosen
+        print(f"[*] Selected: {filepath}")
+    else:
+        filepath = os.path.expanduser(args.file) if args.file else \
+                   os.path.expanduser(input("Audio/SID file path: ").strip())
 
     if not is_url(filepath) and not os.path.isfile(filepath):
         print(f"[!] File not found: {filepath}"); sys.exit(1)

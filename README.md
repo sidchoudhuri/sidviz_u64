@@ -4,7 +4,7 @@ Real-time waveform visualizer for the Commodore 64, driven by a Mac or Linux mac
 
 ```
 +------------------------------------------------------+
-|  sidviz_u64  v1.5.0  build 2026-04-23               |
+|  sidviz_u64  v1.6.5  build 2026-04-24               |
 +------------------------------------------------------+
 |  File: Commando.sid                                  |
 |  Title        Commando                               |
@@ -115,6 +115,7 @@ If no file is given the script prompts for one interactively.
 ```
 usage: sidviz_u64 [-h] [--ip IP] [--color] [--no-color] [--sid] [--audio]
                   [--c64audio] [--macaudio] [--fps FPS] [--save FILE.mp3]
+                  [--yt-search QUERY] [--yt-max YT_MAX]
                   [--version]
                   [file]
 
@@ -133,6 +134,9 @@ options:
   --macaudio       Play SID audio locally via sidplayfp (default)
   --fps FPS        Waveform frame rate (default: 10)
   --save FILE.mp3  Save stream to MP3 while playing (streaming modes)
+  --yt-search QUERY
+                   Search YouTube by title/artist and choose a result
+  --yt-max YT_MAX  Max YouTube search results (default: 10)
   --version        Show version and exit
 ```
 
@@ -193,6 +197,7 @@ Pass any supported URL and the mode is detected automatically. `yt-dlp` is requi
 ```bash
 python3 sidviz_u64.py 'https://www.youtube.com/watch?v=...'
 python3 sidviz_u64.py 'https://youtu.be/...'
+python3 sidviz_u64.py --yt-search "artist - title"
 ```
 
 Two parallel `yt-dlp` processes are opened — one piped to `ffplay` for audio, one piped to `ffmpeg` for waveform generation. `yt-dlp` handles all range requests and DASH segment management internally, so the full track plays correctly.

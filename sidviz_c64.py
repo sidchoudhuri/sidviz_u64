@@ -153,27 +153,64 @@ def get_audio_info(filepath):
     except Exception:
         return {}
 
-def _spotify_info_oembed(url):
-    """Fallback Spotify metadata via the public oEmbed API (no auth needed)."""
+def _spotify_info(url):
+    """Fetch Spotify track metadata: page og-tags → oEmbed fallback.
+
+    og:description contains 'Artist · Song · Year · duration', giving us
+    the artist name that oEmbed alone does not provide.
+    """
+    info = {"Format": "Spotify", "filename": url}
+
+    def _unescape(s):
+        return (s.replace("&amp;", "&").replace("&quot;", '"')
+                 .replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">"))
+
+    # 1. Scrape the track page — og:description includes the artist name
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            page = resp.read().decode("utf-8", errors="replace")
+
+        m = re.search(r'property="og:title"\s+content="([^"]*)"', page)
+        if m:
+            info["Title"] = _unescape(m.group(1))
+
+        m = re.search(r'property="og:description"\s+content="([^"]*)"', page)
+        if m:
+            desc = _unescape(m.group(1))
+            # "Listen to Track on Spotify. Artist · Song · Year · N min M sec"
+            desc = re.sub(r"(?i)listen to .+? on spotify\.\s*", "", desc)
+            parts = [p.strip() for p in desc.split("·")]
+            if parts and parts[0]:
+                info["Artist"] = parts[0]
+
+        if info.get("Title"):
+            return info
+    except Exception as e:
+        print(f"[!] Spotify page fetch failed: {e}")
+
+    # 2. oEmbed fallback — title only (sometimes "Track · Artist")
     try:
         oembed_url = "https://open.spotify.com/oembed?url=" + urllib.parse.quote(url)
-        with urllib.request.urlopen(oembed_url, timeout=10) as r:
-            data = json.loads(r.read())
-        info = {}
+        with urllib.request.urlopen(oembed_url, timeout=10) as resp:
+            data = json.loads(resp.read())
         title = data.get("title", "")
-        # oEmbed title is sometimes "Track · Artist"
         if "·" in title:
             parts = title.split("·", 1)
             info["Title"]  = parts[0].strip()
-            info["Artist"] = parts[1].strip()
+            info.setdefault("Artist", parts[1].strip())
         elif title:
             info["Title"] = title
-        info["Format"]   = "Spotify"
-        info["filename"] = url
-        return info
+        if info.get("Title"):
+            return info
     except Exception as e:
         print(f"[!] Spotify oEmbed fallback failed: {e}")
-        return None
+
+    return None
 
 def get_stream_info(url):
     """Use yt-dlp to extract metadata from any supported streaming URL.
@@ -189,8 +226,8 @@ def get_stream_info(url):
     except Exception as e:
         print(f"[!] yt-dlp metadata failed: {e}")
         if get_service(url) == "spotify":
-            print("[*] Trying Spotify oEmbed fallback...")
-            return _spotify_info_oembed(url)
+            print("[*] Trying Spotify metadata fallback...")
+            return _spotify_info(url)
         return None
     info = {}
     if data.get("title"):   info["Title"] = data["title"]
@@ -247,7 +284,7 @@ def start_ffmpeg_waveform_stream(url):
     )
     cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
            "-filter_complex",
-           f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
+           f"[0:a]loudnorm=I=-16:TP=-1.5:LRA=11,showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     yt_proc.stdout.close()  # let ffmpeg own the pipe; yt_proc gets SIGPIPE if ffmpeg exits early
@@ -261,7 +298,8 @@ def start_ffplay_stream(url):
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
     p = subprocess.Popen(
-        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-i", "pipe:0"],
         stdin=yt_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     yt_proc.stdout.close()

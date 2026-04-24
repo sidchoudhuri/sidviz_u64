@@ -3,7 +3,7 @@
 sidviz_u64.py -- SID/audio waveform visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 
-version 1.4.0-exp (2026-04-17-exp2)
+version 1.6.0-exp (2026-04-24)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)

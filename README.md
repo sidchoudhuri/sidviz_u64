@@ -4,7 +4,7 @@ Real-time waveform visualizer for the Commodore 64, driven by a Mac or Linux mac
 
 ```
 +------------------------------------------------------+
-|  sidviz_u64  v1.6.5  build 2026-04-24               |
+|  sidviz_u64  v1.6.5  build 2026-04-24                |
 +------------------------------------------------------+
 |  File: Commando.sid                                  |
 |  Title        Commando                               |

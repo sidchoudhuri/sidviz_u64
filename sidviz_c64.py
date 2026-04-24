@@ -3,7 +3,7 @@
 sidviz_u64.py -- SID/audio waveform visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 
-version 1.4.0-exp (2026-04-17-exp2)
+version 1.6.5 (2026-04-24)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -24,8 +24,8 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.5.0"
-BUILD   = "2026-04-23"
+VERSION = "1.6.5"
+BUILD   = "2026-04-24"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, termios, tty, re, json, select as _select, struct
@@ -64,9 +64,11 @@ def parse_args():
     p.add_argument("--sid",      action="store_true",    help="Force sidplayfp mode")
     p.add_argument("--audio",    action="store_true",    help="Force ffmpeg audio mode")
     p.add_argument("--c64audio", action="store_true",    help="Play SID audio on C64 hardware")
-    p.add_argument("--macaudio", action="store_true",    help="Play SID audio on Mac (default)")
+    p.add_argument("--macaudio", action="store_true",    help="Play SID audio locally via sidplayfp (default)")
     p.add_argument("--fps",      type=int, default=10,   help="Frame rate (default 10)")
     p.add_argument("--save",     metavar="FILE.mp3",     help="Save YouTube stream to MP3 (YouTube mode only)")
+    p.add_argument("--yt-search", metavar="QUERY",        help="Search YouTube by title/artist and choose a result")
+    p.add_argument("--yt-max",   type=int, default=10,    help="Max YouTube search results (default 10)")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -153,20 +155,90 @@ def get_audio_info(filepath):
     except Exception:
         return {}
 
-def get_youtube_info(url):
-    """Use yt-dlp to extract metadata from a YouTube URL."""
+def _spotify_info(url):
+    """Fetch Spotify track metadata: page og-tags → oEmbed fallback.
+
+    og:description contains 'Artist · Song · Year · duration', giving us
+    the artist name that oEmbed alone does not provide.
+    """
+    info = {"Format": "Spotify", "filename": url}
+
+    def _unescape(s):
+        return (s.replace("&amp;", "&").replace("&quot;", '"')
+                 .replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">"))
+
+    # 1. Scrape the track page — og:description includes the artist name
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            page = resp.read().decode("utf-8", errors="replace")
+
+        m = re.search(r'property="og:title"\s+content="([^"]*)"', page)
+        if m:
+            info["Title"] = _unescape(m.group(1))
+
+        m = re.search(r'property="og:description"\s+content="([^"]*)"', page)
+        if m:
+            desc = _unescape(m.group(1))
+            # "Listen to Track on Spotify. Artist · Song · Year · N min M sec"
+            desc = re.sub(r"(?i)listen to .+? on spotify\.\s*", "", desc)
+            parts = [p.strip() for p in desc.split("·")]
+            if parts and parts[0]:
+                info["Artist"] = parts[0]
+
+        if info.get("Title"):
+            return info
+    except Exception as e:
+        print(f"[!] Spotify page fetch failed: {e}")
+
+    # 2. oEmbed fallback — title only (sometimes "Track · Artist")
+    try:
+        oembed_url = "https://open.spotify.com/oembed?url=" + urllib.parse.quote(url)
+        with urllib.request.urlopen(oembed_url, timeout=10) as resp:
+            data = json.loads(resp.read())
+        title = data.get("title", "")
+        if "·" in title:
+            parts = title.split("·", 1)
+            info["Title"]  = parts[0].strip()
+            info.setdefault("Artist", parts[1].strip())
+        elif title:
+            info["Title"] = title
+        if info.get("Title"):
+            return info
+    except Exception as e:
+        print(f"[!] Spotify oEmbed fallback failed: {e}")
+
+    return None
+
+def get_stream_info(url):
+    """Use yt-dlp to extract metadata from any supported streaming URL.
+    For Spotify, falls back to the public oEmbed API if yt-dlp fails."""
     try:
         r = subprocess.run(
             ["yt-dlp", "--dump-json", "--no-playlist", url],
             capture_output=True, text=True, timeout=30
         )
+        if not r.stdout.strip():
+            raise ValueError(r.stderr.strip() or "no output from yt-dlp")
         data = json.loads(r.stdout)
     except Exception as e:
         print(f"[!] yt-dlp metadata failed: {e}")
+        if get_service(url) == "spotify":
+            print("[*] Trying Spotify metadata fallback...")
+            return _spotify_info(url)
         return None
     info = {}
-    if data.get("title"):       info["Title"]  = data["title"]
-    if data.get("uploader"):    info["Artist"] = data["uploader"]
+    if data.get("title"):   info["Title"] = data["title"]
+    # Artist: field name varies by service
+    artist = (data.get("artist") or
+              (", ".join(data["artists"]) if data.get("artists") else None) or
+              data.get("uploader") or data.get("creator") or "")
+    if artist:              info["Artist"] = artist
+    if data.get("album"):   info["Album"]  = data["album"]
     if data.get("upload_date"):
         d = data["upload_date"]
         info["Date"] = f"{d[:4]}-{d[4:6]}-{d[6:]}"
@@ -174,12 +246,101 @@ def get_youtube_info(url):
     if dur:
         m, s = divmod(int(dur), 60)
         info["Duration"] = f"{m}:{s:02d}"
-    info["Format"]   = "YouTube"
+    service_labels = {"youtube": "YouTube", "soundcloud": "SoundCloud", "spotify": "Spotify"}
+    info["Format"]   = service_labels.get(get_service(url), "Stream")
     info["filename"] = url
     return info
 
-def start_ffmpeg_waveform_youtube(url):
-    """Stream audio from YouTube via yt-dlp piped to ffmpeg for waveform generation."""
+def resolve_stream_url(url, info):
+    """For Spotify URLs: find the best YouTube match and return that URL.
+    For all other services: return the URL unchanged."""
+    if get_service(url) != "spotify":
+        return url
+    title  = info.get("Title", "")
+    artist = info.get("Artist", "")
+    query  = f"{artist} - {title}".strip(" -") if artist else title
+    if not query:
+        print("[!] Spotify: no metadata to search with")
+        return None
+    print(f"[*] Spotify: searching YouTube for: {query}")
+    try:
+        r = subprocess.run(
+            ["yt-dlp", "--dump-json", "--no-playlist", f"ytsearch1:{query}"],
+            capture_output=True, text=True, timeout=30
+        )
+        data = json.loads(r.stdout)
+        yt_url = data.get("webpage_url") or data.get("url")
+        if not yt_url:
+            raise ValueError("no URL in search result")
+        print(f"[*] Spotify: matched '{data.get('title', 'unknown')}'")
+        return yt_url
+    except Exception as e:
+        print(f"[!] Spotify YouTube search failed: {e}")
+        return None
+
+def youtube_search(query, max_results=10):
+    """Search YouTube via yt-dlp and return a list of candidate videos."""
+    max_results = max(1, int(max_results or 10))
+    try:
+        r = subprocess.run(
+            ["yt-dlp", "--dump-json", "--flat-playlist", "--no-playlist", f"ytsearch{max_results}:{query}"],
+            capture_output=True, text=True, timeout=30
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            raise ValueError(r.stderr.strip() or "no output from yt-dlp")
+    except Exception as e:
+        print(f"[!] YouTube search failed: {e}")
+        return []
+
+    results = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        vid = data.get("id", "")
+        url = (data.get("webpage_url") or data.get("url") or
+               (f"https://www.youtube.com/watch?v={vid}" if vid else ""))
+        if not url:
+            continue
+        dur = data.get("duration")
+        if isinstance(dur, (int, float)):
+            m, s = divmod(int(dur), 60)
+            dur_s = f"{m}:{s:02d}"
+        else:
+            dur_s = "?:??"
+        results.append({
+            "title": data.get("title", "Untitled"),
+            "uploader": data.get("uploader", "Unknown"),
+            "duration": dur_s,
+            "url": url,
+        })
+    return results
+
+def choose_youtube_result(results):
+    """Prompt for selection from yt search results and return chosen URL."""
+    if not results:
+        return None
+    print("\n[*] YouTube search results:")
+    for i, item in enumerate(results, start=1):
+        print(f"    {i:2d}. {item['title']}  [{item['duration']}]  -  {item['uploader']}")
+    while True:
+        ans = input(f"Select video [1-{len(results)}] (default 1, q=cancel): ").strip().lower()
+        if ans in ("", "1"):
+            return results[0]["url"]
+        if ans in ("q", "quit", "n", "no"):
+            return None
+        if ans.isdigit():
+            idx = int(ans)
+            if 1 <= idx <= len(results):
+                return results[idx - 1]["url"]
+        print("[!] Invalid selection.")
+
+def start_ffmpeg_waveform_stream(url):
+    """Stream audio via yt-dlp piped to ffmpeg for waveform generation."""
     yt_proc = subprocess.Popen(
         ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist", url],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
@@ -190,21 +351,22 @@ def start_ffmpeg_waveform_youtube(url):
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     yt_proc.stdout.close()  # let ffmpeg own the pipe; yt_proc gets SIGPIPE if ffmpeg exits early
-    print("[*] ffmpeg waveform (YouTube) started.")
+    print("[*] ffmpeg waveform (stream) started.")
     return yt_proc, p
 
-def start_ffplay_youtube(url):
-    """Stream audio from YouTube via yt-dlp piped to ffplay."""
+def start_ffplay_stream(url):
+    """Stream audio via yt-dlp piped to ffplay."""
     yt_proc = subprocess.Popen(
         ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist", url],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
     p = subprocess.Popen(
-        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-i", "pipe:0"],
         stdin=yt_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     yt_proc.stdout.close()
-    print("[*] ffplay audio (YouTube) started.")
+    print("[*] ffplay audio (stream) started.")
     return yt_proc, p
 
 def build_ticker_string(info, mode):
@@ -321,10 +483,16 @@ def send_ticker(ticker_str):
 def is_url(s):
     return s.startswith(("http://", "https://"))
 
+def get_service(url):
+    if "spotify.com"   in url: return "spotify"
+    if "soundcloud.com" in url: return "soundcloud"
+    if "youtube.com"   in url or "youtu.be" in url: return "youtube"
+    return "stream"
+
 def detect_mode(filepath, force_sid=False, force_audio=False):
     if is_url(filepath):
-        print("[*] Detected mode: youtube (URL input)")
-        return "youtube"
+        print(f"[*] Detected mode: stream ({get_service(filepath)})")
+        return "stream"
     ext = os.path.splitext(filepath)[1].lower()
     if force_sid:   return "sid"
     if force_audio: return "audio"
@@ -515,8 +683,25 @@ def main():
         print(f"sidviz_u64  v{VERSION}  build {BUILD}")
         sys.exit(0)
 
-    filepath = os.path.expanduser(args.file) if args.file else \
-               os.path.expanduser(input("Audio/SID file path: ").strip())
+    if args.yt_search:
+        query = args.yt_search.strip()
+        if not query:
+            print("[!] --yt-search requires a non-empty query")
+            sys.exit(1)
+        print(f"[*] Searching YouTube: {query} (max {args.yt_max})")
+        candidates = youtube_search(query, args.yt_max)
+        if not candidates:
+            print("[!] No YouTube results found")
+            sys.exit(1)
+        chosen = choose_youtube_result(candidates)
+        if not chosen:
+            print("[*] Search cancelled.")
+            sys.exit(0)
+        filepath = chosen
+        print(f"[*] Selected: {filepath}")
+    else:
+        filepath = os.path.expanduser(args.file) if args.file else \
+                   os.path.expanduser(input("Audio/SID file path: ").strip())
 
     if not is_url(filepath) and not os.path.isfile(filepath):
         print(f"[!] File not found: {filepath}"); sys.exit(1)
@@ -540,23 +725,31 @@ def main():
         elif args.macaudio:
             c64_audio = False
         else:
-            ans = input("Audio output? [m=Mac (default), c=C64]: ").strip().lower()
+            ans = input("Audio output? [m=local/sidplayfp (default), c=C64]: ").strip().lower()
             c64_audio = ans in ("c", "c64")
-        print(f"[*] SID audio: {'C64 hardware (PSID player)' if c64_audio else 'Mac (sidplayfp)'}")
+        print(f"[*] SID audio: {'C64 hardware (PSID player)' if c64_audio else 'local (sidplayfp)'}")
 
     # Get and display metadata
     if mode == "sid":
         info = get_sid_info(filepath)
-    elif mode == "youtube":
-        info = get_youtube_info(filepath)
+    elif mode == "stream":
+        info = get_stream_info(filepath)
         if info is None:
-            print("[!] Failed to fetch YouTube metadata — is yt-dlp installed and the URL valid?")
+            print("[!] Failed to fetch stream metadata — is yt-dlp installed and the URL valid?")
             sys.exit(1)
     else:
         info = get_audio_info(filepath)
     display_mode = "sid" if mode == "sid" else "audio"
     show_info_header(info, display_mode, filepath)
     ticker_str = build_ticker_string(info, display_mode)
+
+    # Resolve the actual stream URL (Spotify → YouTube search; others unchanged)
+    stream_url = filepath
+    if mode == "stream" and get_service(filepath) == "spotify":
+        stream_url = resolve_stream_url(filepath, info)
+        if not stream_url:
+            print("[!] Could not find a YouTube match for this Spotify track")
+            sys.exit(1)
 
     if not os.path.isfile(PRG_LOCAL):
         print(f"[!] {PRG_REMOTE} not found at {PRG_LOCAL}")
@@ -593,7 +786,7 @@ def main():
         if c64_audio:
             psid = parse_psid(filepath)
             if not psid:
-                print("[!] PSID parse failed, falling back to Mac audio")
+                print("[!] PSID parse failed, falling back to local audio")
                 c64_audio = False
 
     # Run PRG — PRG clears $C002 in init, so no stale values from previous runs
@@ -602,7 +795,7 @@ def main():
     # If C64 audio: write $C002=$01 IMMEDIATELY after run_prg_from_temp
     # PRG clears $C002 at start of init, then spends ~300ms on display setup
     # before checking it — plenty of time for us to set it
-    # Mac/MP3 modes: never write $C002, it stays $00 after PRG clears it
+    # local/MP3 modes: never write $C002, it stays $00 after PRG clears it
     if c64_audio:
         print("[*] Signalling C64 audio mode to PRG ($C002=1)...")
         write_byte(C64_AUDIO_FLAG, 1)
@@ -611,7 +804,7 @@ def main():
 
     # Force PAL 50Hz CIA1 timer A — only needed in C64 audio mode
     # where the SID play routine expects PAL timing.
-    # For Mac/MP3 modes the KERNAL timer is already correct.
+    # For local/MP3 modes the KERNAL timer is already correct.
     if c64_audio:
         print("[*] Setting CIA1 timer for PAL 50Hz...")
         write_mem(0xDC04, [0xF8, 0x4C])   # timer A latch lo=$F8, hi=$4C
@@ -634,17 +827,17 @@ def main():
             upload_sid_to_c64(psid)
             procs = [sid_fifo_proc, ffmpeg_proc]
         else:
-            # Mac audio — $C002 stays $00, PRG already in main loop
+            # local audio — $C002 stays $00, PRG already in main loop
             sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
             procs = [sid_fifo_proc, sid_audio_proc, ffmpeg_proc]
-    elif mode == "youtube":
-        yt_viz_proc,   ffmpeg_proc = start_ffmpeg_waveform_youtube(filepath)
-        yt_audio_proc, ffplay_proc = start_ffplay_youtube(filepath)
+    elif mode == "stream":
+        yt_viz_proc,   ffmpeg_proc = start_ffmpeg_waveform_stream(stream_url)
+        yt_audio_proc, ffplay_proc = start_ffplay_stream(stream_url)
         procs = [yt_viz_proc, ffmpeg_proc, yt_audio_proc, ffplay_proc]
         if args.save:
             print(f"[*] Saving stream to: {args.save}")
             save_proc = subprocess.Popen(
-                ["yt-dlp", "-q", "-x", "--audio-format", "mp3", "-o", args.save, filepath],
+                ["yt-dlp", "-q", "-x", "--audio-format", "mp3", "-o", args.save, stream_url],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             procs.append(save_proc)
     else:
@@ -699,6 +892,10 @@ def main():
         print("\r\n[*] Interrupted.")
     finally:
         state["quit"] = True
+        # Silence SID chip first — clears gate bits, waveforms, and volume on
+        # all three voices so the last note doesn't ring on after we stop
+        if c64_audio:
+            write_mem(0xD400, [0] * 25)
         for p in procs:
             try: p.terminate()
             except: pass

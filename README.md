@@ -1,6 +1,6 @@
 # sidviz_u64
 
-Real-time waveform visualizer for the Commodore 64, driven by a Mac over the [Ultimate 64 (U64)](https://ultimate64.com) network API. Plays SID files, MP3s/audio files, and YouTube streams — and renders the live waveform on a real C64 screen with a scrolling metadata ticker.
+Real-time waveform visualizer for the Commodore 64, driven by a Mac over the [Ultimate 64 (U64)](https://ultimate64.com) network API. Plays SID files, MP3s/audio files, and streams from YouTube, SoundCloud, and Spotify — and renders the live waveform on a real C64 screen with a scrolling metadata ticker.
 
 ```
 +------------------------------------------------------+
@@ -37,7 +37,7 @@ Real-time waveform visualizer for the Commodore 64, driven by a Mac over the [Ul
 | `ffplay` | Audio playback (MP3 / YouTube) |
 | `ffprobe` | Audio file metadata |
 | `sidplayfp` | SID emulation and playback |
-| `yt-dlp` | YouTube streaming (optional) |
+| `yt-dlp` | YouTube, SoundCloud, and Spotify streaming (optional) |
 | `64tass` | Assembles `sidviz.prg` — build time only |
 
 Install on macOS with Homebrew:
@@ -79,7 +79,7 @@ usage: sidviz_u64 [-h] [--ip IP] [--color] [--no-color] [--sid] [--audio]
 SID/audio waveform visualizer for C64 via U64 API
 
 positional arguments:
-  file             Audio/SID file or YouTube URL
+  file             Audio/SID file, or YouTube / SoundCloud / Spotify URL
 
 options:
   --ip IP          U64 IP address (default: 192.168.2.64)
@@ -90,7 +90,7 @@ options:
   --c64audio       Play SID audio on C64 hardware (experimental)
   --macaudio       Play SID audio on Mac via sidplayfp (default)
   --fps FPS        Waveform frame rate (default: 10)
-  --save FILE.mp3  Save YouTube stream to MP3 while playing
+  --save FILE.mp3  Save stream to MP3 while playing (streaming modes)
   --version        Show version and exit
 ```
 
@@ -140,25 +140,55 @@ python3 sidviz_u64.py track.mp3
 
 `ffplay` handles audio playback. `ffmpeg` generates waveform frames directly from the file. Metadata (title, artist, album, duration, etc.) is read via `ffprobe`.
 
-### YouTube streaming
+### Streaming (YouTube / SoundCloud / Spotify)
+
+Pass any supported URL and the mode is detected automatically. `yt-dlp` is required for all streaming.
+
+> **Note:** Always quote URLs in the terminal — characters like `?`, `&`, and `=` are interpreted by zsh/bash as glob or special characters and will cause a "no matches found" error if unquoted.
+
+#### YouTube
 
 ```bash
 python3 sidviz_u64.py 'https://www.youtube.com/watch?v=...'
+python3 sidviz_u64.py 'https://youtu.be/...'
 ```
 
-> **Note:** Always quote the URL — the `?` in YouTube URLs is a glob character in zsh/bash and will cause a "no matches found" error if unquoted.
+Two parallel `yt-dlp` processes are opened — one piped to `ffplay` for audio, one piped to `ffmpeg` for waveform generation. `yt-dlp` handles all range requests and DASH segment management internally, so the full track plays correctly.
 
-`yt-dlp` is required. Two parallel streams are opened (one for audio via `ffplay`, one for waveform via `ffmpeg`), both piped directly from `yt-dlp` so range requests and segmented DASH streams are handled correctly.
+#### SoundCloud
 
-Metadata (title, uploader, date, duration) is fetched via `yt-dlp` before the C64 reboots, so a bad URL or missing `yt-dlp` fails fast.
+```bash
+python3 sidviz_u64.py 'https://soundcloud.com/artist/track'
+```
+
+Works identically to YouTube. `yt-dlp` handles SoundCloud URLs natively — same pipe architecture, no extra steps.
+
+#### Spotify
+
+```bash
+python3 sidviz_u64.py 'https://open.spotify.com/track/...'
+```
+
+Spotify audio is DRM-protected and cannot be streamed directly. Instead:
+
+1. `yt-dlp` extracts the track title and artist from the Spotify page
+2. The best match is found on YouTube using `yt-dlp ytsearch1:"Artist - Title"`
+3. The stream plays from that YouTube result
+
+The info box and ticker show the **Spotify metadata** (correct title, artist, album). Only public tracks are supported — private or region-locked tracks will fail before the C64 reboots.
+
+#### Metadata fetched before the C64 reboots
+
+For all streaming modes, metadata is fetched and the URL is validated before the C64 reboots, so a bad URL or missing `yt-dlp` fails fast with a clear error.
 
 #### Save to MP3 while playing
 
 ```bash
 python3 sidviz_u64.py 'https://www.youtube.com/watch?v=...' --save output.mp3
+python3 sidviz_u64.py 'https://soundcloud.com/artist/track' --save output.mp3
 ```
 
-A third `yt-dlp` process downloads and converts the stream to MP3 in parallel with playback.
+A third `yt-dlp` process downloads and converts the stream to MP3 in parallel with playback. Works for YouTube and SoundCloud. For Spotify, the saved file comes from the YouTube match.
 
 ---
 
@@ -183,7 +213,7 @@ Metadata is converted to PETSCII and scrolled across row 1 of the C64 screen. Fi
 | Mode | Fields shown |
 |---|---|
 | SID | Title · Author · Released · Song Speed · Song Length · Format · Addresses |
-| Audio / YouTube | Title · Artist · Album · Date · Genre · Duration · Bitrate · Format |
+| Audio / Streaming | Title · Artist · Album · Date · Genre · Duration · Bitrate · Format |
 
 ---
 

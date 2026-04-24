@@ -153,16 +153,44 @@ def get_audio_info(filepath):
     except Exception:
         return {}
 
+def _spotify_info_oembed(url):
+    """Fallback Spotify metadata via the public oEmbed API (no auth needed)."""
+    try:
+        oembed_url = "https://open.spotify.com/oembed?url=" + urllib.parse.quote(url)
+        with urllib.request.urlopen(oembed_url, timeout=10) as r:
+            data = json.loads(r.read())
+        info = {}
+        title = data.get("title", "")
+        # oEmbed title is sometimes "Track · Artist"
+        if "·" in title:
+            parts = title.split("·", 1)
+            info["Title"]  = parts[0].strip()
+            info["Artist"] = parts[1].strip()
+        elif title:
+            info["Title"] = title
+        info["Format"]   = "Spotify"
+        info["filename"] = url
+        return info
+    except Exception as e:
+        print(f"[!] Spotify oEmbed fallback failed: {e}")
+        return None
+
 def get_stream_info(url):
-    """Use yt-dlp to extract metadata from any supported streaming URL."""
+    """Use yt-dlp to extract metadata from any supported streaming URL.
+    For Spotify, falls back to the public oEmbed API if yt-dlp fails."""
     try:
         r = subprocess.run(
             ["yt-dlp", "--dump-json", "--no-playlist", url],
             capture_output=True, text=True, timeout=30
         )
+        if not r.stdout.strip():
+            raise ValueError(r.stderr.strip() or "no output from yt-dlp")
         data = json.loads(r.stdout)
     except Exception as e:
         print(f"[!] yt-dlp metadata failed: {e}")
+        if get_service(url) == "spotify":
+            print("[*] Trying Spotify oEmbed fallback...")
+            return _spotify_info_oembed(url)
         return None
     info = {}
     if data.get("title"):   info["Title"] = data["title"]

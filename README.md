@@ -66,12 +66,10 @@ pip install yt-dlp
 # sidplayfp: build from source (see below)
 ```
 
-#### Linux (Arch)
+#### Linux (Arch) for IDUN Cartridge
 
 ```bash
-sudo pacman -S ffmpeg yt-dlp
-# sidplayfp and 64tass are in the AUR:
-yay -S sidplayfp 64tass
+sudo pacman -S --needed ffmpeg sidplayfp yt-dlp 64tass
 ```
 
 #### Building sidplayfp from source (any Linux)

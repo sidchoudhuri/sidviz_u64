@@ -1,6 +1,6 @@
 # sidviz_u64
 
-Real-time waveform visualizer for the Commodore 64, driven by a Mac over the [Ultimate 64 (U64)](https://ultimate64.com) network API. Plays SID files, MP3s/audio files, and streams from YouTube, SoundCloud, and Spotify — and renders the live waveform on a real C64 screen with a scrolling metadata ticker.
+Real-time waveform visualizer for the Commodore 64, driven by a Mac or Linux machine over the [Ultimate 64 (U64)](https://ultimate64.com) network API. Plays SID files, MP3s/audio files, and streams from YouTube, SoundCloud, and Spotify — and renders the live waveform on a real C64 screen with a scrolling metadata ticker.
 
 ```
 +------------------------------------------------------+
@@ -30,20 +30,62 @@ Real-time waveform visualizer for the Commodore 64, driven by a Mac over the [Ul
 - Ultimate 64 (U64) connected to your local network
 
 ### Software
+
 | Tool | Purpose |
 |---|---|
 | Python 3 | Runtime |
 | `ffmpeg` | Waveform frame generation |
-| `ffplay` | Audio playback (MP3 / YouTube) |
+| `ffplay` | Audio playback (MP3 / streams) |
 | `ffprobe` | Audio file metadata |
 | `sidplayfp` | SID emulation and playback |
 | `yt-dlp` | YouTube, SoundCloud, and Spotify streaming (optional) |
 | `64tass` | Assembles `sidviz.prg` — build time only |
 
-Install on macOS with Homebrew:
+#### macOS
+
 ```bash
 brew install ffmpeg sidplayfp yt-dlp
 brew install 64tass  # build time only
+```
+
+#### Linux (Debian / Ubuntu)
+
+```bash
+sudo apt install ffmpeg sidplayfp 64tass
+pip install yt-dlp          # or: pipx install yt-dlp
+```
+
+> **Note:** Package names and availability vary by distro and release. If `sidplayfp` or `64tass` are not in your repos, see the build-from-source notes below.
+
+#### Linux (Fedora / RHEL)
+
+```bash
+sudo dnf install ffmpeg      # may require RPM Fusion
+sudo dnf install 64tass
+pip install yt-dlp
+# sidplayfp: build from source (see below)
+```
+
+#### Linux (Arch)
+
+```bash
+sudo pacman -S ffmpeg yt-dlp
+# sidplayfp and 64tass are in the AUR:
+yay -S sidplayfp 64tass
+```
+
+#### Building sidplayfp from source (any Linux)
+
+```bash
+sudo apt install libsidplayfp-dev   # or equivalent for your distro
+# or build from: https://github.com/libsidplayfp/sidplayfp
+```
+
+#### Building 64tass from source (any Linux)
+
+```bash
+# https://sourceforge.net/projects/tass64/
+./configure && make && sudo make install
 ```
 
 ---
@@ -88,7 +130,7 @@ options:
   --sid            Force SID file mode
   --audio          Force audio file mode
   --c64audio       Play SID audio on C64 hardware (experimental)
-  --macaudio       Play SID audio on Mac via sidplayfp (default)
+  --macaudio       Play SID audio locally via sidplayfp (default)
   --fps FPS        Waveform frame rate (default: 10)
   --save FILE.mp3  Save stream to MP3 while playing (streaming modes)
   --version        Show version and exit
@@ -117,7 +159,7 @@ python3 sidviz_u64.py tune.sid
 
 `sidplayfp` emulates the SID chip and outputs audio to the Mac speaker. The waveform is generated from the same audio via a named pipe. Song length is read from the SID header and used to stop playback automatically.
 
-When prompted, you can choose to play audio on the **Mac** (default) or on real **C64 hardware** (see below).
+When prompted, you can choose to play audio **locally via sidplayfp** (default) or on real **C64 hardware** (see below).
 
 #### C64 hardware audio (experimental)
 

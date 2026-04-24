@@ -64,7 +64,7 @@ def parse_args():
     p.add_argument("--sid",      action="store_true",    help="Force sidplayfp mode")
     p.add_argument("--audio",    action="store_true",    help="Force ffmpeg audio mode")
     p.add_argument("--c64audio", action="store_true",    help="Play SID audio on C64 hardware")
-    p.add_argument("--macaudio", action="store_true",    help="Play SID audio on Mac (default)")
+    p.add_argument("--macaudio", action="store_true",    help="Play SID audio locally via sidplayfp (default)")
     p.add_argument("--fps",      type=int, default=10,   help="Frame rate (default 10)")
     p.add_argument("--save",     metavar="FILE.mp3",     help="Save YouTube stream to MP3 (YouTube mode only)")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
@@ -579,9 +579,9 @@ def main():
         elif args.macaudio:
             c64_audio = False
         else:
-            ans = input("Audio output? [m=Mac (default), c=C64]: ").strip().lower()
+            ans = input("Audio output? [m=local/sidplayfp (default), c=C64]: ").strip().lower()
             c64_audio = ans in ("c", "c64")
-        print(f"[*] SID audio: {'C64 hardware (PSID player)' if c64_audio else 'Mac (sidplayfp)'}")
+        print(f"[*] SID audio: {'C64 hardware (PSID player)' if c64_audio else 'local (sidplayfp)'}")
 
     # Get and display metadata
     if mode == "sid":
@@ -640,7 +640,7 @@ def main():
         if c64_audio:
             psid = parse_psid(filepath)
             if not psid:
-                print("[!] PSID parse failed, falling back to Mac audio")
+                print("[!] PSID parse failed, falling back to local audio")
                 c64_audio = False
 
     # Run PRG — PRG clears $C002 in init, so no stale values from previous runs
@@ -649,7 +649,7 @@ def main():
     # If C64 audio: write $C002=$01 IMMEDIATELY after run_prg_from_temp
     # PRG clears $C002 at start of init, then spends ~300ms on display setup
     # before checking it — plenty of time for us to set it
-    # Mac/MP3 modes: never write $C002, it stays $00 after PRG clears it
+    # local/MP3 modes: never write $C002, it stays $00 after PRG clears it
     if c64_audio:
         print("[*] Signalling C64 audio mode to PRG ($C002=1)...")
         write_byte(C64_AUDIO_FLAG, 1)
@@ -658,7 +658,7 @@ def main():
 
     # Force PAL 50Hz CIA1 timer A — only needed in C64 audio mode
     # where the SID play routine expects PAL timing.
-    # For Mac/MP3 modes the KERNAL timer is already correct.
+    # For local/MP3 modes the KERNAL timer is already correct.
     if c64_audio:
         print("[*] Setting CIA1 timer for PAL 50Hz...")
         write_mem(0xDC04, [0xF8, 0x4C])   # timer A latch lo=$F8, hi=$4C
@@ -681,7 +681,7 @@ def main():
             upload_sid_to_c64(psid)
             procs = [sid_fifo_proc, ffmpeg_proc]
         else:
-            # Mac audio — $C002 stays $00, PRG already in main loop
+            # local audio — $C002 stays $00, PRG already in main loop
             sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
             procs = [sid_fifo_proc, sid_audio_proc, ffmpeg_proc]
     elif mode == "stream":

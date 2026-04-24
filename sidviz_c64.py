@@ -24,8 +24,8 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.5.0"
-BUILD   = "2026-04-23"
+VERSION = "1.6.0"
+BUILD   = "2026-04-24"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, termios, tty, re, json, select as _select, struct
@@ -153,8 +153,8 @@ def get_audio_info(filepath):
     except Exception:
         return {}
 
-def get_youtube_info(url):
-    """Use yt-dlp to extract metadata from a YouTube URL."""
+def get_stream_info(url):
+    """Use yt-dlp to extract metadata from any supported streaming URL."""
     try:
         r = subprocess.run(
             ["yt-dlp", "--dump-json", "--no-playlist", url],
@@ -165,8 +165,13 @@ def get_youtube_info(url):
         print(f"[!] yt-dlp metadata failed: {e}")
         return None
     info = {}
-    if data.get("title"):       info["Title"]  = data["title"]
-    if data.get("uploader"):    info["Artist"] = data["uploader"]
+    if data.get("title"):   info["Title"] = data["title"]
+    # Artist: field name varies by service
+    artist = (data.get("artist") or
+              (", ".join(data["artists"]) if data.get("artists") else None) or
+              data.get("uploader") or data.get("creator") or "")
+    if artist:              info["Artist"] = artist
+    if data.get("album"):   info["Album"]  = data["album"]
     if data.get("upload_date"):
         d = data["upload_date"]
         info["Date"] = f"{d[:4]}-{d[4:6]}-{d[6:]}"
@@ -174,12 +179,40 @@ def get_youtube_info(url):
     if dur:
         m, s = divmod(int(dur), 60)
         info["Duration"] = f"{m}:{s:02d}"
-    info["Format"]   = "YouTube"
+    service_labels = {"youtube": "YouTube", "soundcloud": "SoundCloud", "spotify": "Spotify"}
+    info["Format"]   = service_labels.get(get_service(url), "Stream")
     info["filename"] = url
     return info
 
-def start_ffmpeg_waveform_youtube(url):
-    """Stream audio from YouTube via yt-dlp piped to ffmpeg for waveform generation."""
+def resolve_stream_url(url, info):
+    """For Spotify URLs: find the best YouTube match and return that URL.
+    For all other services: return the URL unchanged."""
+    if get_service(url) != "spotify":
+        return url
+    title  = info.get("Title", "")
+    artist = info.get("Artist", "")
+    query  = f"{artist} - {title}".strip(" -") if artist else title
+    if not query:
+        print("[!] Spotify: no metadata to search with")
+        return None
+    print(f"[*] Spotify: searching YouTube for: {query}")
+    try:
+        r = subprocess.run(
+            ["yt-dlp", "--dump-json", "--no-playlist", f"ytsearch1:{query}"],
+            capture_output=True, text=True, timeout=30
+        )
+        data = json.loads(r.stdout)
+        yt_url = data.get("webpage_url") or data.get("url")
+        if not yt_url:
+            raise ValueError("no URL in search result")
+        print(f"[*] Spotify: matched '{data.get('title', 'unknown')}'")
+        return yt_url
+    except Exception as e:
+        print(f"[!] Spotify YouTube search failed: {e}")
+        return None
+
+def start_ffmpeg_waveform_stream(url):
+    """Stream audio via yt-dlp piped to ffmpeg for waveform generation."""
     yt_proc = subprocess.Popen(
         ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist", url],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
@@ -190,11 +223,11 @@ def start_ffmpeg_waveform_youtube(url):
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     yt_proc.stdout.close()  # let ffmpeg own the pipe; yt_proc gets SIGPIPE if ffmpeg exits early
-    print("[*] ffmpeg waveform (YouTube) started.")
+    print("[*] ffmpeg waveform (stream) started.")
     return yt_proc, p
 
-def start_ffplay_youtube(url):
-    """Stream audio from YouTube via yt-dlp piped to ffplay."""
+def start_ffplay_stream(url):
+    """Stream audio via yt-dlp piped to ffplay."""
     yt_proc = subprocess.Popen(
         ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist", url],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
@@ -204,7 +237,7 @@ def start_ffplay_youtube(url):
         stdin=yt_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     yt_proc.stdout.close()
-    print("[*] ffplay audio (YouTube) started.")
+    print("[*] ffplay audio (stream) started.")
     return yt_proc, p
 
 def build_ticker_string(info, mode):
@@ -321,10 +354,16 @@ def send_ticker(ticker_str):
 def is_url(s):
     return s.startswith(("http://", "https://"))
 
+def get_service(url):
+    if "spotify.com"   in url: return "spotify"
+    if "soundcloud.com" in url: return "soundcloud"
+    if "youtube.com"   in url or "youtu.be" in url: return "youtube"
+    return "stream"
+
 def detect_mode(filepath, force_sid=False, force_audio=False):
     if is_url(filepath):
-        print("[*] Detected mode: youtube (URL input)")
-        return "youtube"
+        print(f"[*] Detected mode: stream ({get_service(filepath)})")
+        return "stream"
     ext = os.path.splitext(filepath)[1].lower()
     if force_sid:   return "sid"
     if force_audio: return "audio"
@@ -547,16 +586,24 @@ def main():
     # Get and display metadata
     if mode == "sid":
         info = get_sid_info(filepath)
-    elif mode == "youtube":
-        info = get_youtube_info(filepath)
+    elif mode == "stream":
+        info = get_stream_info(filepath)
         if info is None:
-            print("[!] Failed to fetch YouTube metadata — is yt-dlp installed and the URL valid?")
+            print("[!] Failed to fetch stream metadata — is yt-dlp installed and the URL valid?")
             sys.exit(1)
     else:
         info = get_audio_info(filepath)
     display_mode = "sid" if mode == "sid" else "audio"
     show_info_header(info, display_mode, filepath)
     ticker_str = build_ticker_string(info, display_mode)
+
+    # Resolve the actual stream URL (Spotify → YouTube search; others unchanged)
+    stream_url = filepath
+    if mode == "stream" and get_service(filepath) == "spotify":
+        stream_url = resolve_stream_url(filepath, info)
+        if not stream_url:
+            print("[!] Could not find a YouTube match for this Spotify track")
+            sys.exit(1)
 
     if not os.path.isfile(PRG_LOCAL):
         print(f"[!] {PRG_REMOTE} not found at {PRG_LOCAL}")
@@ -637,14 +684,14 @@ def main():
             # Mac audio — $C002 stays $00, PRG already in main loop
             sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
             procs = [sid_fifo_proc, sid_audio_proc, ffmpeg_proc]
-    elif mode == "youtube":
-        yt_viz_proc,   ffmpeg_proc = start_ffmpeg_waveform_youtube(filepath)
-        yt_audio_proc, ffplay_proc = start_ffplay_youtube(filepath)
+    elif mode == "stream":
+        yt_viz_proc,   ffmpeg_proc = start_ffmpeg_waveform_stream(stream_url)
+        yt_audio_proc, ffplay_proc = start_ffplay_stream(stream_url)
         procs = [yt_viz_proc, ffmpeg_proc, yt_audio_proc, ffplay_proc]
         if args.save:
             print(f"[*] Saving stream to: {args.save}")
             save_proc = subprocess.Popen(
-                ["yt-dlp", "-q", "-x", "--audio-format", "mp3", "-o", args.save, filepath],
+                ["yt-dlp", "-q", "-x", "--audio-format", "mp3", "-o", args.save, stream_url],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             procs.append(save_proc)
     else:

@@ -20,7 +20,7 @@ Real-time waveform visualizer for the Commodore 64, driven by a Mac or Linux mac
 
 ## How it works
 
-`sidviz_u64.py` runs on the Mac. It reboots the C64 via the U64 API, uploads a small 6502 program (`sidviz.prg`), and then streams waveform frames into C64 screen RAM at up to 10 fps. A scrolling PETSCII ticker on row 1 shows the track metadata. Audio plays on the Mac (or on real C64 hardware for SID files).
+`sidviz_u64.py` or the compiled executable found in [Releases](https://github.com/sidchoudhuri/sidviz_u64/releases) tab runs on Windows, Linux, or Mac. It reboots the C64 via the U64 API, uploads a small 6502 program (`sidviz.prg`), and then streams waveform frames into C64 screen RAM at up to 10 fps. A scrolling PETSCII ticker on row 1 shows the track metadata. Audio plays on the Mac or on real C64 hardware for SID files.
 
 ---
 

@@ -574,8 +574,10 @@ def _build_viz_filter():
     return (f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
             f":rate={FPS}:colors=#ffffff,format=gray")
 
-def start_ffmpeg_waveform_fifo():
-    cmd = ["ffmpeg", "-loglevel", "quiet", "-f", "wav", "-i", FIFO_PATH,
+def start_ffmpeg_waveform_fifo(realtime=False):
+    # -re: read at 1x speed so sidplayfp can't race ahead of C64 real-time playback
+    re_flag = ["-re"] if realtime else []
+    cmd = ["ffmpeg", "-loglevel", "quiet"] + re_flag + ["-f", "wav", "-i", FIFO_PATH,
            "-filter_complex", _build_viz_filter(),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -932,15 +934,17 @@ def main():
     # Start audio/waveform processes
     if mode == "sid":
         make_fifo(FIFO_PATH)
-        ffmpeg_proc   = start_ffmpeg_waveform_fifo()
         if c64_audio:
             # Upload first — C64 starts playing at the end of upload_sid_to_c64.
             # Then start sidplayfp so the waveform is in sync with the C64.
-            # The upload takes long enough that ffmpeg has time to open the FIFO.
+            # -re flag throttles ffmpeg to real-time speed so the pipeline
+            # doesn't race ahead of the C64's real-time playback.
+            ffmpeg_proc   = start_ffmpeg_waveform_fifo(realtime=True)
             upload_sid_to_c64(psid)
             sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
             procs = [sid_fifo_proc, ffmpeg_proc]
         else:
+            ffmpeg_proc   = start_ffmpeg_waveform_fifo()
             time.sleep(0.3)           # give ffmpeg time to open FIFO before sidplayfp writes
             sid_fifo_proc  = start_sidplayfp_fifo(filepath, sid_duration_secs)
             sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)

@@ -107,6 +107,7 @@ init:
         sta color_mode
         sta ticker_pos
         sta c64_audio_flag
+        sta quit_flag
 
         ; Init IRQ tick counter
         lda #SCROLL_RATE

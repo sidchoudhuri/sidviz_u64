@@ -1010,13 +1010,17 @@ def main():
     finally:
         state["quit"] = True
         if c64_audio:
-            # Signal the C64 to handle its own shutdown: the PRG's main loop
-            # will SEI, zero all SID registers, then JMP $FCE2 (BASIC ready).
-            # We don't touch $D400 or the IRQ vector from Python — the C64
-            # would immediately overwrite them on the next IRQ before we finish.
-            print("\r\n[*] Signalling C64 to stop SID and return to BASIC...")
+            print("\r\n[*] Stopping SID and returning C64 to BASIC...")
+            # Step 1: clear c64_audio_flag so the IRQ stops calling the SID
+            # play routine at $C610 — without this the IRQ overwrites our
+            # $D400 zeroes on every frame before do_quit can run.
+            write_byte(C64_AUDIO_FLAG, 0)
+            time.sleep(0.04)             # wait ~2 IRQ frames (50Hz = 20ms each)
+            # Step 2: silence SID directly — IRQ is no longer touching $D400
+            write_mem(0xD400, [0] * 25)
+            # Step 3: signal PRG main loop to JMP $FCE2 (BASIC ready screen)
             write_byte(QUIT_FLAG, 1)
-            time.sleep(0.3)          # let PRG main loop see the flag and execute
+            time.sleep(0.3)
         else:
             # Local/MP3 mode: silence any residual SID output on C64 display side
             write_mem(0xD400, [0] * 25)

@@ -9,6 +9,7 @@ Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
   $C001     = color flag  (2=rainbow, 1=white density, 3=fire density)
   $C002     = sid_ready   (Python sets 1 after uploading SID code)
+  $C003     = quit_flag   (Python writes 1 to stop SID and return C64 to BASIC)
   $C620/$C621 = SID play vector saved post-init (play_addr=0 SIDs)
   $C100     = frame buffer, 680 bytes PETSCII (rows 8-24, $C100-$C3A7)
   $C3A8     = white density color table, 128 bytes (screen_code → C64 color)
@@ -43,6 +44,7 @@ FRAME_BUF    = 0xC100
 FRAME_FLAG   = 0xC000
 COLOR_FLAG   = 0xC001
 C64_AUDIO_FLAG = 0xC002  # 0=off, 1=waiting, 2=SID ready
+QUIT_FLAG      = 0xC003  # Python writes 1 → C64 silences SID and JMPs to BASIC
 TICKER_BUF   = 0xC500
 TICKER_LEN   = 0xC5FE
 TICKER_ROW   = 0x0428          # screen RAM row 1
@@ -1014,22 +1016,27 @@ def main():
         print("\r\n[*] Interrupted.")
     finally:
         state["quit"] = True
-        # Silence SID chip first — clears gate bits, waveforms, and volume on
-        # all three voices so the last note doesn't ring on after we stop
         if c64_audio:
+            # Signal the C64 to handle its own shutdown: the PRG's main loop
+            # will SEI, zero all SID registers, then JMP $FCE2 (BASIC ready).
+            # We don't touch $D400 or the IRQ vector from Python — the C64
+            # would immediately overwrite them on the next IRQ before we finish.
+            print("\r\n[*] Signalling C64 to stop SID and return to BASIC...")
+            write_byte(QUIT_FLAG, 1)
+            time.sleep(0.3)          # let PRG main loop see the flag and execute
+        else:
+            # Local/MP3 mode: silence any residual SID output on C64 display side
             write_mem(0xD400, [0] * 25)
+            write_byte(FRAME_FLAG, 0)
+            write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
+            orig = u64_get("machine:readmem?address=F9&length=2")
+            if orig and len(orig) == 2:
+                u64_put("machine:writemem", {"address": "314",
+                                              "data": f"{orig[0]:02X}{orig[1]:02X}"})
+            write_mem(TICKER_ROW, [0x20] * 40)
         for p in procs:
             try: p.terminate()
             except: pass
-        # Clean up display
-        write_byte(FRAME_FLAG, 0)
-        write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
-        # Restore original IRQ vector (saved at $F9/$FA by PRG) to stop ticker
-        orig = u64_get("machine:readmem?address=F9&length=2")
-        if orig and len(orig) == 2:
-            u64_put("machine:writemem", {"address": "314",
-                                          "data": f"{orig[0]:02X}{orig[1]:02X}"})
-        write_mem(TICKER_ROW, [0x20] * 40)
         try: os.remove(FIFO_PATH)
         except: pass
         # Restore terminal

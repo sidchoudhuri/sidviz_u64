@@ -63,6 +63,7 @@ wave_col    = $d940
 frame_flag      = $c000
 color_flag      = $c001
 c64_audio_flag  = $c002   ; 0=off, 1=wait for SID upload, 2=SID ready
+quit_flag       = $c003   ; Python writes 1 to trigger graceful SID stop + BASIC reset
 frame_buf       = $c100   ; 680 bytes ($c100-$c3a7)
 white_ctable    = $c3a8   ; 128-byte color table, screen_code → C64 color (white mode)
 fire_ctable     = $c428   ; 128-byte color table, screen_code → C64 color (fire mode)
@@ -171,6 +172,8 @@ no_c64_audio:
 ; ---------------------------------------------------------------------------
 
 main_loop:
+        lda quit_flag
+        bne do_quit
         lda color_flag
         beq check_frame
 
@@ -211,6 +214,22 @@ check_frame:
 do_density_white:
         jsr density_colors
         jmp main_loop
+
+; ---------------------------------------------------------------------------
+; do_quit: silence SID and return to BASIC
+; Called from main loop when quit_flag ($C003) is set by Python.
+; SEI prevents IRQ from re-triggering SID play while we zero the chip.
+; JMP $FCE2 = C64 power-on cold start → clears screen, shows BASIC READY.
+; ---------------------------------------------------------------------------
+
+do_quit:
+        sei
+        ldx #24
+dq_sil: lda #$00
+        sta $d400,x
+        dex
+        bpl dq_sil
+        jmp $fce2
 
 ; ---------------------------------------------------------------------------
 ; IRQ handler — saves/restores all registers

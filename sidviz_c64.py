@@ -51,35 +51,31 @@ TICKER_ROW   = 0x0428          # screen RAM row 1
 PRG_LOCAL    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidviz.prg")
 PRG_REMOTE   = "sidviz.prg"
 TIMEOUT      = 5.0
-CHARS        = [32, 46, 58, 42, 35, 64]           # showwaves: space . : * # line
-CHARS_FREQ   = [32, 46, 58, 33, 42, 37, 35,  0]  # showfreqs: space . : ! * % # @
-
 # C64 colors: 0=black 1=white 2=red 7=yellow 8=orange 9=brown 10=ltred 11=dkgray 12=mdgray 15=ltgray
 WHITE_CTABLE_ADDR = 0xC3A8   # 128-byte table written by Python: screen_code → C64 color
 FIRE_CTABLE_ADDR  = 0xC428   # 128-byte table written by Python: screen_code → C64 color
 
-WHITE_COLOR_MAP = {           # screen_code: C64 color (white density mode)
-    32:  0,  # space → black
-    46: 11,  # .     → dark gray
-    58: 12,  # :     → medium gray
-    33: 15,  # !     → light gray
-    42:  1,  # *     → white
-    37:  1,  # %     → white
-    35:  1,  # #     → white
-     0:  1,  # @     → white
-    64:  1,  # ─     → white   (showwaves)
-}
-FIRE_COLOR_MAP = {            # screen_code: C64 color (fire density mode)
-    32:  0,  # space → black
-    46:  9,  # .     → brown
-    58: 10,  # :     → light red
-    33:  8,  # !     → orange
-    42:  7,  # *     → yellow
-    37:  2,  # %     → red
-    35:  2,  # #     → red
-     0:  2,  # @     → red
-    64:  2,  # ─     → red    (showwaves)
-}
+#                            code  white  fire
+CHARS_DEF = [               # showwaves  (least → most dense)
+    (32,   0,   0),         # space      black       black
+    (46,  11,   9),         # .          dark gray   brown
+    (58,  12,  10),         # :          med gray    light red
+    (42,   1,   7),         # *          white       yellow
+    (35,   1,   2),         # #          white       red
+    (64,   1,   2),         # ─          white       red
+]
+CHARS_FREQ_DEF = [          # showfreqs  (least → most dense)
+    (32,   0,   0),         # space      black       black
+    (46,  11,   9),         # .          dark gray   brown
+    (58,  12,  10),         # :          med gray    light red
+    (33,  15,   8),         # !          light gray  orange
+    (42,   1,   7),         # *          white       yellow
+    (37,   1,   2),         # %          white       red
+    (35,   1,   2),         # #          white       red
+    ( 0,   1,   2),         # @          white       red
+]
+CHARS      = [t[0] for t in CHARS_DEF]
+CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]
 SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
@@ -499,12 +495,9 @@ def write_byte(addr, val):
 def write_color_tables():
     white = [0] * 128
     fire  = [0] * 128
-    for code, col in WHITE_COLOR_MAP.items():
-        if 0 <= code < 128:
-            white[code] = col
-    for code, col in FIRE_COLOR_MAP.items():
-        if 0 <= code < 128:
-            fire[code] = col
+    for code, wcol, fcol in CHARS_DEF + CHARS_FREQ_DEF:
+        white[code] = wcol
+        fire[code]  = fcol
     write_mem(WHITE_CTABLE_ADDR, white)
     write_mem(FIRE_CTABLE_ADDR,  fire)
 

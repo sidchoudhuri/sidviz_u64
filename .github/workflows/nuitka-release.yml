@@ -3,6 +3,9 @@ name: Build and Release sidviz_u64
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
 
 jobs:
   build:

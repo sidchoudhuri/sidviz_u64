@@ -11,6 +11,8 @@ Memory protocol:
   $C002     = sid_ready   (Python sets 1 after uploading SID code)
   $C620/$C621 = SID play vector saved post-init (play_addr=0 SIDs)
   $C100     = frame buffer, 680 bytes PETSCII (rows 8-24, $C100-$C3A7)
+  $C3A8     = white density color table, 128 bytes (screen_code → C64 color)
+  $C428     = fire  density color table, 128 bytes (screen_code → C64 color)
   $C500     = ticker buffer, up to 253 PETSCII chars
   $C5FC     = color_mode  (ASM owns: 0=rainbow, 1=white, 2=fire)
   $C5FD     = irq_tick    (ASM owns)
@@ -49,6 +51,33 @@ PRG_REMOTE   = "sidviz.prg"
 TIMEOUT      = 5.0
 CHARS        = [32, 46, 58, 42, 35, 64]           # showwaves: space . : * # line
 CHARS_FREQ   = [32, 46, 58, 33, 42, 37, 35,  0]  # showfreqs: space . : ! * % # @
+
+WHITE_CTABLE_ADDR = 0xC3A8   # 128-byte table written by Python: screen_code → C64 color
+FIRE_CTABLE_ADDR  = 0xC428   # 128-byte table written by Python: screen_code → C64 color
+
+# C64 colors: 0=black 1=white 2=red 7=yellow 8=orange 9=brown 10=ltred 11=dkgray 12=mdgray 15=ltgray
+WHITE_COLOR_MAP = {           # screen_code: C64 color (white density mode)
+    32:  0,  # space → black
+    46: 11,  # .     → dark gray
+    58: 12,  # :     → medium gray
+    33: 15,  # !     → light gray
+    42:  1,  # *     → white
+    37:  1,  # %     → white
+    35:  1,  # #     → white
+     0:  1,  # @     → white
+    64:  1,  # ─     → white   (showwaves)
+}
+FIRE_COLOR_MAP = {            # screen_code: C64 color (fire density mode)
+    32:  0,  # space → black
+    46:  9,  # .     → brown
+    58: 10,  # :     → light red
+    33:  8,  # !     → orange
+    42:  7,  # *     → yellow
+    37:  2,  # %     → red
+    35:  2,  # #     → red
+     0:  2,  # @     → red
+    64:  2,  # ─     → red    (showwaves)
+}
 SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
@@ -465,6 +494,18 @@ def write_mem(addr, data):
 def write_byte(addr, val):
     u64_put("machine:writemem", {"address": f"{addr:X}", "data": f"{val:02X}"})
 
+def write_color_tables():
+    white = [0] * 128
+    fire  = [0] * 128
+    for code, col in WHITE_COLOR_MAP.items():
+        if 0 <= code < 128:
+            white[code] = col
+    for code, col in FIRE_COLOR_MAP.items():
+        if 0 <= code < 128:
+            fire[code] = col
+    write_mem(WHITE_CTABLE_ADDR, white)
+    write_mem(FIRE_CTABLE_ADDR,  fire)
+
 def ftp_upload(local_path, remote_name):
     ip  = U64.replace("http://", "")
     url = f"ftp://{ip}/Temp/{remote_name}"
@@ -871,6 +912,9 @@ def main():
         write_byte(C64_AUDIO_FLAG, 1)
 
     time.sleep(1.0)  # wait for PRG to finish init
+
+    write_color_tables()
+    print("[*] Color tables written ($C3A8/$C428).")
 
     # Force PAL 50Hz CIA1 timer A — only needed in C64 audio mode
     # where the SID play routine expects PAL timing.

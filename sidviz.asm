@@ -38,6 +38,7 @@ src_lo      = $fb
 src_hi      = $fc
 dst_lo      = $fd
 dst_hi      = $fe
+ctc_x       = $f7       ; scratch: preserves X across char_to_color calls
 
 ; ---------------------------------------------------------------------------
 ; Hardware
@@ -62,7 +63,9 @@ wave_col    = $d940
 frame_flag      = $c000
 color_flag      = $c001
 c64_audio_flag  = $c002   ; 0=off, 1=wait for SID upload, 2=SID ready
-frame_buf       = $c100
+frame_buf       = $c100   ; 680 bytes ($c100-$c3a7)
+white_ctable    = $c3a8   ; 128-byte color table, screen_code → C64 color (white mode)
+fire_ctable     = $c428   ; 128-byte color table, screen_code → C64 color (fire mode)
 ticker_buf      = $c500
 color_mode      = $c5fc
 irq_tick        = $c5fd
@@ -455,8 +458,7 @@ fr0_lp: sta (dst_lo),y
         rts
 
 ; ---------------------------------------------------------------------------
-; density_colors: white density palette
-; space->0, .->11(dkgray), :->12(mdgray), !->15(ltgray), *->1(white), %/#/@->1(white)
+; density_colors: white density palette — colors set by Python via white_ctable ($C3A8)
 ; ---------------------------------------------------------------------------
 
 density_colors:
@@ -491,32 +493,14 @@ dc_rm:  lda (src_lo),y
         rts
 
 char_to_color:
-        cmp #$20
-        beq ctc_black
-        cmp #$2e
-        beq ctc_dkgray
-        cmp #$3a
-        beq ctc_mdgray
-        cmp #$21
-        beq ctc_ltgray
-        lda #1
-        rts
-ctc_black:
-        lda #0
-        rts
-ctc_dkgray:
-        lda #11
-        rts
-ctc_mdgray:
-        lda #12
-        rts
-ctc_ltgray:
-        lda #15
+        stx ctc_x
+        tax
+        lda white_ctable,x
+        ldx ctc_x
         rts
 
 ; ---------------------------------------------------------------------------
-; density_colors_fire: fire palette
-; space->0, .->9(brown), :->10(ltred), !->8(orange), *->7(yellow), %/#/@->2(red)
+; density_colors_fire: fire palette — colors set by Python via fire_ctable ($C428)
 ; ---------------------------------------------------------------------------
 
 density_colors_fire:
@@ -551,32 +535,10 @@ df_rm:  lda (src_lo),y
         rts
 
 char_to_color_fire:
-        cmp #$20
-        beq cfire_black
-        cmp #$2e
-        beq cfire_brown
-        cmp #$3a
-        beq cfire_ltred
-        cmp #$21
-        beq cfire_orange
-        cmp #$2a
-        beq cfire_yellow
-        lda #2
-        rts
-cfire_black:
-        lda #0
-        rts
-cfire_brown:
-        lda #9
-        rts
-cfire_ltred:
-        lda #10
-        rts
-cfire_orange:
-        lda #8
-        rts
-cfire_yellow:
-        lda #7
+        stx ctc_x
+        tax
+        lda fire_ctable,x
+        ldx ctc_x
         rts
 
 ; ---------------------------------------------------------------------------

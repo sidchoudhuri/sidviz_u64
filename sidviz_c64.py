@@ -700,13 +700,29 @@ def make_keypress_listener(state):
 def pixel_to_char(val):
     return CHARS[val * (len(CHARS) - 1) // 255]
 
-def _apply_freq_gradient(raw):
-    """Scale each showfreqs pixel by its row position so bars fade toward the top.
-    Bottom row = full brightness, top row = ~6% — gives density color modes a
-    range of values to work with instead of flat solid white."""
+def _apply_freq_gradient(raw, color_mode):
+    """Apply a per-mode vertical gradient to showfreqs frames so density/fire
+    color modes see a range of character values instead of flat solid white.
+
+    Row 0 = top of frame (tip of tallest bars).
+    Row HEIGHT-1 = bottom of frame (base of all bars).
+
+    rainbow (0): unchanged — bright at base, dim at tip (current behavior)
+    white   (1): reversed  — dim at base (dark gray), bright at tip (white)
+    fire    (2): tent      — dim base (period→brown), bright body (hash→red),
+                             lighter fringe at tip (colon→light red)
+    """
     buf = bytearray(raw)
     for row in range(HEIGHT):
-        scale = (row + 1) / HEIGHT
+        if color_mode == 1:    # white: reversed
+            scale = 0.2 + 0.8 * (HEIGHT - 1 - row) / (HEIGHT - 1)
+        elif color_mode == 2:  # fire: tent — fringe top, bright body, dim base
+            if row <= 2:       # top fringe: 0.5 at row 0, 1.0 at row 2
+                scale = 1.0 - (2 - row) / 2 * 0.5
+            else:              # body→base: 1.0 at row 2, 0.2 at row HEIGHT-1
+                scale = 0.2 + (HEIGHT - 1 - row) / (HEIGHT - 3) * 0.8
+        else:                  # rainbow: unchanged
+            scale = (row + 1) / HEIGHT
         start = row * WIDTH
         for i in range(start, start + WIDTH):
             if buf[i] > 0:
@@ -942,7 +958,7 @@ def main():
                 print("\r\n[*] Stream ended."); break
 
             if VIZ_MODE == "showfreqs":
-                raw = _apply_freq_gradient(raw)
+                raw = _apply_freq_gradient(raw, state["color_mode"])
             screen = bytes(pixel_to_char(p) for p in raw)
             write_mem(FRAME_BUF, screen)
             write_byte(FRAME_FLAG, 1)

@@ -60,19 +60,19 @@ CHARS_DEF = [               # showwaves  (least → most dense)
     (32,   0,   0),         # space      black       black
     (46,  11,   9),         # .          dark gray   brown
     (58,  12,  10),         # :          med gray    light red
-    (42,   1,   7),         # *          white       yellow
+    (42,  15,   8),         # *          light gray  orange
     (35,   1,   2),         # #          white       red
     (64,   1,   2),         # ─          white       red
 ]
 CHARS_FREQ_DEF = [          # showfreqs  (least → most dense)
     (32,   0,   0),         # space      black       black
-    (46,  11,   9),         # .          dark gray   brown
+    (46,  11,   7),         # .          dark gray   yellow
     (58,  12,  10),         # :          med gray    light red
     (33,  15,   8),         # !          light gray  orange
-    (42,   1,   7),         # *          white       yellow
-    (37,   1,   2),         # %          white       red
+    (43,   1,   9),         # +          white       brown
+    (34,   1,   2),         # "          white       red
     (35,   1,   2),         # #          white       red
-    ( 0,   1,   2),         # @          white       red
+    (42,   1,   2),         # *          white       red
 ]
 CHARS      = [t[0] for t in CHARS_DEF]
 CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]
@@ -495,7 +495,8 @@ def write_byte(addr, val):
 def write_color_tables():
     white = [0] * 128
     fire  = [0] * 128
-    for code, wcol, fcol in CHARS_DEF + CHARS_FREQ_DEF:
+    defs = CHARS_DEF if VIZ_MODE == "showwaves" else CHARS_FREQ_DEF
+    for code, wcol, fcol in defs:
         white[code] = wcol
         fire[code]  = fcol
     write_mem(WHITE_CTABLE_ADDR, white)

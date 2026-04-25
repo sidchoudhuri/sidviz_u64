@@ -2,7 +2,7 @@
 ; 64tass assembler
 ; autostart SYS 2064
 ;
-; version 1.6.7 (2026-04-25)
+; version 1.6.7b (2026-04-25)
 ;
 ; Single PRG handles all modes via $C002 flag:
 ;   $C002 = $00  Mac/MP3 mode   — no SID player, normal display
@@ -221,11 +221,37 @@ irq_handler:
         tya
         pha
 
-        ; Call SID play directly — exact timing regardless of main loop load
+        ; Call SID play directly — exact timing regardless of main loop load.
+        ; Save/restore ZP pointers $F9-$FE: SID play routines may clobber them,
+        ; corrupting copy_frame's src/dst pointers or the IRQ chain pointer.
         lda c64_audio_flag
         cmp #$02
         bne irq_skip_play
+        lda $f9
+        pha
+        lda $fa
+        pha
+        lda $fb
+        pha
+        lda $fc
+        pha
+        lda $fd
+        pha
+        lda $fe
+        pha
         jsr $c610
+        pla
+        sta $fe
+        pla
+        sta $fd
+        pla
+        sta $fc
+        pla
+        sta $fb
+        pla
+        sta $fa
+        pla
+        sta $f9
 irq_skip_play:
 
         ; Ticker scroll every SCROLL_RATE IRQs

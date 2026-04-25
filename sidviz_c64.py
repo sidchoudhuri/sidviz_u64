@@ -58,13 +58,28 @@ CHARS_FREQ   = [32, 46, 58, 33, 42, 37, 35,  0]  # showfreqs: space . : ! * % # 
 WHITE_CTABLE_ADDR = 0xC3A8   # 128-byte table written by Python: screen_code → C64 color
 FIRE_CTABLE_ADDR  = 0xC428   # 128-byte table written by Python: screen_code → C64 color
 
-#                    sp  .   :   *   #  line
-CHARS_WHITE      = [ 0, 11, 12, 15,  1,  1]   # white density colors for showwaves
-CHARS_FIRE       = [ 0,  9, 10,  7,  2,  2]   # fire  density colors for showwaves
-
-#                    sp  .   :   !   *   %   #   @
-CHARS_FREQ_WHITE = [ 0, 11, 12, 15,  1,  1,  1,  1]   # white density colors for showfreqs
-CHARS_FREQ_FIRE  = [ 0,  9, 10,  8,  7,  2,  2,  2]   # fire  density colors for showfreqs
+WHITE_COLOR_MAP = {           # screen_code: C64 color (white density mode)
+    32:  0,  # space → black
+    46: 11,  # .     → dark gray
+    58: 12,  # :     → medium gray
+    33: 15,  # !     → light gray
+    42:  1,  # *     → white
+    37:  1,  # %     → white
+    35:  1,  # #     → white
+     0:  1,  # @     → white
+    64:  1,  # ─     → white   (showwaves)
+}
+FIRE_COLOR_MAP = {            # screen_code: C64 color (fire density mode)
+    32:  0,  # space → black
+    46:  9,  # .     → brown
+    58: 10,  # :     → light red
+    33:  8,  # !     → orange
+    42:  7,  # *     → yellow
+    37:  2,  # %     → red
+    35:  2,  # #     → red
+     0:  2,  # @     → red
+    64:  2,  # ─     → red    (showwaves)
+}
 SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
@@ -484,10 +499,12 @@ def write_byte(addr, val):
 def write_color_tables():
     white = [0] * 128
     fire  = [0] * 128
-    for code, col in zip(CHARS,      CHARS_WHITE):       white[code] = col
-    for code, col in zip(CHARS,      CHARS_FIRE):        fire[code]  = col
-    for code, col in zip(CHARS_FREQ, CHARS_FREQ_WHITE):  white[code] = col
-    for code, col in zip(CHARS_FREQ, CHARS_FREQ_FIRE):   fire[code]  = col
+    for code, col in WHITE_COLOR_MAP.items():
+        if 0 <= code < 128:
+            white[code] = col
+    for code, col in FIRE_COLOR_MAP.items():
+        if 0 <= code < 128:
+            fire[code] = col
     write_mem(WHITE_CTABLE_ADDR, white)
     write_mem(FIRE_CTABLE_ADDR,  fire)
 

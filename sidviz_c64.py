@@ -3,7 +3,7 @@
 sidviz_u64.py -- SID/audio waveform visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 
-version 1.6.5 (2026-04-24)
+version 1.7.0 (2026-04-25)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -24,7 +24,7 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.6.7"
+VERSION = "1.7.0"
 BUILD   = "2026-04-25"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
@@ -51,6 +51,7 @@ CHARS        = [32, 46, 58, 42, 35, 64]
 SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
+VIZ_MODE     = "showwaves"
 
 # ---------------------------------------------------------------------------
 # Args
@@ -77,6 +78,8 @@ def parse_args():
                    help="Browser to pull cookies from for yt-dlp auth (chrome, firefox, safari, edge, …)")
     p.add_argument("--cookies",  metavar="FILE",
                    help="Netscape-format cookies file for yt-dlp auth")
+    p.add_argument("--showwaves", action="store_true",    help="Force waveform visualization")
+    p.add_argument("--showfreqs", action="store_true",    help="Force frequency spectrum visualization")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -360,8 +363,7 @@ def start_ffmpeg_waveform_stream(url):
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
     cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
-           "-filter_complex",
-           f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
+           "-filter_complex", _build_viz_filter(),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     yt_proc.stdout.close()  # let ffmpeg own the pipe; yt_proc gets SIGPIPE if ffmpeg exits early
@@ -527,10 +529,16 @@ def make_fifo(path):
     os.mkfifo(path)
     print(f"[*] FIFO created: {path}")
 
+def _build_viz_filter():
+    if VIZ_MODE == "showfreqs":
+        return (f"[0:a]showfreqs=s={WIDTH}x{HEIGHT}:mode=bar"
+                f":ascale=log:fscale=log:fps={FPS}:colors=#ffffff,format=gray")
+    return (f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
+            f":rate={FPS}:colors=#ffffff,format=gray")
+
 def start_ffmpeg_waveform_fifo():
     cmd = ["ffmpeg", "-loglevel", "quiet", "-f", "wav", "-i", FIFO_PATH,
-           "-filter_complex",
-           f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
+           "-filter_complex", _build_viz_filter(),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     print("[*] ffmpeg waveform (FIFO) started."); return p
@@ -538,8 +546,7 @@ def start_ffmpeg_waveform_fifo():
 def start_ffmpeg_waveform_file(filepath):
     cmd = ["ffmpeg", "-loglevel", "quiet",
            "-i", filepath,
-           "-filter_complex",
-           f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
+           "-filter_complex", _build_viz_filter(),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     print("[*] ffmpeg waveform (file) started."); return p
@@ -698,7 +705,7 @@ def pixel_to_char(val):
 # ---------------------------------------------------------------------------
 
 def main():
-    global U64, FPS, _YTDLP_COOKIE_ARGS
+    global U64, FPS, VIZ_MODE, _YTDLP_COOKIE_ARGS
 
     args = parse_args()
 
@@ -736,6 +743,15 @@ def main():
 
     U64 = f"http://{args.ip}"
     FPS = args.fps
+
+    if args.showwaves:
+        VIZ_MODE = "showwaves"
+    elif args.showfreqs:
+        VIZ_MODE = "showfreqs"
+    else:
+        ans = input("Visualization? [0=waveform, 1=spectrum] (default 0): ").strip()
+        VIZ_MODE = "showfreqs" if ans == "1" else "showwaves"
+    print(f"[*] Viz mode: {VIZ_MODE}")
 
     if args.color:      color_mode_init = 0
     elif args.no_color: color_mode_init = 1

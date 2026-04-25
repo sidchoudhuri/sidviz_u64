@@ -47,8 +47,8 @@ TICKER_ROW   = 0x0428          # screen RAM row 1
 PRG_LOCAL    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidviz.prg")
 PRG_REMOTE   = "sidviz.prg"
 TIMEOUT      = 5.0
-CHARS        = [32, 46, 58, 42, 35, 0]
-# CHARS        = [46, 58, 33, 34, 43, 35]
+CHARS        = [32, 46, 58, 42, 35, 64]           # showwaves: space . : * # line
+CHARS_FREQ   = [32, 46, 58, 33, 42, 37, 35,  0]  # showfreqs: space . : ! * % # @
 SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
@@ -698,8 +698,8 @@ def make_keypress_listener(state):
 # Frame conversion
 # ---------------------------------------------------------------------------
 
-def pixel_to_char(val):
-    return CHARS[val * (len(CHARS) - 1) // 255]
+def pixel_to_char(val, chars=CHARS):
+    return chars[val * (len(chars) - 1) // 255]
 
 def _apply_freq_gradient(raw, color_mode):
     """Apply a per-mode vertical gradient to showfreqs frames so density/fire
@@ -956,7 +956,9 @@ def main():
 
             if VIZ_MODE == "showfreqs":
                 raw = _apply_freq_gradient(raw, state["color_mode"])
-            screen = bytes(pixel_to_char(p) for p in raw)
+                screen = bytes(pixel_to_char(p, CHARS_FREQ) for p in raw)
+            else:
+                screen = bytes(pixel_to_char(p) for p in raw)
             write_mem(FRAME_BUF, screen)
             write_byte(FRAME_FLAG, 1)
 

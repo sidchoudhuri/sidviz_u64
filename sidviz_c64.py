@@ -707,18 +707,18 @@ def _apply_freq_gradient(raw, color_mode):
     Row 0 = top of frame (tip of tallest bars).
     Row HEIGHT-1 = bottom of frame (base of all bars).
 
-    white        (1): reversed — dim at base (dark gray), bright at tip (white)
-    rainbow+fire (0,2): tent — dim base, bright body, lighter fringe at tip
+    white        (1): dim at tip, bright at base
+    rainbow+fire (0,2): tent — sparse at tip, dense near base, lighter fringe at base
     """
     buf = bytearray(raw)
     for row in range(HEIGHT):
-        if color_mode == 1:  # white: reversed — dim at base, bright at tip
-            scale = 0.2 + 0.8 * (HEIGHT - 1 - row) / (HEIGHT - 1)
-        else:                # rainbow + fire: tent — bright body, lighter fringe/base
-            if row <= 2:     # top fringe: 0.5 at row 0, 1.0 at row 2
-                scale = 1.0 - (2 - row) / 2 * 0.5
-            else:            # body→base: 1.0 at row 2, 0.2 at row HEIGHT-1
-                scale = 0.2 + (HEIGHT - 1 - row) / (HEIGHT - 3) * 0.8
+        if color_mode == 1:  # white: dim at tip, bright at base
+            scale = 0.2 + 0.8 * row / (HEIGHT - 1)
+        else:                # rainbow + fire: tent peak near base, lighter fringe at base
+            if row >= HEIGHT - 3:    # bottom fringe: 1.0 at row HEIGHT-3, 0.5 at row HEIGHT-1
+                scale = 1.0 - (row - (HEIGHT - 3)) / 2 * 0.5
+            else:                    # tip→body: 0.2 at row 0, 1.0 at row HEIGHT-3
+                scale = 0.2 + row / (HEIGHT - 3) * 0.8
         start = row * WIDTH
         for i in range(start, start + WIDTH):
             if buf[i] > 0:

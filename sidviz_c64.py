@@ -700,6 +700,19 @@ def make_keypress_listener(state):
 def pixel_to_char(val):
     return CHARS[val * (len(CHARS) - 1) // 255]
 
+def _apply_freq_gradient(raw):
+    """Scale each showfreqs pixel by its row position so bars fade toward the top.
+    Bottom row = full brightness, top row = ~6% — gives density color modes a
+    range of values to work with instead of flat solid white."""
+    buf = bytearray(raw)
+    for row in range(HEIGHT):
+        scale = (row + 1) / HEIGHT
+        start = row * WIDTH
+        for i in range(start, start + WIDTH):
+            if buf[i] > 0:
+                buf[i] = max(1, int(buf[i] * scale))
+    return bytes(buf)
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -928,6 +941,8 @@ def main():
             if len(raw) < frame_size:
                 print("\r\n[*] Stream ended."); break
 
+            if VIZ_MODE == "showfreqs":
+                raw = _apply_freq_gradient(raw)
             screen = bytes(pixel_to_char(p) for p in raw)
             write_mem(FRAME_BUF, screen)
             write_byte(FRAME_FLAG, 1)

@@ -4,7 +4,7 @@ Real-time waveform visualizer for the Commodore 64, driven by a Mac or Linux mac
 
 ```
 +------------------------------------------------------+
-|  sidviz_u64  v1.6.5  build 2026-04-24                |
+|  sidviz_u64  v1.6.6  build 2026-04-25                |
 +------------------------------------------------------+
 |  File: Commando.sid                                  |
 |  Title        Commando                               |
@@ -135,6 +135,7 @@ If no file is given the script prompts for one interactively.
 usage: sidviz_u64 [-h] [--ip IP] [--color] [--no-color] [--sid] [--audio]
                   [--c64audio] [--macaudio] [--fps FPS] [--save FILE.mp3]
                   [--yt-search QUERY] [--yt-max YT_MAX]
+                  [--cookies-from-browser BROWSER] [--cookies FILE]
                   [--version]
                   [file]
 
@@ -156,6 +157,10 @@ options:
   --yt-search QUERY
                    Search YouTube by title/artist and choose a result
   --yt-max YT_MAX  Max YouTube search results (default: 10)
+  --cookies-from-browser BROWSER
+                   Pull cookies from a browser for yt-dlp auth
+                   (chrome, firefox, safari, edge, brave, chromium, …)
+  --cookies FILE   Netscape-format cookies file for yt-dlp auth
   --version        Show version and exit
 ```
 
@@ -246,6 +251,32 @@ The info box and ticker show the **Spotify metadata** (correct title, artist, al
 #### Metadata fetched before the C64 reboots
 
 For all streaming modes, metadata is fetched and the URL is validated before the C64 reboots, so a bad URL or missing `yt-dlp` fails fast with a clear error.
+
+#### Age-restricted or sign-in required videos
+
+Some YouTube videos require authentication (age-restricted content, or when YouTube returns a "Sign in to confirm" error). Pass cookies to `yt-dlp` using either flag:
+
+```bash
+# Pull cookies directly from an installed browser (no export needed):
+python3 sidviz_u64.py 'https://www.youtube.com/watch?v=...' --cookies-from-browser chrome
+python3 sidviz_u64.py --yt-search "artist title" --cookies-from-browser firefox
+
+# Or point to a Netscape-format cookies file:
+python3 sidviz_u64.py 'https://www.youtube.com/watch?v=...' --cookies ~/cookies.txt
+```
+
+Accepted browser names for `--cookies-from-browser`: `chrome`, `firefox`, `safari`, `edge`, `brave`, `chromium`, `opera`, `vivaldi`, `whale`.
+
+When one of these flags is set, the cookies are forwarded to **every** `yt-dlp` call — metadata, search, audio stream, waveform stream, and `--save`.
+
+If you hit the error without having set a cookie flag, sidviz prints a hint:
+
+```
+[!] yt-dlp metadata failed: ERROR: [youtube] …: Sign in to confirm your age. …
+[!] Hint: re-run with --cookies-from-browser BROWSER (e.g. chrome, firefox, safari)
+```
+
+> **Note on exporting YouTube cookies:** YouTube rotates cookies on open browser tabs, so a naively exported file may be stale. For a stable cookie file: open a **private/incognito window**, log into YouTube, navigate to `https://www.youtube.com/robots.txt`, export only the `youtube.com` cookies with a browser extension (e.g. *Get cookies.txt LOCALLY* for Chrome, *cookies.txt* for Firefox), then **close the incognito window immediately**.
 
 #### Save to MP3 while playing
 

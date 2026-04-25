@@ -9,7 +9,7 @@ Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
   $C001     = color flag  (2=rainbow, 1=white density, 3=fire density)
   $C002     = sid_ready   (Python sets 1 after uploading SID code)
-  $C003     = sid_play_flag (IRQ sets 1, main loop calls play and clears)
+  $C620/$C621 = SID play vector saved post-init (play_addr=0 SIDs)
   $C100     = frame buffer, 680 bytes PETSCII (rows 8-24, $C100-$C3A7)
   $C500     = ticker buffer, up to 253 PETSCII chars
   $C5FC     = color_mode  (ASM owns: 0=rainbow, 1=white, 2=fire)
@@ -24,11 +24,15 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.6.5"
-BUILD   = "2026-04-24"
+VERSION = "1.6.7"
+BUILD   = "2026-04-25"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, termios, tty, re, json, select as _select, struct
+
+# Populated in main() from --cookies-from-browser / --cookies CLI flags;
+# injected into every yt-dlp subprocess call.
+_YTDLP_COOKIE_ARGS: list = []
 
 FIFO_PATH    = "/tmp/sidpipe.wav"
 WIDTH        = 40
@@ -69,6 +73,10 @@ def parse_args():
     p.add_argument("--save",     metavar="FILE.mp3",     help="Save YouTube stream to MP3 (YouTube mode only)")
     p.add_argument("--yt-search", metavar="QUERY",        help="Search YouTube by title/artist and choose a result")
     p.add_argument("--yt-max",   type=int, default=10,    help="Max YouTube search results (default 10)")
+    p.add_argument("--cookies-from-browser", metavar="BROWSER",
+                   help="Browser to pull cookies from for yt-dlp auth (chrome, firefox, safari, edge, …)")
+    p.add_argument("--cookies",  metavar="FILE",
+                   help="Netscape-format cookies file for yt-dlp auth")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -214,12 +222,15 @@ def _spotify_info(url):
 
     return None
 
+def _is_cookie_error(text):
+    return "cookies-from-browser" in text or "Sign in to confirm" in text
+
 def get_stream_info(url):
     """Use yt-dlp to extract metadata from any supported streaming URL.
     For Spotify, falls back to the public oEmbed API if yt-dlp fails."""
     try:
         r = subprocess.run(
-            ["yt-dlp", "--dump-json", "--no-playlist", url],
+            ["yt-dlp", "--dump-json", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [url],
             capture_output=True, text=True, timeout=30
         )
         if not r.stdout.strip():
@@ -227,6 +238,8 @@ def get_stream_info(url):
         data = json.loads(r.stdout)
     except Exception as e:
         print(f"[!] yt-dlp metadata failed: {e}")
+        if not _YTDLP_COOKIE_ARGS and _is_cookie_error(str(e)):
+            print("[!] Hint: re-run with --cookies-from-browser BROWSER (e.g. chrome, firefox, safari)")
         if get_service(url) == "spotify":
             print("[*] Trying Spotify metadata fallback...")
             return _spotify_info(url)
@@ -265,7 +278,7 @@ def resolve_stream_url(url, info):
     print(f"[*] Spotify: searching YouTube for: {query}")
     try:
         r = subprocess.run(
-            ["yt-dlp", "--dump-json", "--no-playlist", f"ytsearch1:{query}"],
+            ["yt-dlp", "--dump-json", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [f"ytsearch1:{query}"],
             capture_output=True, text=True, timeout=30
         )
         data = json.loads(r.stdout)
@@ -283,7 +296,8 @@ def youtube_search(query, max_results=10):
     max_results = max(1, int(max_results or 10))
     try:
         r = subprocess.run(
-            ["yt-dlp", "--dump-json", "--flat-playlist", "--no-playlist", f"ytsearch{max_results}:{query}"],
+            ["yt-dlp", "--dump-json", "--flat-playlist", "--no-playlist"]
+            + _YTDLP_COOKIE_ARGS + [f"ytsearch{max_results}:{query}"],
             capture_output=True, text=True, timeout=30
         )
         if r.returncode != 0 or not r.stdout.strip():
@@ -342,7 +356,7 @@ def choose_youtube_result(results):
 def start_ffmpeg_waveform_stream(url):
     """Stream audio via yt-dlp piped to ffmpeg for waveform generation."""
     yt_proc = subprocess.Popen(
-        ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist", url],
+        ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [url],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
     cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
@@ -357,7 +371,7 @@ def start_ffmpeg_waveform_stream(url):
 def start_ffplay_stream(url):
     """Stream audio via yt-dlp piped to ffplay."""
     yt_proc = subprocess.Popen(
-        ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist", url],
+        ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [url],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
     p = subprocess.Popen(
@@ -567,11 +581,17 @@ def parse_psid(filepath):
         print(f"[!] Not a PSID/RSID file (magic: {magic})")
         return None
 
+    version     = struct.unpack_from(">H", raw, 4)[0]
     data_offset = struct.unpack_from(">H", raw, 6)[0]
     load_addr   = struct.unpack_from(">H", raw, 8)[0]
     init_addr   = struct.unpack_from(">H", raw, 10)[0]
     play_addr   = struct.unpack_from(">H", raw, 12)[0]
     sid_data    = raw[data_offset:]
+
+    # v2+ flags word at 0x76, bits 0-1: clock (0=unknown, 1=PAL, 2=NTSC, 3=both)
+    clock = 0
+    if version >= 2 and len(raw) > 0x77:
+        clock = struct.unpack_from(">H", raw, 0x76)[0] & 0x03
 
     # Read title from header to confirm we're parsing the right file
     title = raw[0x16:0x36].rstrip(b"\x00").decode(errors="replace")
@@ -583,17 +603,19 @@ def parse_psid(filepath):
         load_addr = struct.unpack_from("<H", sid_data, 0)[0]
         sid_data  = sid_data[2:]
 
-    print(f"[*] PSID: load=${load_addr:04X} init=${init_addr:04X} play=${play_addr:04X} size={len(sid_data)} bytes")
+    clock_str = {0: "unknown", 1: "PAL", 2: "NTSC", 3: "PAL+NTSC"}.get(clock, "?")
+    print(f"[*] PSID v{version}: load=${load_addr:04X} init=${init_addr:04X} play=${play_addr:04X} "
+          f"size={len(sid_data)} bytes  clock={clock_str}")
 
     if play_addr == 0:
         print(f"[*] play_addr=0 — SID installs play via IRQ vector during init")
-        print(f"[*] Python will read $0314/$0315 after init to get real play address")
+        print(f"[*] ASM will save post-init $0314 to $C620; Python reads $C620 for play address")
 
     if load_addr <= 0x07E7 and (load_addr + len(sid_data)) >= 0x0400:
         print(f"[!] PSID driver overlaps screen RAM ($0400-$07E7) — rows 0-7 may show driver artifacts")
 
     return {"load_addr": load_addr, "init_addr": init_addr,
-            "play_addr": play_addr, "data": sid_data}
+            "play_addr": play_addr, "data": sid_data, "clock": clock}
 
 def upload_sid_to_c64(psid):
     """Upload PSID code to C64 RAM, write trampolines, signal PRG to proceed."""
@@ -623,16 +645,17 @@ def upload_sid_to_c64(psid):
         # Signal PRG: $02 = SID ready, call init
         write_byte(C64_AUDIO_FLAG, 2)
         print(f"[*] SID uploaded — signalling PRG to run init (play_addr=0, $C002=2)...")
-        # Give PRG time to call init, which installs real play addr into $0314/$0315
+        # Give PRG time to call init; ASM saves SID's post-init $0314/$0315
+        # to $C620/$C621 before installing irq_handler, so we read the real
+        # SID play address rather than irq_handler's address.
         time.sleep(0.3)
-        # Read back the real play address from $0314/$0315
-        vec = u64_get("machine:readmem?address=314&length=2")
+        vec = u64_get("machine:readmem?address=C620&length=2")
         if vec and len(vec) == 2:
             real_play = vec[0] | (vec[1] << 8)
             print(f"[*] SID installed play address: ${real_play:04X} — patching $C610...")
             write_mem(0xC610, [0x4C, real_play & 0xFF, (real_play >> 8) & 0xFF])
         else:
-            print(f"[!] Could not read $0314 — play may not work")
+            print(f"[!] Could not read $C620 — play may not work")
 
 # ---------------------------------------------------------------------------
 # Keypress toggle
@@ -675,9 +698,14 @@ def pixel_to_char(val):
 # ---------------------------------------------------------------------------
 
 def main():
-    global U64, FPS
+    global U64, FPS, _YTDLP_COOKIE_ARGS
 
     args = parse_args()
+
+    if args.cookies_from_browser:
+        _YTDLP_COOKIE_ARGS = ["--cookies-from-browser", args.cookies_from_browser]
+    elif args.cookies:
+        _YTDLP_COOKIE_ARGS = ["--cookies", args.cookies]
 
     if args.version:
         print(f"sidviz_u64  v{VERSION}  build {BUILD}")
@@ -806,8 +834,12 @@ def main():
     # where the SID play routine expects PAL timing.
     # For local/MP3 modes the KERNAL timer is already correct.
     if c64_audio:
-        print("[*] Setting CIA1 timer for PAL 50Hz...")
-        write_mem(0xDC04, [0xF8, 0x4C])   # timer A latch lo=$F8, hi=$4C
+        if psid.get("clock") == 2:  # NTSC-only: 1022727 / 60 = 17045 = $4295
+            print("[*] NTSC SID — setting CIA1 timer for 60Hz...")
+            write_mem(0xDC04, [0x95, 0x42])
+        else:                       # PAL / unknown / both: 985248 / 50 = 19704 = $4CF8
+            print("[*] Setting CIA1 timer for PAL 50Hz...")
+            write_mem(0xDC04, [0xF8, 0x4C])
         write_byte(0xDC0E, 0x11)           # start timer A continuous, force reload
 
     # Send initial color mode and ticker
@@ -837,7 +869,7 @@ def main():
         if args.save:
             print(f"[*] Saving stream to: {args.save}")
             save_proc = subprocess.Popen(
-                ["yt-dlp", "-q", "-x", "--audio-format", "mp3", "-o", args.save, stream_url],
+                ["yt-dlp", "-q", "-x", "--audio-format", "mp3"] + _YTDLP_COOKIE_ARGS + ["-o", args.save, stream_url],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             procs.append(save_proc)
     else:

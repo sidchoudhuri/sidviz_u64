@@ -50,7 +50,7 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            build/*.exe
-            build/*.bin
-            build/*.app.zip
+            build/sidviz_u64-Windows.exe
+            build/sidviz_u64-Linux.bin
+            build/sidviz_u64-macOS
 

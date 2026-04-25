@@ -29,7 +29,7 @@ jobs:
         with:
           nuitka-version: main
           script-name: sidviz_c64.py
-          onefile: true  # This ensures a single file output
+          mode: onefile
           output-file: sidviz_u64-${{ runner.os }}
 
       - name: Publish to GitHub Release
@@ -37,10 +37,4 @@ jobs:
         with:
           tag_name: v${{ github.run_number }}
           name: Release v${{ github.run_number }}
-          draft: false
-          prerelease: false
-          files: |
-            build/sidviz_u64-Windows.exe
-            build/sidviz_u64-Linux
-            build/sidviz_u64-macOS
-            
+          files: build/* 

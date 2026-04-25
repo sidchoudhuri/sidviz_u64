@@ -10,7 +10,6 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # force node.js 24
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     permissions:
@@ -24,23 +23,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-    #      cache: 'pip'
-
-    # - name: Install dependencies
-    #    run: |
-    #      if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Build with Nuitka
         uses: Nuitka/Nuitka-Action@main
         with:
           nuitka-version: main
           script-name: sidviz_c64.py
-          mode: standalone
+          onefile: true  # This ensures a single file output
           output-file: sidviz_u64-${{ runner.os }}
-
-      - name: Prepare macOS App Bundle (Zip)
-        if: runner.os == 'macOS'
-        run: zip -r build/sidviz_u64-macOS.app.zip build/*.app
 
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -51,6 +41,6 @@ jobs:
           prerelease: false
           files: |
             build/sidviz_u64-Windows.exe
-            build/sidviz_u64-Linux.bin
+            build/sidviz_u64-Linux
             build/sidviz_u64-macOS
-
+            

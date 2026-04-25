@@ -24,11 +24,15 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.6.5"
-BUILD   = "2026-04-24"
+VERSION = "1.6.6"
+BUILD   = "2026-04-25"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, termios, tty, re, json, select as _select, struct
+
+# Populated in main() from --cookies-from-browser / --cookies CLI flags;
+# injected into every yt-dlp subprocess call.
+_YTDLP_COOKIE_ARGS: list = []
 
 FIFO_PATH    = "/tmp/sidpipe.wav"
 WIDTH        = 40
@@ -69,6 +73,10 @@ def parse_args():
     p.add_argument("--save",     metavar="FILE.mp3",     help="Save YouTube stream to MP3 (YouTube mode only)")
     p.add_argument("--yt-search", metavar="QUERY",        help="Search YouTube by title/artist and choose a result")
     p.add_argument("--yt-max",   type=int, default=10,    help="Max YouTube search results (default 10)")
+    p.add_argument("--cookies-from-browser", metavar="BROWSER",
+                   help="Browser to pull cookies from for yt-dlp auth (chrome, firefox, safari, edge, …)")
+    p.add_argument("--cookies",  metavar="FILE",
+                   help="Netscape-format cookies file for yt-dlp auth")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -214,12 +222,15 @@ def _spotify_info(url):
 
     return None
 
+def _is_cookie_error(text):
+    return "cookies-from-browser" in text or "Sign in to confirm" in text
+
 def get_stream_info(url):
     """Use yt-dlp to extract metadata from any supported streaming URL.
     For Spotify, falls back to the public oEmbed API if yt-dlp fails."""
     try:
         r = subprocess.run(
-            ["yt-dlp", "--dump-json", "--no-playlist", url],
+            ["yt-dlp", "--dump-json", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [url],
             capture_output=True, text=True, timeout=30
         )
         if not r.stdout.strip():
@@ -227,6 +238,8 @@ def get_stream_info(url):
         data = json.loads(r.stdout)
     except Exception as e:
         print(f"[!] yt-dlp metadata failed: {e}")
+        if not _YTDLP_COOKIE_ARGS and _is_cookie_error(str(e)):
+            print("[!] Hint: re-run with --cookies-from-browser BROWSER (e.g. chrome, firefox, safari)")
         if get_service(url) == "spotify":
             print("[*] Trying Spotify metadata fallback...")
             return _spotify_info(url)
@@ -265,7 +278,7 @@ def resolve_stream_url(url, info):
     print(f"[*] Spotify: searching YouTube for: {query}")
     try:
         r = subprocess.run(
-            ["yt-dlp", "--dump-json", "--no-playlist", f"ytsearch1:{query}"],
+            ["yt-dlp", "--dump-json", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [f"ytsearch1:{query}"],
             capture_output=True, text=True, timeout=30
         )
         data = json.loads(r.stdout)
@@ -283,7 +296,8 @@ def youtube_search(query, max_results=10):
     max_results = max(1, int(max_results or 10))
     try:
         r = subprocess.run(
-            ["yt-dlp", "--dump-json", "--flat-playlist", "--no-playlist", f"ytsearch{max_results}:{query}"],
+            ["yt-dlp", "--dump-json", "--flat-playlist", "--no-playlist"]
+            + _YTDLP_COOKIE_ARGS + [f"ytsearch{max_results}:{query}"],
             capture_output=True, text=True, timeout=30
         )
         if r.returncode != 0 or not r.stdout.strip():
@@ -342,7 +356,7 @@ def choose_youtube_result(results):
 def start_ffmpeg_waveform_stream(url):
     """Stream audio via yt-dlp piped to ffmpeg for waveform generation."""
     yt_proc = subprocess.Popen(
-        ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist", url],
+        ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [url],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
     cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
@@ -357,7 +371,7 @@ def start_ffmpeg_waveform_stream(url):
 def start_ffplay_stream(url):
     """Stream audio via yt-dlp piped to ffplay."""
     yt_proc = subprocess.Popen(
-        ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist", url],
+        ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [url],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
     p = subprocess.Popen(
@@ -675,9 +689,14 @@ def pixel_to_char(val):
 # ---------------------------------------------------------------------------
 
 def main():
-    global U64, FPS
+    global U64, FPS, _YTDLP_COOKIE_ARGS
 
     args = parse_args()
+
+    if args.cookies_from_browser:
+        _YTDLP_COOKIE_ARGS = ["--cookies-from-browser", args.cookies_from_browser]
+    elif args.cookies:
+        _YTDLP_COOKIE_ARGS = ["--cookies", args.cookies]
 
     if args.version:
         print(f"sidviz_u64  v{VERSION}  build {BUILD}")
@@ -837,7 +856,7 @@ def main():
         if args.save:
             print(f"[*] Saving stream to: {args.save}")
             save_proc = subprocess.Popen(
-                ["yt-dlp", "-q", "-x", "--audio-format", "mp3", "-o", args.save, stream_url],
+                ["yt-dlp", "-q", "-x", "--audio-format", "mp3"] + _YTDLP_COOKIE_ARGS + ["-o", args.save, stream_url],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             procs.append(save_proc)
     else:

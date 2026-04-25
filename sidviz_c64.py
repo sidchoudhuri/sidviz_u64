@@ -532,7 +532,7 @@ def make_fifo(path):
 def _build_viz_filter():
     if VIZ_MODE == "showfreqs":
         return (f"[0:a]showfreqs=s={WIDTH}x{HEIGHT}:mode=bar"
-                f":ascale=log:fscale=log:fps={FPS}:colors=#ffffff,format=gray")
+                f":ascale=log:fscale=log:colors=#ffffff,format=gray")
     return (f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
             f":rate={FPS}:colors=#ffffff,format=gray")
 

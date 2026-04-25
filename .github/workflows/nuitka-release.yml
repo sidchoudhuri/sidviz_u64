@@ -35,8 +35,8 @@ jobs:
         with:
           nuitka-version: main
           script-name: sidviz_c64.py
-          onefile: true
-          output-filename: sidviz_u64-${{ runner.os }}
+          mode: standalone
+          output-file: sidviz_u64-${{ runner.os }}
 
       - name: Prepare macOS App Bundle (Zip)
         if: runner.os == 'macOS'

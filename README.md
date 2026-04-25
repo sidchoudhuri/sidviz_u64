@@ -104,16 +104,23 @@ sudo apt install libsidplayfp-dev   # or equivalent for your distro
 
 ## Setup
 
-### 1. Build the C64 program
+### 1. Build the C64 program or use the included .prg file
 
 ```bash
 64tass -a -B -o sidviz.prg sidviz.asm
 ```
 
-This only needs to be done once (or after modifying the assembly).
+This only needs to be done if the assembly file has changed.
 
-### 2. Run
+### 2. Run the Python script or the platform-specific compiled binary
 
+```bash
+sidviz_u64-Linux [file | URL] [options]
+
+sidviz_u64-macOS [file | URL] [options]
+
+sidviz_u64-Windows.exe [file | URL] [options]
+```
 ```bash
 python3 sidviz_u64.py [file | URL] [options]
 ```

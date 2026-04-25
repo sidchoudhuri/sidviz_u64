@@ -456,7 +456,7 @@ fr0_lp: sta (dst_lo),y
 
 ; ---------------------------------------------------------------------------
 ; density_colors: white density palette
-; space->0, .->11, :->12, *->15, #/@->1
+; space->0, .->11(dkgray), :->12(mdgray), !->15(ltgray), *->1(white), %/#/@->1(white)
 ; ---------------------------------------------------------------------------
 
 density_colors:
@@ -497,7 +497,7 @@ char_to_color:
         beq ctc_dkgray
         cmp #$3a
         beq ctc_mdgray
-        cmp #$2a
+        cmp #$21
         beq ctc_ltgray
         lda #1
         rts
@@ -516,7 +516,7 @@ ctc_ltgray:
 
 ; ---------------------------------------------------------------------------
 ; density_colors_fire: fire palette
-; space->0, .->9(brown), :->10(ltred), *->8(orange), #/@->2(red)
+; space->0, .->9(brown), :->10(ltred), !->8(orange), *->7(yellow), %/#/@->2(red)
 ; ---------------------------------------------------------------------------
 
 density_colors_fire:
@@ -557,8 +557,10 @@ char_to_color_fire:
         beq cfire_brown
         cmp #$3a
         beq cfire_ltred
-        cmp #$2a
+        cmp #$21
         beq cfire_orange
+        cmp #$2a
+        beq cfire_yellow
         lda #2
         rts
 cfire_black:
@@ -572,6 +574,9 @@ cfire_ltred:
         rts
 cfire_orange:
         lda #8
+        rts
+cfire_yellow:
+        lda #7
         rts
 
 ; ---------------------------------------------------------------------------

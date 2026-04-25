@@ -933,15 +933,16 @@ def main():
     if mode == "sid":
         make_fifo(FIFO_PATH)
         ffmpeg_proc   = start_ffmpeg_waveform_fifo()
-        time.sleep(0.3)
-        sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
-
         if c64_audio:
-            # Upload SID code + write trampolines + write $C002=$02 to release PRG
+            # Upload first — C64 starts playing at the end of upload_sid_to_c64.
+            # Then start sidplayfp so the waveform is in sync with the C64.
+            # The upload takes long enough that ffmpeg has time to open the FIFO.
             upload_sid_to_c64(psid)
+            sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
             procs = [sid_fifo_proc, ffmpeg_proc]
         else:
-            # local audio — $C002 stays $00, PRG already in main loop
+            time.sleep(0.3)           # give ffmpeg time to open FIFO before sidplayfp writes
+            sid_fifo_proc  = start_sidplayfp_fifo(filepath, sid_duration_secs)
             sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
             procs = [sid_fifo_proc, sid_audio_proc, ffmpeg_proc]
     elif mode == "stream":

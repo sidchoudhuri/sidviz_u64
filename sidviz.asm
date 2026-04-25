@@ -2,7 +2,7 @@
 ; 64tass assembler
 ; autostart SYS 2064
 ;
-; version 1.6.5 (2026-04-24)
+; version 1.6.7 (2026-04-25)
 ;
 ; Single PRG handles all modes via $C002 flag:
 ;   $C002 = $00  Mac/MP3 mode   — no SID player, normal display
@@ -13,7 +13,6 @@
 ;   $C000     = frame flag      (Python writes 1, ASM clears to 0)
 ;   $C001     = color flag      (2=rainbow, 1=white density, 3=fire density)
 ;   $C002     = c64_audio_flag  (0=off, 1=wait, 2=ready — Python controls)
-;   $C003     = sid_play_flag   (IRQ sets 1, main loop calls play+clears)
 ;   $C100     = frame buffer    (680 bytes, rows 8-24)
 ;   $C500     = ticker buffer   (up to 253 PETSCII chars)
 ;   $C5FC     = color_mode      (ASM owns: 0=rainbow, 1=white, 2=fire)
@@ -22,6 +21,7 @@
 ;   $C5FF     = ticker position (ASM owns)
 ;   $C600     = JMP initAddress trampoline (Python writes when c64_audio)
 ;   $C610     = JMP playAddress trampoline (Python writes when c64_audio)
+;   $C620/$C621 = SID play vector saved post-init (play_addr=0 SIDs)
 ;
 ; ZP usage:
 ;   $F9/$FA   = saved original IRQ vector (for chain)
@@ -62,7 +62,6 @@ wave_col    = $d940
 frame_flag      = $c000
 color_flag      = $c001
 c64_audio_flag  = $c002   ; 0=off, 1=wait for SID upload, 2=SID ready
-sid_play_flag   = $c003   ; IRQ sets 1, main loop calls play and clears
 frame_buf       = $c100
 ticker_buf      = $c500
 color_mode      = $c5fc
@@ -103,7 +102,6 @@ init:
         sta color_flag
         sta color_mode
         sta ticker_pos
-        sta sid_play_flag
         sta c64_audio_flag
 
         ; Init IRQ tick counter
@@ -146,6 +144,14 @@ wait_sid:
         ; JSR $C600 -> JMP initAddr -> init runs -> RTS returns here
         jsr $c600
 
+        ; Save SID's post-init IRQ vector ($0314/$0315) to $C620/$C621 before
+        ; we overwrite $0314 with irq_handler.  Python reads $C620/$C621 for
+        ; play_addr=0 SIDs to get the correct play routine address.
+        lda irq_vec_lo
+        sta $c620
+        lda irq_vec_hi
+        sta $c621
+
 no_c64_audio:
         ; Hook IRQ to our handler
         ; If C64 audio: orig_irq_lo/hi has pre-SID KERNAL vector (safe chain)
@@ -162,17 +168,6 @@ no_c64_audio:
 ; ---------------------------------------------------------------------------
 
 main_loop:
-        ; Call SID play if IRQ flagged it AND C64 audio is active
-        lda sid_play_flag
-        beq check_color
-        lda #$00
-        sta sid_play_flag
-        lda c64_audio_flag
-        cmp #$02
-        bne check_color     ; not in C64 audio mode, skip play
-        jsr $c610           ; JMP playAddress trampoline (Python wrote this)
-
-check_color:
         lda color_flag
         beq check_frame
 
@@ -216,7 +211,7 @@ do_density_white:
 
 ; ---------------------------------------------------------------------------
 ; IRQ handler — saves/restores all registers
-; Sets sid_play_flag for main loop, scrolls ticker
+; Calls SID play directly at IRQ rate, scrolls ticker
 ; ---------------------------------------------------------------------------
 
 irq_handler:
@@ -226,9 +221,12 @@ irq_handler:
         tya
         pha
 
-        ; Signal main loop to call SID play (main loop checks c64_audio_flag)
-        lda #$01
-        sta sid_play_flag
+        ; Call SID play directly — exact timing regardless of main loop load
+        lda c64_audio_flag
+        cmp #$02
+        bne irq_skip_play
+        jsr $c610
+irq_skip_play:
 
         ; Ticker scroll every SCROLL_RATE IRQs
         dec irq_tick

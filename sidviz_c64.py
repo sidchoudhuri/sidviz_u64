@@ -81,9 +81,17 @@ CHARS_SCOPE_DEF = [        # avectorscope (least → most dense)
     (42,  15,   8),         # *          light gray  orange
     (35,   1,   2),         # #          white       red
 ]
+CHARS_SPECTRUM_DEF = [     # showspectrum (least → most dense)
+    (32,   0,   0),         # space      black       black
+    (46,  11,   9),         # .          dark gray   brown
+    (58,  12,  10),         # :          med gray    light red
+    (42,  15,   8),         # *          light gray  orange
+    (35,   1,   7),         # #          white       yellow
+]
 CHARS      = [t[0] for t in CHARS_DEF]
 CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]
 CHARS_SCOPE = [t[0] for t in CHARS_SCOPE_DEF]
+CHARS_SPECTRUM = [t[0] for t in CHARS_SPECTRUM_DEF]
 SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
@@ -117,6 +125,7 @@ def parse_args():
     p.add_argument("--showwaves",     action="store_true", help="Force waveform visualization")
     p.add_argument("--showfreqs",     action="store_true", help="Force frequency spectrum visualization")
     p.add_argument("--avectorscope",  action="store_true", help="Force vectorscope (oscilloscope) visualization")
+    p.add_argument("--showspectrum",  action="store_true", help="Force scrolling spectrogram visualization")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -508,8 +517,10 @@ def write_color_tables():
         defs = CHARS_DEF
     elif VIZ_MODE == "showfreqs":
         defs = CHARS_FREQ_DEF
-    else:
+    elif VIZ_MODE == "avectorscope":
         defs = CHARS_SCOPE_DEF
+    else:
+        defs = CHARS_SPECTRUM_DEF
     for code, wcol, fcol in defs:
         white[code] = wcol
         fire[code]  = fcol
@@ -596,6 +607,12 @@ def _build_viz_filter():
                 f",format=gray")
         print(f"[*] avectorscope filter: {filt}")
         return filt
+    if VIZ_MODE == "showspectrum":
+        # slide=scroll: time moves left, new data arrives on right (waterfall)
+        # scale=log: log frequency axis — equal space per octave, better for music
+        # color=intensity: brightness = amplitude
+        return (f"[0:a]showspectrum=s={WIDTH}x{HEIGHT}:slide=scroll"
+                f":scale=log:color=intensity,format=gray")
     return (f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
             f":rate={FPS}:colors=#ffffff,format=gray")
 
@@ -840,10 +857,13 @@ def main():
         VIZ_MODE = "showfreqs"
     elif args.avectorscope:
         VIZ_MODE = "avectorscope"
+    elif args.showspectrum:
+        VIZ_MODE = "showspectrum"
     else:
-        ans = input("Visualization? [0=waveform, 1=spectrum, 2=scope] (default 0): ").strip()
+        ans = input("Visualization? [0=waveform, 1=spectrum, 2=scope, 3=spectrogram] (default 0): ").strip()
         if ans == "1":   VIZ_MODE = "showfreqs"
         elif ans == "2": VIZ_MODE = "avectorscope"
+        elif ans == "3": VIZ_MODE = "showspectrum"
         else:            VIZ_MODE = "showwaves"
     print(f"[*] Viz mode: {VIZ_MODE}")
 
@@ -1033,6 +1053,8 @@ def main():
                 screen = bytes(pixel_to_char(p, CHARS_FREQ) for p in raw)
             elif VIZ_MODE == "avectorscope":
                 screen = bytes(pixel_to_char(p, CHARS_SCOPE) for p in raw)
+            elif VIZ_MODE == "showspectrum":
+                screen = bytes(pixel_to_char(p, CHARS_SPECTRUM) for p in raw)
             else:
                 screen = bytes(pixel_to_char(p) for p in raw)
             write_mem(FRAME_BUF, screen)

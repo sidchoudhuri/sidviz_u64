@@ -73,7 +73,7 @@ sudo pacman -S --needed ffmpeg sidplayfp yt-dlp 64tass
 yay -S sidplayfp 64tass
 ```
 
-#### IDUN Cartridge Linux (Arch 33-bit)
+#### IDUN Cartridge Linux (Arch 32-bit)
 
 ```bash
 sudo pacman -S --needed sidplayfp yt-dlp 64tass

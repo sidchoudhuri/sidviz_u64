@@ -590,9 +590,9 @@ def _build_viz_filter():
         # Use aformat to reliably mix to mono, split into two copies, delay one
         # by 8ms, amerge as stereo → L≠R → ellipses that change shape with pitch.
         filt = (f"[0:a]aformat=channel_layouts=mono,asplit=2[La][Ra];"
-                f"[Ra]adelay=8[Rd];"
+                f"[Ra]adelay=2[Rd];"
                 f"[La][Rd]amerge=inputs=2[S];"
-                f"[S]avectorscope=s={WIDTH}x{HEIGHT}:zoom=1.3:draw=line"
+                f"[S]avectorscope=s={WIDTH}x{HEIGHT}:zoom=1.8:draw=dot:scale=log"
                 f",format=gray")
         print(f"[*] avectorscope filter: {filt}")
         return filt

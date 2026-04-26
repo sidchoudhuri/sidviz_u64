@@ -74,8 +74,16 @@ CHARS_FREQ_DEF = [          # showfreqs  (least → most dense)
     (35,   1,   2),         # #          white       red
     (42,   1,   2),         # *          white       red
 ]
+CHARS_SCOPE_DEF = [        # avectorscope (least → most dense)
+    (32,   0,   0),         # space      black       black
+    (46,  11,   6),         # .          dark gray   blue
+    (58,   5,   3),         # :          green       cyan
+    (42,  13,  14),         # *          light green light blue
+    (35,   1,   1),         # #          white       white
+]
 CHARS      = [t[0] for t in CHARS_DEF]
 CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]
+CHARS_SCOPE = [t[0] for t in CHARS_SCOPE_DEF]
 SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
@@ -106,8 +114,9 @@ def parse_args():
                    help="Browser to pull cookies from for yt-dlp auth (chrome, firefox, safari, edge, …)")
     p.add_argument("--cookies",  metavar="FILE",
                    help="Netscape-format cookies file for yt-dlp auth")
-    p.add_argument("--showwaves", action="store_true",    help="Force waveform visualization")
-    p.add_argument("--showfreqs", action="store_true",    help="Force frequency spectrum visualization")
+    p.add_argument("--showwaves",     action="store_true", help="Force waveform visualization")
+    p.add_argument("--showfreqs",     action="store_true", help="Force frequency spectrum visualization")
+    p.add_argument("--avectorscope",  action="store_true", help="Force vectorscope (oscilloscope) visualization")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -495,7 +504,12 @@ def write_byte(addr, val):
 def write_color_tables():
     white = [0] * 128
     fire  = [0] * 128
-    defs = CHARS_DEF if VIZ_MODE == "showwaves" else CHARS_FREQ_DEF
+    if VIZ_MODE == "showwaves":
+        defs = CHARS_DEF
+    elif VIZ_MODE == "showfreqs":
+        defs = CHARS_FREQ_DEF
+    else:
+        defs = CHARS_SCOPE_DEF
     for code, wcol, fcol in defs:
         white[code] = wcol
         fire[code]  = fcol
@@ -571,6 +585,9 @@ def _build_viz_filter():
     if VIZ_MODE == "showfreqs":
         return (f"[0:a]showfreqs=s={WIDTH}x{HEIGHT}:mode=bar"
                 f":ascale=log:fscale=log:colors=#ffffff,format=gray")
+    if VIZ_MODE == "avectorscope":
+        return (f"[0:a]avectorscope=s={WIDTH}x{HEIGHT}:zoom=1.3:draw=line"
+                f",format=gray")
     return (f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
             f":rate={FPS}:colors=#ffffff,format=gray")
 
@@ -813,9 +830,13 @@ def main():
         VIZ_MODE = "showwaves"
     elif args.showfreqs:
         VIZ_MODE = "showfreqs"
+    elif args.avectorscope:
+        VIZ_MODE = "avectorscope"
     else:
-        ans = input("Visualization? [0=waveform, 1=spectrum] (default 0): ").strip()
-        VIZ_MODE = "showfreqs" if ans == "1" else "showwaves"
+        ans = input("Visualization? [0=waveform, 1=spectrum, 2=scope] (default 0): ").strip()
+        if ans == "1":   VIZ_MODE = "showfreqs"
+        elif ans == "2": VIZ_MODE = "avectorscope"
+        else:            VIZ_MODE = "showwaves"
     print(f"[*] Viz mode: {VIZ_MODE}")
 
     if args.color:      color_mode_init = 0
@@ -1002,6 +1023,8 @@ def main():
             if VIZ_MODE == "showfreqs":
                 raw = _apply_freq_gradient(raw, state["color_mode"])
                 screen = bytes(pixel_to_char(p, CHARS_FREQ) for p in raw)
+            elif VIZ_MODE == "avectorscope":
+                screen = bytes(pixel_to_char(p, CHARS_SCOPE) for p in raw)
             else:
                 screen = bytes(pixel_to_char(p) for p in raw)
             write_mem(FRAME_BUF, screen)

@@ -586,7 +586,12 @@ def _build_viz_filter():
         return (f"[0:a]showfreqs=s={WIDTH}x{HEIGHT}:mode=bar"
                 f":ascale=log:fscale=log:colors=#ffffff,format=gray")
     if VIZ_MODE == "avectorscope":
-        return (f"[0:a]avectorscope=s={WIDTH}x{HEIGHT}:zoom=1.3:draw=line"
+        # SID is mono (L=R), so split and delay one channel to create phase
+        # difference — produces rotating ellipses that change shape with pitch
+        return (f"[0:a]asplit=2[L][R];"
+                f"[R]adelay=0|8[Rd];"
+                f"[L][Rd]amerge=inputs=2[S];"
+                f"[S]avectorscope=s={WIDTH}x{HEIGHT}:zoom=1.3:draw=line"
                 f",format=gray")
     return (f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
             f":rate={FPS}:colors=#ffffff,format=gray")

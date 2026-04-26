@@ -76,10 +76,10 @@ CHARS_FREQ_DEF = [          # showfreqs  (least → most dense)
 ]
 CHARS_SCOPE_DEF = [        # avectorscope (least → most dense)
     (32,   0,   0),         # space      black       black
-    (46,  11,   6),         # .          dark gray   blue
-    (58,   5,   3),         # :          green       cyan
-    (42,  13,  14),         # *          light green light blue
-    (35,   1,   1),         # #          white       white
+    (46,  11,   7),         # .          dark gray   yellow
+    (58,  12,  10),         # :          med gray    light red
+    (42,  15,   8),         # *          light gray  orange
+    (35,   1,   2),         # #          white       red
 ]
 CHARS      = [t[0] for t in CHARS_DEF]
 CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]

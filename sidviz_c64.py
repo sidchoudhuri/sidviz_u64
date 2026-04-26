@@ -586,15 +586,16 @@ def _build_viz_filter():
         return (f"[0:a]showfreqs=s={WIDTH}x{HEIGHT}:mode=bar"
                 f":ascale=log:fscale=log:colors=#ffffff,format=gray")
     if VIZ_MODE == "avectorscope":
-        # avectorscope lissajous mode maps X=L-R, Y=L+R.  SID is mono (L=R)
-        # so X is always 0 → vertical line.  Fix: mix to mono, split into two
-        # copies, delay one by 8ms, join as stereo → X≠0 → ellipses.
-        return (f"[0:a]pan=mono|c0=0.5*c0+0.5*c1[M];"
-                f"[M]asplit=2[La][Ra];"
+        # avectorscope lissajous mode: X=L, Y=R.  SID is mono so L=R → diagonal.
+        # Use aformat to reliably mix to mono, split into two copies, delay one
+        # by 8ms, amerge as stereo → L≠R → ellipses that change shape with pitch.
+        filt = (f"[0:a]aformat=channel_layouts=mono,asplit=2[La][Ra];"
                 f"[Ra]adelay=8[Rd];"
                 f"[La][Rd]amerge=inputs=2[S];"
                 f"[S]avectorscope=s={WIDTH}x{HEIGHT}:zoom=1.3:draw=line"
                 f",format=gray")
+        print(f"[*] avectorscope filter: {filt}")
+        return filt
     return (f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
             f":rate={FPS}:colors=#ffffff,format=gray")
 

@@ -626,8 +626,7 @@ def _build_viz_filter():
                 f":scale=log:color=intensity,format=gray")
     if VIZ_MODE == "ahistogram":
         # X axis = sample amplitude, Y axis = count (log scale)
-        # dmode=stack: mono SID channels stacked — full height bars
-        return (f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=log:dmode=stack"
+        return (f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=log"
                 f",format=gray")
     return (f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
             f":rate={FPS}:colors=#ffffff,format=gray")

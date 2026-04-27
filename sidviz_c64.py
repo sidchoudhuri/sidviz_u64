@@ -625,8 +625,8 @@ def _build_viz_filter():
         return (f"[0:a]showspectrum=s={WIDTH}x{HEIGHT}:slide=scroll"
                 f":scale=log:color=intensity,format=gray")
     if VIZ_MODE == "ahistogram":
-        # X axis = sample amplitude, Y axis = count (log scale)
-        return (f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=log"
+        # X axis = sample amplitude, Y axis = time (scrolls up), brightness = count
+        return (f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=log:slide=scroll"
                 f",format=gray")
     return (f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
             f":rate={FPS}:colors=#ffffff,format=gray")

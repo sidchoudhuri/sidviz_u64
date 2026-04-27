@@ -726,7 +726,58 @@ def parse_psid(filepath):
     return {"load_addr": load_addr, "init_addr": init_addr,
             "play_addr": play_addr, "data": sid_data, "clock": clock}
 
-def upload_sid_to_c64(psid):
+# 6502 opcodes that write to an absolute address (3-byte encoding: opcode lo hi)
+_WRITE_ABS_OPCODES = frozenset([
+    0x8D,  # STA abs
+    0x9D,  # STA abs,X
+    0x99,  # STA abs,Y
+    0x8E,  # STX abs
+    0x8C,  # STY abs
+    0xEE,  # INC abs
+    0xCE,  # DEC abs
+    0x0E,  # ASL abs
+    0x4E,  # LSR abs
+    0x2E,  # ROL abs
+    0x6E,  # ROR abs
+])
+
+def scan_sid_screen_writes(data, lo=0x0450, hi=0x053F):
+    """Heuristic: scan for absolute-mode write instructions targeting lo..hi.
+    False positives possible if data bytes happen to match opcode patterns."""
+    for i in range(len(data) - 2):
+        if data[i] in _WRITE_ABS_OPCODES:
+            addr = data[i+1] | (data[i+2] << 8)
+            if lo <= addr <= hi:
+                return True
+    return False
+
+def _c64audio_height(psid):
+    """Determine visualization row range for c64audio mode.
+    Returns HEIGHT_EXTENDED (rows 2-24) or HEIGHT_C64AUDIO (rows 8-24)."""
+    load = psid["load_addr"]
+    data = psid["data"]
+    end  = load + len(data) - 1
+
+    # SID code loaded in rows 2-7: copy_frame would overwrite SID code with
+    # PETSCII characters, corrupting it. No choice — lock to rows 8-24.
+    if load <= 0x053F and end >= 0x0450:
+        print(f"[!] SID code spans rows 2-7 (${load:04X}-${end:04X})"
+              f" — visualization locked to rows 8-24 to protect SID code.")
+        return HEIGHT_C64AUDIO
+
+    # SID may actively write to rows 2-7 during playback (heuristic scan).
+    # Safe to show visualization over it (SID keeps running), but user may
+    # prefer a clean display.
+    if scan_sid_screen_writes(data, 0x0450, 0x053F):
+        print(f"[*] This SID may write characters to screen rows 2-7 during playback.")
+        ans = input("    [2] rows 2-24 (full height, SID output visible)"
+                    "  [8] rows 8-24 (clean): ").strip()
+        if ans == "8":
+            return HEIGHT_C64AUDIO
+
+    return HEIGHT_EXTENDED
+
+
     """Upload PSID code to C64 RAM, write trampolines, signal PRG to proceed."""
     load_addr = psid["load_addr"]
     init_addr = psid["init_addr"]
@@ -971,9 +1022,9 @@ def main():
                 c64_audio = False
 
     # Set HEIGHT and viz_mode now that c64_audio is final
-    HEIGHT = HEIGHT_C64AUDIO if c64_audio else HEIGHT_EXTENDED
+    HEIGHT = _c64audio_height(psid) if (c64_audio and psid) else HEIGHT_EXTENDED
     # Write viz_mode while C64 is at BASIC (after reboot, before run_prg)
-    write_byte(VIZ_MODE_FLAG, 0 if c64_audio else 1)
+    write_byte(VIZ_MODE_FLAG, 0 if HEIGHT == HEIGHT_C64AUDIO else 1)
 
     # Run PRG — PRG clears $C002 in init, so no stale values from previous runs
     print(f"[*] Running {PRG_REMOTE}...")

@@ -623,11 +623,12 @@ def _build_viz_filter():
         print(f"[*] avectorscope filter: {filt}")
         return filt
     if VIZ_MODE == "showspectrum":
-        # slide=scroll: time moves left, new data arrives on right (waterfall)
-        # scale=log: log frequency axis — equal space per octave, better for music
+        # slide=scroll: time moves left, new data on right (waterfall)
+        # scale=log: amplitude on log scale (dB)
+        # fscale=log: frequency axis logarithmic — equal rows per octave, same as showfreqs
         # color=intensity: brightness = amplitude
         return (f"[0:a]showspectrum=s={WIDTH}x{HEIGHT}:slide=scroll"
-                f":scale=log:color=intensity,format=gray")
+                f":scale=log:fscale=log:color=intensity,format=gray")
     if VIZ_MODE == "ahistogram":
         # X axis = sample amplitude, Y axis = time (scrolls up), brightness = count
         return (f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=log:slide=scroll"

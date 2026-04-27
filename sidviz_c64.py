@@ -88,10 +88,18 @@ CHARS_SPECTRUM_DEF = [     # showspectrum (least → most dense)
     (33,  15,   8),         # !          light gray  orange
     (43,   1,   7),         # +          white       yellow
 ]
+CHARS_HIST_DEF = [         # ahistogram (least → most dense)
+    (32,   0,   0),         # space      black       black
+    (46,  11,   5),         # .          dark gray   green
+    (58,  12,  13),         # :          med gray    light green
+    (42,  15,   7),         # *          light gray  yellow
+    (35,   1,   1),         # #          white       white
+]
 CHARS      = [t[0] for t in CHARS_DEF]
 CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]
 CHARS_SCOPE = [t[0] for t in CHARS_SCOPE_DEF]
 CHARS_SPECTRUM = [t[0] for t in CHARS_SPECTRUM_DEF]
+CHARS_HIST = [t[0] for t in CHARS_HIST_DEF]
 SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
@@ -126,6 +134,7 @@ def parse_args():
     p.add_argument("--showfreqs",     action="store_true", help="Force frequency spectrum visualization")
     p.add_argument("--avectorscope",  action="store_true", help="Force vectorscope (oscilloscope) visualization")
     p.add_argument("--showspectrum",  action="store_true", help="Force scrolling spectrogram visualization")
+    p.add_argument("--ahistogram",    action="store_true", help="Force amplitude histogram visualization")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -519,8 +528,10 @@ def write_color_tables():
         defs = CHARS_FREQ_DEF
     elif VIZ_MODE == "avectorscope":
         defs = CHARS_SCOPE_DEF
-    else:
+    elif VIZ_MODE == "showspectrum":
         defs = CHARS_SPECTRUM_DEF
+    else:
+        defs = CHARS_HIST_DEF
     for code, wcol, fcol in defs:
         white[code] = wcol
         fire[code]  = fcol
@@ -613,6 +624,11 @@ def _build_viz_filter():
         # color=intensity: brightness = amplitude
         return (f"[0:a]showspectrum=s={WIDTH}x{HEIGHT}:slide=scroll"
                 f":scale=log:color=intensity,format=gray")
+    if VIZ_MODE == "ahistogram":
+        # X axis = sample amplitude, Y axis = count (log scale)
+        # dmode=stack: mono SID channels stacked — full height bars
+        return (f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=log:dmode=stack"
+                f",format=gray")
     return (f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
             f":rate={FPS}:colors=#ffffff,format=gray")
 
@@ -859,11 +875,14 @@ def main():
         VIZ_MODE = "avectorscope"
     elif args.showspectrum:
         VIZ_MODE = "showspectrum"
+    elif args.ahistogram:
+        VIZ_MODE = "ahistogram"
     else:
-        ans = input("Visualization? [0=waveform, 1=spectrum, 2=scope, 3=spectrogram] (default 0): ").strip()
+        ans = input("Visualization? [0=waveform, 1=spectrum, 2=scope, 3=spectrogram, 4=histogram] (default 0): ").strip()
         if ans == "1":   VIZ_MODE = "showfreqs"
         elif ans == "2": VIZ_MODE = "avectorscope"
         elif ans == "3": VIZ_MODE = "showspectrum"
+        elif ans == "4": VIZ_MODE = "ahistogram"
         else:            VIZ_MODE = "showwaves"
     print(f"[*] Viz mode: {VIZ_MODE}")
 
@@ -1055,6 +1074,8 @@ def main():
                 screen = bytes(pixel_to_char(p, CHARS_SCOPE) for p in raw)
             elif VIZ_MODE == "showspectrum":
                 screen = bytes(pixel_to_char(p, CHARS_SPECTRUM) for p in raw)
+            elif VIZ_MODE == "ahistogram":
+                screen = bytes(pixel_to_char(p, CHARS_HIST) for p in raw)
             else:
                 screen = bytes(pixel_to_char(p) for p in raw)
             write_mem(FRAME_BUF, screen)

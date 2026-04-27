@@ -3,14 +3,17 @@
 sidviz_u64.py -- SID/audio waveform visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 
-version 1.6.5 (2026-04-24)
+version 1.7.8 (2026-04-25)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
   $C001     = color flag  (2=rainbow, 1=white density, 3=fire density)
   $C002     = sid_ready   (Python sets 1 after uploading SID code)
+  $C003     = quit_flag   (Python writes 1 to stop SID and return C64 to BASIC)
   $C620/$C621 = SID play vector saved post-init (play_addr=0 SIDs)
   $C100     = frame buffer, 680 bytes PETSCII (rows 8-24, $C100-$C3A7)
+  $C3A8     = white density color table, 128 bytes (screen_code → C64 color)
+  $C428     = fire  density color table, 128 bytes (screen_code → C64 color)
   $C500     = ticker buffer, up to 253 PETSCII chars
   $C5FC     = color_mode  (ASM owns: 0=rainbow, 1=white, 2=fire)
   $C5FD     = irq_tick    (ASM owns)
@@ -24,7 +27,7 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.6.7"
+VERSION = "1.7.8"
 BUILD   = "2026-04-25"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
@@ -41,16 +44,66 @@ FRAME_BUF    = 0xC100
 FRAME_FLAG   = 0xC000
 COLOR_FLAG   = 0xC001
 C64_AUDIO_FLAG = 0xC002  # 0=off, 1=waiting, 2=SID ready
+QUIT_FLAG      = 0xC003  # Python writes 1 → C64 silences SID and JMPs to BASIC
 TICKER_BUF   = 0xC500
 TICKER_LEN   = 0xC5FE
 TICKER_ROW   = 0x0428          # screen RAM row 1
 PRG_LOCAL    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidviz.prg")
 PRG_REMOTE   = "sidviz.prg"
 TIMEOUT      = 5.0
-CHARS        = [32, 46, 58, 42, 35, 64]
+# C64 colors: 0=black 1=white 2=red 7=yellow 8=orange 9=brown 10=ltred 11=dkgray 12=mdgray 15=ltgray
+WHITE_CTABLE_ADDR = 0xC3A8   # 128-byte table written by Python: screen_code → C64 color
+FIRE_CTABLE_ADDR  = 0xC428   # 128-byte table written by Python: screen_code → C64 color
+
+#                             code       white       fire
+CHARS_DEF = [               # showwaves  (least → most dense)
+    (32,   0,   0),         # space      black       black
+    (46,  11,   9),         # .          dark gray   brown
+    (58,  12,  10),         # :          med gray    light red
+    (42,  15,   8),         # *          light gray  orange
+    (35,   1,   2),         # #          white       red
+    (64,   1,   2),         # ─          white       red
+]
+CHARS_FREQ_DEF = [          # showfreqs  (least → most dense)
+    (32,   0,   0),         # space      black       black
+    (46,  11,   7),         # .          dark gray   yellow
+    (58,  12,  10),         # :          med gray    light red
+    (33,  15,   8),         # !          light gray  orange
+    (43,   1,   9),         # +          white       brown
+    (34,   1,   2),         # "          white       red
+    (35,   1,   2),         # #          white       red
+    (42,   1,   2),         # *          white       red
+]
+CHARS_SCOPE_DEF = [         # avectorscope (least → most dense)
+    (32,   0,   0),         # space      black       black
+    (46,  11,   7),         # .          dark gray   yellow
+    (58,  12,  10),         # :          med gray    light red
+    (42,  15,   8),         # *          light gray  orange
+    (35,   1,   2),         # #          white       red
+]
+CHARS_SPECTRUM_DEF = [      # showspectrum (least → most dense)
+    (32,   0,   0),         # space      black       black
+    (46,  11,   9),         # .          dark gray   brown
+    (58,  12,   2),         # :          med gray    red
+    (33,  15,  10),         # !          light gray  light red
+    (43,   1,   8),         # +          white       orange
+]
+CHARS_HIST_DEF = [          # ahistogram (least → most dense)
+    (32,   0,   0),         # space      black       black
+    (46,  11,   9),         # .          dark gray   brown
+    (58,  12,  10),         # :          med gray    light red
+    (42,  15,   8),         # *          light gray  orange
+    (35,   1,   2),         # #          white       red
+]
+CHARS      = [t[0] for t in CHARS_DEF]
+CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]
+CHARS_SCOPE = [t[0] for t in CHARS_SCOPE_DEF]
+CHARS_SPECTRUM = [t[0] for t in CHARS_SPECTRUM_DEF]
+CHARS_HIST = [t[0] for t in CHARS_HIST_DEF]
 SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
+VIZ_MODE     = "showwaves"
 
 # ---------------------------------------------------------------------------
 # Args
@@ -77,6 +130,11 @@ def parse_args():
                    help="Browser to pull cookies from for yt-dlp auth (chrome, firefox, safari, edge, …)")
     p.add_argument("--cookies",  metavar="FILE",
                    help="Netscape-format cookies file for yt-dlp auth")
+    p.add_argument("--showwaves",     action="store_true", help="Force waveform visualization")
+    p.add_argument("--showfreqs",     action="store_true", help="Force frequency spectrum visualization")
+    p.add_argument("--avectorscope",  action="store_true", help="Force vectorscope (oscilloscope) visualization")
+    p.add_argument("--showspectrum",  action="store_true", help="Force scrolling spectrogram visualization")
+    p.add_argument("--ahistogram",    action="store_true", help="Force amplitude histogram visualization")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -360,8 +418,7 @@ def start_ffmpeg_waveform_stream(url):
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
     cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
-           "-filter_complex",
-           f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
+           "-filter_complex", _build_viz_filter(),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     yt_proc.stdout.close()  # let ffmpeg own the pipe; yt_proc gets SIGPIPE if ffmpeg exits early
@@ -462,6 +519,25 @@ def write_mem(addr, data):
 def write_byte(addr, val):
     u64_put("machine:writemem", {"address": f"{addr:X}", "data": f"{val:02X}"})
 
+def write_color_tables():
+    white = [0] * 128
+    fire  = [0] * 128
+    if VIZ_MODE == "showwaves":
+        defs = CHARS_DEF
+    elif VIZ_MODE == "showfreqs":
+        defs = CHARS_FREQ_DEF
+    elif VIZ_MODE == "avectorscope":
+        defs = CHARS_SCOPE_DEF
+    elif VIZ_MODE == "showspectrum":
+        defs = CHARS_SPECTRUM_DEF
+    else:
+        defs = CHARS_HIST_DEF
+    for code, wcol, fcol in defs:
+        white[code] = wcol
+        fire[code]  = fcol
+    write_mem(WHITE_CTABLE_ADDR, white)
+    write_mem(FIRE_CTABLE_ADDR,  fire)
+
 def ftp_upload(local_path, remote_name):
     ip  = U64.replace("http://", "")
     url = f"ftp://{ip}/Temp/{remote_name}"
@@ -527,10 +603,39 @@ def make_fifo(path):
     os.mkfifo(path)
     print(f"[*] FIFO created: {path}")
 
-def start_ffmpeg_waveform_fifo():
-    cmd = ["ffmpeg", "-loglevel", "quiet", "-f", "wav", "-i", FIFO_PATH,
-           "-filter_complex",
-           f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
+def _build_viz_filter():
+    if VIZ_MODE == "showfreqs":
+        return (f"[0:a]showfreqs=s={WIDTH}x{HEIGHT}:mode=bar"
+                f":ascale=log:fscale=log:colors=#ffffff,format=gray")
+    if VIZ_MODE == "avectorscope":
+        # avectorscope lissajous mode: X=L, Y=R.  SID is mono so L=R → diagonal.
+        # Use aformat to reliably mix to mono, split into two copies, delay one
+        # by 8ms, amerge as stereo → L≠R → ellipses that change shape with pitch.
+        filt = (f"[0:a]aformat=channel_layouts=mono,asplit=2[La][Ra];"
+                f"[Ra]adelay=2[Rd];"
+                f"[La][Rd]amerge=inputs=2[S];"
+                f"[S]avectorscope=s={WIDTH}x{HEIGHT}:zoom=1.8:draw=dot:scale=log"
+                f",format=gray")
+        print(f"[*] avectorscope filter: {filt}")
+        return filt
+    if VIZ_MODE == "showspectrum":
+        # slide=scroll: time moves left, new data arrives on right (waterfall)
+        # scale=log: log frequency axis — equal space per octave, better for music
+        # color=intensity: brightness = amplitude
+        return (f"[0:a]showspectrum=s={WIDTH}x{HEIGHT}:slide=scroll"
+                f":scale=log:color=intensity,format=gray")
+    if VIZ_MODE == "ahistogram":
+        # X axis = sample amplitude, Y axis = time (scrolls up), brightness = count
+        return (f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=log:slide=scroll"
+                f",format=gray")
+    return (f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
+            f":rate={FPS}:colors=#ffffff,format=gray")
+
+def start_ffmpeg_waveform_fifo(realtime=False):
+    # -re: read at 1x speed so sidplayfp can't race ahead of C64 real-time playback
+    re_flag = ["-re"] if realtime else []
+    cmd = ["ffmpeg", "-loglevel", "quiet"] + re_flag + ["-f", "wav", "-i", FIFO_PATH,
+           "-filter_complex", _build_viz_filter(),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     print("[*] ffmpeg waveform (FIFO) started."); return p
@@ -538,8 +643,7 @@ def start_ffmpeg_waveform_fifo():
 def start_ffmpeg_waveform_file(filepath):
     cmd = ["ffmpeg", "-loglevel", "quiet",
            "-i", filepath,
-           "-filter_complex",
-           f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline:rate={FPS}:colors=#ffffff,format=gray",
+           "-filter_complex", _build_viz_filter(),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     print("[*] ffmpeg waveform (file) started."); return p
@@ -690,15 +794,40 @@ def make_keypress_listener(state):
 # Frame conversion
 # ---------------------------------------------------------------------------
 
-def pixel_to_char(val):
-    return CHARS[val * (len(CHARS) - 1) // 255]
+def pixel_to_char(val, chars=CHARS):
+    return chars[val * (len(chars) - 1) // 255]
+
+def _apply_freq_gradient(raw, color_mode):
+    """Apply a per-mode vertical gradient to showfreqs frames so density/fire
+    color modes see a range of character values instead of flat solid white.
+
+    Row 0 = top of frame (tip of tallest bars).
+    Row HEIGHT-1 = bottom of frame (base of all bars).
+
+    white        (1): dim at tip, bright at base
+    rainbow+fire (0,2): tent — sparse at tip, dense near base, lighter fringe at base
+    """
+    buf = bytearray(raw)
+    for row in range(HEIGHT):
+        if color_mode == 1:  # white: dim at tip, bright at base
+            scale = 0.2 + 0.8 * row / (HEIGHT - 1)
+        else:                # rainbow + fire: tent peak near base, lighter fringe at base
+            if row >= HEIGHT - 3:    # bottom fringe: 1.0 at row HEIGHT-3, 0.5 at row HEIGHT-1
+                scale = 1.0 - (row - (HEIGHT - 3)) / 2 * 0.5
+            else:                    # tip→body: 0.2 at row 0, 1.0 at row HEIGHT-3
+                scale = 0.2 + row / (HEIGHT - 3) * 0.8
+        start = row * WIDTH
+        for i in range(start, start + WIDTH):
+            if buf[i] > 0:
+                buf[i] = max(1, int(buf[i] * scale))
+    return bytes(buf)
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    global U64, FPS, _YTDLP_COOKIE_ARGS
+    global U64, FPS, VIZ_MODE, _YTDLP_COOKIE_ARGS
 
     args = parse_args()
 
@@ -736,6 +865,25 @@ def main():
 
     U64 = f"http://{args.ip}"
     FPS = args.fps
+
+    if args.showwaves:
+        VIZ_MODE = "showwaves"
+    elif args.showfreqs:
+        VIZ_MODE = "showfreqs"
+    elif args.avectorscope:
+        VIZ_MODE = "avectorscope"
+    elif args.showspectrum:
+        VIZ_MODE = "showspectrum"
+    elif args.ahistogram:
+        VIZ_MODE = "ahistogram"
+    else:
+        ans = input("Visualization? [0=waveform, 1=spectrum, 2=scope, 3=spectrogram, 4=histogram] (default 0): ").strip()
+        if ans == "1":   VIZ_MODE = "showfreqs"
+        elif ans == "2": VIZ_MODE = "avectorscope"
+        elif ans == "3": VIZ_MODE = "showspectrum"
+        elif ans == "4": VIZ_MODE = "ahistogram"
+        else:            VIZ_MODE = "showwaves"
+    print(f"[*] Viz mode: {VIZ_MODE}")
 
     if args.color:      color_mode_init = 0
     elif args.no_color: color_mode_init = 1
@@ -830,6 +978,9 @@ def main():
 
     time.sleep(1.0)  # wait for PRG to finish init
 
+    write_color_tables()
+    print("[*] Color tables written ($C3A8/$C428).")
+
     # Force PAL 50Hz CIA1 timer A — only needed in C64 audio mode
     # where the SID play routine expects PAL timing.
     # For local/MP3 modes the KERNAL timer is already correct.
@@ -850,16 +1001,19 @@ def main():
     # Start audio/waveform processes
     if mode == "sid":
         make_fifo(FIFO_PATH)
-        ffmpeg_proc   = start_ffmpeg_waveform_fifo()
-        time.sleep(0.3)
-        sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
-
         if c64_audio:
-            # Upload SID code + write trampolines + write $C002=$02 to release PRG
+            # Upload first — C64 starts playing at the end of upload_sid_to_c64.
+            # Then start sidplayfp so the waveform is in sync with the C64.
+            # -re flag throttles ffmpeg to real-time speed so the pipeline
+            # doesn't race ahead of the C64's real-time playback.
+            ffmpeg_proc   = start_ffmpeg_waveform_fifo(realtime=True)
             upload_sid_to_c64(psid)
+            sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
             procs = [sid_fifo_proc, ffmpeg_proc]
         else:
-            # local audio — $C002 stays $00, PRG already in main loop
+            ffmpeg_proc   = start_ffmpeg_waveform_fifo()
+            time.sleep(0.3)           # give ffmpeg time to open FIFO before sidplayfp writes
+            sid_fifo_proc  = start_sidplayfp_fifo(filepath, sid_duration_secs)
             sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
             procs = [sid_fifo_proc, sid_audio_proc, ffmpeg_proc]
     elif mode == "stream":
@@ -912,7 +1066,17 @@ def main():
             if len(raw) < frame_size:
                 print("\r\n[*] Stream ended."); break
 
-            screen = bytes(pixel_to_char(p) for p in raw)
+            if VIZ_MODE == "showfreqs":
+                raw = _apply_freq_gradient(raw, state["color_mode"])
+                screen = bytes(pixel_to_char(p, CHARS_FREQ) for p in raw)
+            elif VIZ_MODE == "avectorscope":
+                screen = bytes(pixel_to_char(p, CHARS_SCOPE) for p in raw)
+            elif VIZ_MODE == "showspectrum":
+                screen = bytes(pixel_to_char(p, CHARS_SPECTRUM) for p in raw)
+            elif VIZ_MODE == "ahistogram":
+                screen = bytes(pixel_to_char(p, CHARS_HIST) for p in raw)
+            else:
+                screen = bytes(pixel_to_char(p) for p in raw)
             write_mem(FRAME_BUF, screen)
             write_byte(FRAME_FLAG, 1)
 
@@ -924,22 +1088,31 @@ def main():
         print("\r\n[*] Interrupted.")
     finally:
         state["quit"] = True
-        # Silence SID chip first — clears gate bits, waveforms, and volume on
-        # all three voices so the last note doesn't ring on after we stop
         if c64_audio:
+            print("\r\n[*] Stopping SID and returning C64 to BASIC...")
+            # Step 1: clear c64_audio_flag so the IRQ stops calling the SID
+            # play routine at $C610 — without this the IRQ overwrites our
+            # $D400 zeroes on every frame before do_quit can run.
+            write_byte(C64_AUDIO_FLAG, 0)
+            time.sleep(0.04)             # wait ~2 IRQ frames (50Hz = 20ms each)
+            # Step 2: silence SID directly — IRQ is no longer touching $D400
             write_mem(0xD400, [0] * 25)
+            # Step 3: signal PRG main loop to JMP $FCE2 (BASIC ready screen)
+            write_byte(QUIT_FLAG, 1)
+            time.sleep(0.3)
+        else:
+            # Local/MP3 mode: silence any residual SID output on C64 display side
+            write_mem(0xD400, [0] * 25)
+            write_byte(FRAME_FLAG, 0)
+            write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
+            orig = u64_get("machine:readmem?address=F9&length=2")
+            if orig and len(orig) == 2:
+                u64_put("machine:writemem", {"address": "314",
+                                              "data": f"{orig[0]:02X}{orig[1]:02X}"})
+            write_mem(TICKER_ROW, [0x20] * 40)
         for p in procs:
             try: p.terminate()
             except: pass
-        # Clean up display
-        write_byte(FRAME_FLAG, 0)
-        write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
-        # Restore original IRQ vector (saved at $F9/$FA by PRG) to stop ticker
-        orig = u64_get("machine:readmem?address=F9&length=2")
-        if orig and len(orig) == 2:
-            u64_put("machine:writemem", {"address": "314",
-                                          "data": f"{orig[0]:02X}{orig[1]:02X}"})
-        write_mem(TICKER_ROW, [0x20] * 40)
         try: os.remove(FIFO_PATH)
         except: pass
         # Restore terminal

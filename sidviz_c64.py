@@ -55,7 +55,7 @@ TIMEOUT      = 5.0
 WHITE_CTABLE_ADDR = 0xC3A8   # 128-byte table written by Python: screen_code → C64 color
 FIRE_CTABLE_ADDR  = 0xC428   # 128-byte table written by Python: screen_code → C64 color
 
-#                            code  white  fire
+#                             code       white       fire
 CHARS_DEF = [               # showwaves  (least → most dense)
     (32,   0,   0),         # space      black       black
     (46,  11,   9),         # .          dark gray   brown
@@ -74,26 +74,26 @@ CHARS_FREQ_DEF = [          # showfreqs  (least → most dense)
     (35,   1,   2),         # #          white       red
     (42,   1,   2),         # *          white       red
 ]
-CHARS_SCOPE_DEF = [        # avectorscope (least → most dense)
+CHARS_SCOPE_DEF = [         # avectorscope (least → most dense)
     (32,   0,   0),         # space      black       black
     (46,  11,   7),         # .          dark gray   yellow
     (58,  12,  10),         # :          med gray    light red
     (42,  15,   8),         # *          light gray  orange
     (35,   1,   2),         # #          white       red
 ]
-CHARS_SPECTRUM_DEF = [     # showspectrum (least → most dense)
+CHARS_SPECTRUM_DEF = [      # showspectrum (least → most dense)
     (32,   0,   0),         # space      black       black
     (46,  11,   9),         # .          dark gray   brown
     (58,  12,  10),         # :          med gray    light red
     (33,  15,   8),         # !          light gray  orange
     (43,   1,   7),         # +          white       yellow
 ]
-CHARS_HIST_DEF = [         # ahistogram (least → most dense)
+CHARS_HIST_DEF = [          # ahistogram (least → most dense)
     (32,   0,   0),         # space      black       black
-    (46,  11,   5),         # .          dark gray   green
-    (58,  12,  13),         # :          med gray    light green
-    (42,  15,   7),         # *          light gray  yellow
-    (35,   1,   1),         # #          white       white
+    (46,  11,   9),         # .          dark gray   brown
+    (58,  12,  10),         # :          med gray    light red
+    (42,  15,   8),         # *          light gray  orange
+    (35,   1,   2),         # #          white       red
 ]
 CHARS      = [t[0] for t in CHARS_DEF]
 CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]

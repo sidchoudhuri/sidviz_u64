@@ -4,7 +4,7 @@ Real-time waveform visualizer for the Commodore 64, driven by a Mac or Linux mac
 
 ```
 +------------------------------------------------------+
-|  sidviz_u64  v1.6.6  build 2026-04-25                |
+|  sidviz_u64  v1.7.8  build 2026-04-25                |
 +------------------------------------------------------+
 |  File: Commando.sid                                  |
 |  Title        Commando                               |
@@ -136,6 +136,8 @@ usage: sidviz_u64 [-h] [--ip IP] [--color] [--no-color] [--sid] [--audio]
                   [--c64audio] [--macaudio] [--fps FPS] [--save FILE.mp3]
                   [--yt-search QUERY] [--yt-max YT_MAX]
                   [--cookies-from-browser BROWSER] [--cookies FILE]
+                  [--showwaves] [--showfreqs] [--avectorscope]
+                  [--showspectrum] [--ahistogram]
                   [--version]
                   [file]
 
@@ -161,6 +163,11 @@ options:
                    Pull cookies from a browser for yt-dlp auth
                    (chrome, firefox, safari, edge, brave, chromium, …)
   --cookies FILE   Netscape-format cookies file for yt-dlp auth
+  --showwaves      Visualization: scrolling waveform (default)
+  --showfreqs      Visualization: frequency spectrum bars
+  --avectorscope   Visualization: Lissajous vector scope
+  --showspectrum   Visualization: scrolling spectrogram
+  --ahistogram     Visualization: scrolling amplitude histogram
   --version        Show version and exit
 ```
 

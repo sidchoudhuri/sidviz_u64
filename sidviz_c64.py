@@ -85,8 +85,8 @@ CHARS_SPECTRUM_DEF = [     # showspectrum (least → most dense)
     (32,   0,   0),         # space      black       black
     (46,  11,   9),         # .          dark gray   brown
     (58,  12,  10),         # :          med gray    light red
-    (42,  15,   8),         # *          light gray  orange
-    (35,   1,   7),         # #          white       yellow
+    (33,  15,   8),         # !          light gray  orange
+    (43,   1,   7),         # +          white       yellow
 ]
 CHARS      = [t[0] for t in CHARS_DEF]
 CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]

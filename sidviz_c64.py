@@ -84,9 +84,9 @@ CHARS_SCOPE_DEF = [         # avectorscope (least → most dense)
 CHARS_SPECTRUM_DEF = [      # showspectrum (least → most dense)
     (32,   0,   0),         # space      black       black
     (46,  11,   9),         # .          dark gray   brown
-    (58,  12,  10),         # :          med gray    light red
-    (33,  15,   8),         # !          light gray  orange
-    (43,   1,   7),         # +          white       yellow
+    (58,  12,   2),         # :          med gray    red
+    (33,  15,  10),         # !          light gray  light red
+    (43,   1,   8),         # +          white       orange
 ]
 CHARS_HIST_DEF = [          # ahistogram (least → most dense)
     (32,   0,   0),         # space      black       black

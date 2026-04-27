@@ -3,17 +3,17 @@
 sidviz_u64.py -- SID/audio waveform visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 
-version 1.7.8 (2026-04-25)
+version 1.7.9 (2026-04-27)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
   $C001     = color flag  (2=rainbow, 1=white density, 3=fire density)
   $C002     = sid_ready   (Python sets 1 after uploading SID code)
   $C003     = quit_flag   (Python writes 1 to stop SID and return C64 to BASIC)
-  $C620/$C621 = SID play vector saved post-init (play_addr=0 SIDs)
-  $C100     = frame buffer, 680 bytes PETSCII (rows 8-24, $C100-$C3A7)
-  $C3A8     = white density color table, 128 bytes (screen_code → C64 color)
-  $C428     = fire  density color table, 128 bytes (screen_code → C64 color)
+  $C004     = viz_mode    (Python writes: 0=c64audio rows 8-24, 1=extended rows 2-24)
+  $C005     = white density color table, 128 bytes (screen_code → C64 color)
+  $C085     = fire  density color table, 128 bytes (screen_code → C64 color)
+  $C105     = frame buffer, 680 bytes (c64audio) or 920 bytes (extended)
   $C500     = ticker buffer, up to 253 PETSCII chars
   $C5FC     = color_mode  (ASM owns: 0=rainbow, 1=white, 2=fire)
   $C5FD     = irq_tick    (ASM owns)
@@ -21,13 +21,14 @@ Memory protocol:
   $C5FF     = ticker read position (ASM owns)
   $C600     = JMP initAddress trampoline (Python writes)
   $C610     = JMP playAddress trampoline (Python writes)
+  $C620/$C621 = SID play vector saved post-init (play_addr=0 SIDs)
 
 Usage:
   1. Assemble: 64tass -a -B -o sidviz.prg sidviz.asm
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.7.8"
+VERSION = "1.7.9"
 BUILD   = "2026-04-25"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
@@ -39,21 +40,24 @@ _YTDLP_COOKIE_ARGS: list = []
 
 FIFO_PATH    = "/tmp/sidpipe.wav"
 WIDTH        = 40
-HEIGHT       = 17              # rows 8-24 — protects SID driver at $0400-$04FF
-FRAME_BUF    = 0xC100
+HEIGHT_EXTENDED = 23           # rows 2-24 (non-c64audio)
+HEIGHT_C64AUDIO = 17           # rows 8-24 (c64audio — protects SID driver at $0400-$04FF)
+HEIGHT          = HEIGHT_EXTENDED   # overridden in main() once c64_audio is known
+FRAME_BUF    = 0xC105
 FRAME_FLAG   = 0xC000
 COLOR_FLAG   = 0xC001
 C64_AUDIO_FLAG = 0xC002  # 0=off, 1=waiting, 2=SID ready
 QUIT_FLAG      = 0xC003  # Python writes 1 → C64 silences SID and JMPs to BASIC
+VIZ_MODE_FLAG  = 0xC004  # Python writes: 0=c64audio rows 8-24, 1=extended rows 2-24
 TICKER_BUF   = 0xC500
 TICKER_LEN   = 0xC5FE
-TICKER_ROW   = 0x0428          # screen RAM row 1
+TICKER_ROW   = 0x0400          # screen RAM row 0
 PRG_LOCAL    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidviz.prg")
 PRG_REMOTE   = "sidviz.prg"
 TIMEOUT      = 5.0
 # C64 colors: 0=black 1=white 2=red 7=yellow 8=orange 9=brown 10=ltred 11=dkgray 12=mdgray 15=ltgray
-WHITE_CTABLE_ADDR = 0xC3A8   # 128-byte table written by Python: screen_code → C64 color
-FIRE_CTABLE_ADDR  = 0xC428   # 128-byte table written by Python: screen_code → C64 color
+WHITE_CTABLE_ADDR = 0xC005   # 128-byte table written by Python: screen_code → C64 color
+FIRE_CTABLE_ADDR  = 0xC085   # 128-byte table written by Python: screen_code → C64 color
 
 #                             code       white       fire
 CHARS_DEF = [               # showwaves  (least → most dense)
@@ -827,7 +831,7 @@ def _apply_freq_gradient(raw, color_mode):
 # ---------------------------------------------------------------------------
 
 def main():
-    global U64, FPS, VIZ_MODE, _YTDLP_COOKIE_ARGS
+    global U64, FPS, VIZ_MODE, HEIGHT, _YTDLP_COOKIE_ARGS
 
     args = parse_args()
 
@@ -965,6 +969,11 @@ def main():
                 print("[!] PSID parse failed, falling back to local audio")
                 c64_audio = False
 
+    # Set HEIGHT and viz_mode now that c64_audio is final
+    HEIGHT = HEIGHT_C64AUDIO if c64_audio else HEIGHT_EXTENDED
+    # Write viz_mode while C64 is at BASIC (after reboot, before run_prg)
+    write_byte(VIZ_MODE_FLAG, 0 if c64_audio else 1)
+
     # Run PRG — PRG clears $C002 in init, so no stale values from previous runs
     print(f"[*] Running {PRG_REMOTE}...")
     if not run_prg_from_temp(PRG_REMOTE): sys.exit(1)
@@ -979,7 +988,7 @@ def main():
     time.sleep(1.0)  # wait for PRG to finish init
 
     write_color_tables()
-    print("[*] Color tables written ($C3A8/$C428).")
+    print("[*] Color tables written ($C005/$C085).")
 
     # Force PAL 50Hz CIA1 timer A — only needed in C64 audio mode
     # where the SID play routine expects PAL timing.

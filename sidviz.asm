@@ -2,7 +2,7 @@
 ; 64tass assembler
 ; autostart SYS 2064
 ;
-; version 1.7.5 (2026-04-25)
+; version 1.7.9 (2026-04-27)
 ;
 ; Single PRG handles all modes via $C002 flag:
 ;   $C002 = $00  Mac/MP3 mode   — no SID player, normal display
@@ -13,7 +13,11 @@
 ;   $C000     = frame flag      (Python writes 1, ASM clears to 0)
 ;   $C001     = color flag      (2=rainbow, 1=white density, 3=fire density)
 ;   $C002     = c64_audio_flag  (0=off, 1=wait, 2=ready — Python controls)
-;   $C100     = frame buffer    (680 bytes, rows 8-24)
+;   $C003     = quit_flag       (Python writes 1 → graceful SID stop + BASIC reset)
+;   $C004     = viz_mode        (Python writes: 0=c64audio rows 8-24, 1=extended rows 2-24)
+;   $C005     = white_ctable    (128 bytes, screen_code → C64 color, white mode)
+;   $C085     = fire_ctable     (128 bytes, screen_code → C64 color, fire mode)
+;   $C105     = frame buffer    (680 bytes c64audio / 920 bytes extended)
 ;   $C500     = ticker buffer   (up to 253 PETSCII chars)
 ;   $C5FC     = color_mode      (ASM owns: 0=rainbow, 1=white, 2=fire)
 ;   $C5FD     = irq_tick        (ASM owns)
@@ -22,6 +26,12 @@
 ;   $C600     = JMP initAddress trampoline (Python writes when c64_audio)
 ;   $C610     = JMP playAddress trampoline (Python writes when c64_audio)
 ;   $C620/$C621 = SID play vector saved post-init (play_addr=0 SIDs)
+;
+; Screen layout:
+;   Row  0  ($0400) = ticker (always)
+;   Row  1  ($0428) = blank spacing row (always)
+;   Rows 2-24 ($0450) = visualization (extended/non-c64audio mode)
+;   Rows 8-24 ($0540) = visualization (c64audio mode — avoids SID driver zone)
 ;
 ; ZP usage:
 ;   $F9/$FA   = saved original IRQ vector (for chain)
@@ -51,10 +61,8 @@ bgcol       = $d021
 irq_vec_lo  = $0314
 irq_vec_hi  = $0315
 
-ticker_scr  = $0428
-ticker_col  = $d828
-wave_scr    = $0540     ; row 8 — above SID driver zone $0400-$04FF
-wave_col    = $d940
+ticker_scr  = $0400     ; row 0
+ticker_col  = $d800     ; row 0 color RAM
 
 ; ---------------------------------------------------------------------------
 ; Python comms
@@ -64,9 +72,10 @@ frame_flag      = $c000
 color_flag      = $c001
 c64_audio_flag  = $c002   ; 0=off, 1=wait for SID upload, 2=SID ready
 quit_flag       = $c003   ; Python writes 1 to trigger graceful SID stop + BASIC reset
-frame_buf       = $c100   ; 680 bytes ($c100-$c3a7)
-white_ctable    = $c3a8   ; 128-byte color table, screen_code → C64 color (white mode)
-fire_ctable     = $c428   ; 128-byte color table, screen_code → C64 color (fire mode)
+viz_mode        = $c004   ; 0=c64audio (rows 8-24), 1=extended (rows 2-24)
+white_ctable    = $c005   ; 128-byte color table, screen_code → C64 color (white mode)
+fire_ctable     = $c085   ; 128-byte color table, screen_code → C64 color (fire mode)
+frame_buf       = $c105   ; 680 or 920 bytes depending on viz_mode
 ticker_buf      = $c500
 color_mode      = $c5fc
 irq_tick        = $c5fd
@@ -100,8 +109,9 @@ init:
         sta border
         sta bgcol
 
-        ; Clear ALL comms flags including c64_audio_flag
-        ; Python must re-write $C002=$01 after run_prg if C64 audio wanted
+        ; Clear comms flags — Python must re-write $C002=$01 after run_prg
+        ; if C64 audio wanted.  viz_mode ($C004) is intentionally NOT cleared
+        ; here: Python writes it before the reboot so init uses the right value.
         sta frame_flag
         sta color_flag
         sta color_mode
@@ -116,7 +126,6 @@ init:
         ; Set up display
         jsr fill_color_rainbow
         jsr fill_ticker_color
-        jsr fill_row0_color
         jsr clear_screen
 
         ; Pre-fill ticker buffer with spaces until Python sends real content
@@ -145,8 +154,6 @@ wait_sid:
         bne wait_sid
 
         ; Call SID INIT via trampoline at $C600
-        ; Python wrote: JMP initAddress at $C600
-        ; JSR $C600 -> JMP initAddr -> init runs -> RTS returns here
         jsr $c600
 
         ; Save SID's post-init IRQ vector ($0314/$0315) to $C620/$C621 before
@@ -159,8 +166,6 @@ wait_sid:
 
 no_c64_audio:
         ; Hook IRQ to our handler
-        ; If C64 audio: orig_irq_lo/hi has pre-SID KERNAL vector (safe chain)
-        ; If Mac/MP3:   orig_irq_lo/hi has KERNAL vector (normal chain)
         lda #<irq_handler
         sta irq_vec_lo
         lda #>irq_handler
@@ -311,7 +316,9 @@ irq_done:
         jmp (orig_irq_lo)
 
 ; ---------------------------------------------------------------------------
-; copy_frame: $C100 -> $0540 (680 bytes = 17 rows x 40 cols)
+; copy_frame: frame_buf ($C105) -> screen RAM
+;   viz_mode=0 (c64audio):  680 bytes -> $0540 (rows  8-24, 2 pages + 168)
+;   viz_mode=1 (extended):  920 bytes -> $0450 (rows  2-24, 3 pages + 152)
 ; ---------------------------------------------------------------------------
 
 copy_frame:
@@ -319,31 +326,56 @@ copy_frame:
         sta src_lo
         lda #>frame_buf
         sta src_hi
-        lda #<wave_scr
-        sta dst_lo
-        lda #>wave_scr
-        sta dst_hi
 
-        ; 2 full pages = 512 bytes
+        lda viz_mode
+        bne cf_ext
+
+        ; c64audio: 680 bytes -> $0540 (2 pages + 168)
+        lda #<$0540
+        sta dst_lo
+        lda #>$0540
+        sta dst_hi
         ldx #2
-cf_pg:  ldy #0
-cf_lp:  lda (src_lo),y
+cf_c_pg:ldy #0
+cf_c_lp:lda (src_lo),y
         sta (dst_lo),y
         iny
-        bne cf_lp
+        bne cf_c_lp
         inc src_hi
         inc dst_hi
         dex
-        bne cf_pg
-
-        ; Remaining 168 bytes (680 - 512)
+        bne cf_c_pg
         ldy #0
-cf_rm:  lda (src_lo),y
+cf_c_rm:lda (src_lo),y
         sta (dst_lo),y
         iny
         cpy #168
-        bne cf_rm
+        bne cf_c_rm
+        jmp cf_done
 
+cf_ext: ; extended: 920 bytes -> $0450 (3 pages + 152)
+        lda #<$0450
+        sta dst_lo
+        lda #>$0450
+        sta dst_hi
+        ldx #3
+cf_e_pg:ldy #0
+cf_e_lp:lda (src_lo),y
+        sta (dst_lo),y
+        iny
+        bne cf_e_lp
+        inc src_hi
+        inc dst_hi
+        dex
+        bne cf_e_pg
+        ldy #0
+cf_e_rm:lda (src_lo),y
+        sta (dst_lo),y
+        iny
+        cpy #152
+        bne cf_e_rm
+
+cf_done:
         lda #0
         sta frame_flag
         rts
@@ -374,83 +406,160 @@ cs_rm:  sta (dst_lo),y
         rts
 
 ; ---------------------------------------------------------------------------
-; fill_color_rainbow: color RAM rows 8-24 ($D940-$DBE7, 680 bytes)
+; fill_color_rainbow: color RAM for visualization rows
+;   viz_mode=0: rows 8-24 ($D940, 680 bytes = 2 pages + 168)
+;   viz_mode=1: rows 2-24 ($D850, 920 bytes = 3 pages + 152)
 ; ---------------------------------------------------------------------------
 
 fill_color_rainbow:
-        lda #<wave_col
+        lda viz_mode
+        bne fcr_ext
+
+        ; c64audio: $D940, 680 bytes
+        lda #<$d940
         sta dst_lo
-        lda #>wave_col
+        lda #>$d940
         sta dst_hi
         ldx #0
-
         ldy #0
-fcr_p0: lda rainbow_table,x
+fcr_c0: lda rainbow_table,x
         sta (dst_lo),y
         inx
         cpx #40
-        bcc fcr_p0n
+        bcc fcr_c0n
         ldx #0
-fcr_p0n:iny
-        bne fcr_p0
+fcr_c0n:iny
+        bne fcr_c0
         inc dst_hi
-
         ldy #0
-fcr_p1: lda rainbow_table,x
+fcr_c1: lda rainbow_table,x
         sta (dst_lo),y
         inx
         cpx #40
-        bcc fcr_p1n
+        bcc fcr_c1n
         ldx #0
-fcr_p1n:iny
-        bne fcr_p1
+fcr_c1n:iny
+        bne fcr_c1
         inc dst_hi
-
         ldy #0
-fcr_rm: lda rainbow_table,x
+fcr_c_r:lda rainbow_table,x
         sta (dst_lo),y
         inx
         cpx #40
-        bcc fcr_rmn
+        bcc fcr_crn
         ldx #0
-fcr_rmn:iny
+fcr_crn:iny
         cpy #168
-        bne fcr_rm
+        bne fcr_c_r
+        rts
+
+fcr_ext:; extended: $D850, 920 bytes
+        lda #<$d850
+        sta dst_lo
+        lda #>$d850
+        sta dst_hi
+        ldx #0
+        ldy #0
+fcr_e0: lda rainbow_table,x
+        sta (dst_lo),y
+        inx
+        cpx #40
+        bcc fcr_e0n
+        ldx #0
+fcr_e0n:iny
+        bne fcr_e0
+        inc dst_hi
+        ldy #0
+fcr_e1: lda rainbow_table,x
+        sta (dst_lo),y
+        inx
+        cpx #40
+        bcc fcr_e1n
+        ldx #0
+fcr_e1n:iny
+        bne fcr_e1
+        inc dst_hi
+        ldy #0
+fcr_e2: lda rainbow_table,x
+        sta (dst_lo),y
+        inx
+        cpx #40
+        bcc fcr_e2n
+        ldx #0
+fcr_e2n:iny
+        bne fcr_e2
+        inc dst_hi
+        ldy #0
+fcr_e_r:lda rainbow_table,x
+        sta (dst_lo),y
+        inx
+        cpx #40
+        bcc fcr_ern
+        ldx #0
+fcr_ern:iny
+        cpy #152
+        bne fcr_e_r
         rts
 
 ; ---------------------------------------------------------------------------
-; fill_color_white: color RAM rows 8-24, all white (1)
+; fill_color_white: color RAM for visualization rows, all white (1)
+;   viz_mode=0: rows 8-24 ($D940, 680 bytes = 2 pages + 168)
+;   viz_mode=1: rows 2-24 ($D850, 920 bytes = 3 pages + 152)
 ; ---------------------------------------------------------------------------
 
 fill_color_white:
-        lda #<wave_col
+        lda viz_mode
+        bne fcw_ext
+        ; c64audio: $D940, 680 bytes (2 pages + 168)
+        lda #<$d940
         sta dst_lo
-        lda #>wave_col
+        lda #>$d940
         sta dst_hi
         lda #1
         ldx #2
-fcw_pg: ldy #0
-fcw_lp: sta (dst_lo),y
+fcw_c_p:ldy #0
+fcw_c_l:sta (dst_lo),y
         iny
-        bne fcw_lp
+        bne fcw_c_l
         inc dst_hi
         dex
-        bne fcw_pg
+        bne fcw_c_p
         ldy #0
-fcw_rm: sta (dst_lo),y
+fcw_c_r:sta (dst_lo),y
         iny
         cpy #168
-        bne fcw_rm
+        bne fcw_c_r
+        rts
+
+fcw_ext:; extended: $D850, 920 bytes (3 pages + 152)
+        lda #<$d850
+        sta dst_lo
+        lda #>$d850
+        sta dst_hi
+        lda #1
+        ldx #3
+fcw_e_p:ldy #0
+fcw_e_l:sta (dst_lo),y
+        iny
+        bne fcw_e_l
+        inc dst_hi
+        dex
+        bne fcw_e_p
+        ldy #0
+fcw_e_r:sta (dst_lo),y
+        iny
+        cpy #152
+        bne fcw_e_r
         rts
 
 ; ---------------------------------------------------------------------------
-; fill_ticker_color: row 1 ($D828, 40 bytes) color 13 (light green)
+; fill_ticker_color: row 0 ($D800, 40 bytes) color 13 (light green)
 ; ---------------------------------------------------------------------------
 
 fill_ticker_color:
-        lda #<ticker_col
+        lda #<color
         sta dst_lo
-        lda #>ticker_col
+        lda #>color
         sta dst_hi
         lda #13
         ldy #0
@@ -461,55 +570,70 @@ ftc_lp: sta (dst_lo),y
         rts
 
 ; ---------------------------------------------------------------------------
-; fill_row0_color: row 0 ($D800, 40 bytes) color 0 (black)
-; ---------------------------------------------------------------------------
-
-fill_row0_color:
-        lda #<color
-        sta dst_lo
-        lda #>color
-        sta dst_hi
-        lda #0
-        ldy #0
-fr0_lp: sta (dst_lo),y
-        iny
-        cpy #40
-        bne fr0_lp
-        rts
-
-; ---------------------------------------------------------------------------
-; density_colors: white density palette — colors set by Python via white_ctable ($C3A8)
+; density_colors: white density palette — lookup via white_ctable ($C005)
+;   viz_mode=0: src=$0540, dst=$D940 (680 bytes = 2 pages + 168)
+;   viz_mode=1: src=$0450, dst=$D850 (920 bytes = 3 pages + 152)
 ; ---------------------------------------------------------------------------
 
 density_colors:
-        lda #<wave_scr
+        lda viz_mode
+        bne dc_ext
+        ; c64audio: src=$0540, dst=$D940, 680 bytes (2 pages + 168)
+        lda #<$0540
         sta src_lo
-        lda #>wave_scr
+        lda #>$0540
         sta src_hi
-        lda #<wave_col
+        lda #<$d940
         sta dst_lo
-        lda #>wave_col
+        lda #>$d940
         sta dst_hi
-
         ldx #2
-dc_pg:  ldy #0
-dc_lp:  lda (src_lo),y
+dc_c_pg:ldy #0
+dc_c_lp:lda (src_lo),y
         jsr char_to_color
         sta (dst_lo),y
         iny
-        bne dc_lp
+        bne dc_c_lp
         inc src_hi
         inc dst_hi
         dex
-        bne dc_pg
-
+        bne dc_c_pg
         ldy #0
-dc_rm:  lda (src_lo),y
+dc_c_rm:lda (src_lo),y
         jsr char_to_color
         sta (dst_lo),y
         iny
         cpy #168
-        bne dc_rm
+        bne dc_c_rm
+        rts
+
+dc_ext: ; extended: src=$0450, dst=$D850, 920 bytes (3 pages + 152)
+        lda #<$0450
+        sta src_lo
+        lda #>$0450
+        sta src_hi
+        lda #<$d850
+        sta dst_lo
+        lda #>$d850
+        sta dst_hi
+        ldx #3
+dc_e_pg:ldy #0
+dc_e_lp:lda (src_lo),y
+        jsr char_to_color
+        sta (dst_lo),y
+        iny
+        bne dc_e_lp
+        inc src_hi
+        inc dst_hi
+        dex
+        bne dc_e_pg
+        ldy #0
+dc_e_rm:lda (src_lo),y
+        jsr char_to_color
+        sta (dst_lo),y
+        iny
+        cpy #152
+        bne dc_e_rm
         rts
 
 char_to_color:
@@ -520,38 +644,70 @@ char_to_color:
         rts
 
 ; ---------------------------------------------------------------------------
-; density_colors_fire: fire palette — colors set by Python via fire_ctable ($C428)
+; density_colors_fire: fire palette — lookup via fire_ctable ($C085)
+;   viz_mode=0: src=$0540, dst=$D940 (680 bytes = 2 pages + 168)
+;   viz_mode=1: src=$0450, dst=$D850 (920 bytes = 3 pages + 152)
 ; ---------------------------------------------------------------------------
 
 density_colors_fire:
-        lda #<wave_scr
+        lda viz_mode
+        bne df_ext
+        ; c64audio: src=$0540, dst=$D940, 680 bytes (2 pages + 168)
+        lda #<$0540
         sta src_lo
-        lda #>wave_scr
+        lda #>$0540
         sta src_hi
-        lda #<wave_col
+        lda #<$d940
         sta dst_lo
-        lda #>wave_col
+        lda #>$d940
         sta dst_hi
-
         ldx #2
-df_pg:  ldy #0
-df_lp:  lda (src_lo),y
+df_c_pg:ldy #0
+df_c_lp:lda (src_lo),y
         jsr char_to_color_fire
         sta (dst_lo),y
         iny
-        bne df_lp
+        bne df_c_lp
         inc src_hi
         inc dst_hi
         dex
-        bne df_pg
-
+        bne df_c_pg
         ldy #0
-df_rm:  lda (src_lo),y
+df_c_rm:lda (src_lo),y
         jsr char_to_color_fire
         sta (dst_lo),y
         iny
         cpy #168
-        bne df_rm
+        bne df_c_rm
+        rts
+
+df_ext: ; extended: src=$0450, dst=$D850, 920 bytes (3 pages + 152)
+        lda #<$0450
+        sta src_lo
+        lda #>$0450
+        sta src_hi
+        lda #<$d850
+        sta dst_lo
+        lda #>$d850
+        sta dst_hi
+        ldx #3
+df_e_pg:ldy #0
+df_e_lp:lda (src_lo),y
+        jsr char_to_color_fire
+        sta (dst_lo),y
+        iny
+        bne df_e_lp
+        inc src_hi
+        inc dst_hi
+        dex
+        bne df_e_pg
+        ldy #0
+df_e_rm:lda (src_lo),y
+        jsr char_to_color_fire
+        sta (dst_lo),y
+        iny
+        cpy #152
+        bne df_e_rm
         rts
 
 char_to_color_fire:

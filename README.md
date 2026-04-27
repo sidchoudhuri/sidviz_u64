@@ -328,8 +328,12 @@ Metadata is converted to PETSCII and scrolled across row 1 of the C64 screen. Fi
 | `$C000` | Python | Frame flag — Python sets 1, ASM clears after display |
 | `$C001` | Python | Color flag — 1=white, 2=rainbow, 3=fire |
 | `$C002` | Python | C64 audio flag — 0=off, 1=waiting, 2=SID ready |
-| `$C003` | ASM | SID play flag — IRQ sets 1, main loop calls play and clears |
-| `$C100–$C3A7` | Python | Frame buffer — 680 bytes PETSCII (rows 8–24) |
+| `$C003` | Python | Quit flag — Python writes 1, C64 silences SID and returns to BASIC |
+| `$C004` | Python | Viz mode — 0=c64audio (rows 8–24), 1=extended (rows 2–24) |
+| `$C005–$C084` | Python | White density color table — 128 bytes, screen\_code → C64 color |
+| `$C085–$C104` | Python | Fire density color table — 128 bytes, screen\_code → C64 color |
+| `$C105–$C49C` | Python | Frame buffer — 920 bytes PETSCII (rows 2–24, extended mode) |
+| `$C105–$C3AC` | Python | Frame buffer — 680 bytes PETSCII (rows 8–24, c64audio mode) |
 | `$C500–$C5FB` | Python | Ticker buffer — up to 253 PETSCII chars |
 | `$C5FC` | ASM | Color mode — 0=rainbow, 1=white, 2=fire |
 | `$C5FD` | ASM | IRQ tick counter |
@@ -337,3 +341,4 @@ Metadata is converted to PETSCII and scrolled across row 1 of the C64 screen. Fi
 | `$C5FF` | ASM | Ticker read position |
 | `$C600` | Python | `JMP initAddress` trampoline (C64 audio mode) |
 | `$C610` | Python | `JMP playAddress` trampoline (C64 audio mode) |
+| `$C620–$C621` | ASM | SID play vector saved post-init (play\_addr=0 SIDs) |

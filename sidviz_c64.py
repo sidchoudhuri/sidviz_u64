@@ -778,6 +778,7 @@ def _c64audio_height(psid):
     return HEIGHT_EXTENDED
 
 
+def upload_sid_to_c64(psid):
     """Upload PSID code to C64 RAM, write trampolines, signal PRG to proceed."""
     load_addr = psid["load_addr"]
     init_addr = psid["init_addr"]

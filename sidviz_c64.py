@@ -3,7 +3,7 @@
 sidviz_u64.py -- SID/audio waveform visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 
-version 1.7.9 (2026-04-27)
+version 1.8.0 (2026-04-28)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -28,8 +28,8 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.7.9"
-BUILD   = "2026-04-27"
+VERSION = "1.8.0"
+BUILD   = "2026-04-28"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, termios, tty, re, json, select as _select, struct
@@ -513,10 +513,10 @@ def u64_put(path, params=None):
     except Exception as e:
         print(f"[!] PUT {path} failed: {e}"); return None
 
-def write_mem(addr, data):
+def write_mem(addr, data, chunk_size=256):
     data = bytes(data)
-    for i in range(0, len(data), 128):
-        chunk    = data[i:i + 128]
+    for i in range(0, len(data), chunk_size):
+        chunk    = data[i:i + chunk_size]
         data_hex = "".join(f"{b:02X}" for b in chunk)
         u64_put("machine:writemem", {"address": f"{addr + i:X}", "data": data_hex})
 
@@ -659,10 +659,14 @@ def start_ffplay_audio(filepath):
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("[*] ffplay audio started."); return p
 
+def _sidplayfp_time_arg(duration_secs):
+    """Return -t argument in mm:ss format (sidplayfp cross-version compatible)."""
+    return f"-t{duration_secs // 60}:{duration_secs % 60:02d}"
+
 def start_sidplayfp_fifo(filepath, duration_secs=None):
     cmd = ["sidplayfp"]
     if duration_secs:
-        cmd += [f"-t{duration_secs}"]
+        cmd += [_sidplayfp_time_arg(duration_secs)]
     cmd += [f"-w{FIFO_PATH}", filepath]
     print(f"[*] sidplayfp FIFO cmd: {' '.join(cmd)}")
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -671,7 +675,7 @@ def start_sidplayfp_fifo(filepath, duration_secs=None):
 def start_sidplayfp_audio(filepath, duration_secs=None):
     cmd = ["sidplayfp"]
     if duration_secs:
-        cmd += [f"-t{duration_secs}"]
+        cmd += [_sidplayfp_time_arg(duration_secs)]
     cmd += [filepath]
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("[*] sidplayfp -> audio started."); return p
@@ -1139,7 +1143,7 @@ def main():
                 screen = bytes(pixel_to_char(p, CHARS_HIST) for p in raw)
             else:
                 screen = bytes(pixel_to_char(p) for p in raw)
-            write_mem(FRAME_BUF, screen)
+            write_mem(FRAME_BUF, screen, chunk_size=frame_size)
             write_byte(FRAME_FLAG, 1)
 
             frame_num += 1
@@ -1163,15 +1167,10 @@ def main():
             write_byte(QUIT_FLAG, 1)
             time.sleep(0.3)
         else:
-            # Local/MP3 mode: silence any residual SID output on C64 display side
-            write_mem(0xD400, [0] * 25)
-            write_byte(FRAME_FLAG, 0)
-            write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
-            orig = u64_get("machine:readmem?address=F9&length=2")
-            if orig and len(orig) == 2:
-                u64_put("machine:writemem", {"address": "314",
-                                              "data": f"{orig[0]:02X}{orig[1]:02X}"})
-            write_mem(TICKER_ROW, [0x20] * 40)
+            # Local/MP3 mode: signal PRG to return to BASIC (do_quit reinitialises
+            # IRQ vector via $FCE2 cold start — no manual restoration needed).
+            write_byte(QUIT_FLAG, 1)
+            time.sleep(0.3)
         for p in procs:
             try: p.terminate()
             except: pass

@@ -29,7 +29,7 @@ Usage:
 """
 
 VERSION = "1.7.9"
-BUILD   = "2026-04-25"
+BUILD   = "2026-04-27"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, termios, tty, re, json, select as _select, struct

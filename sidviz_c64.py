@@ -1346,16 +1346,21 @@ def main():
                 write_mem(FRAME_BUF, bot_screen)
                 write_byte(FRAME_FLAG, 1)
 
-                # Top rows (2-7): write directly to screen RAM, colors stay static
+                # Top rows (2-7): write screen RAM every frame, color RAM every 30 frames.
+                # Color RAM ($D850-$D93F) is a separate 4-bit SRAM chip; single writes via
+                # the U64 API can fail silently.  Repeating every ~3 s ensures it persists.
                 if top_raw:
                     top_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in top_raw)
                     write_mem(_cam_ext_scr, top_screen)
+                    if frame_num % 30 == 0:
+                        write_mem(_cam_ext_col, _top_colors(state["color_mode"]))
 
                 frame_num += 1
                 ind = ["R","W","F"][state["color_mode"]]
                 vfc = viz_frame_count[0] if viz_ffmpeg_proc else -1
                 vsuf = f" viz={vfc:05d}" if vfc >= 0 else ""
-                print(f"\r[*] Frame {frame_num:05d} [{ind}]{vsuf}", end="", flush=True)
+                tsuf = f" top={len(top_raw)}" if cam_ext_rows else ""
+                print(f"\r[*] Frame {frame_num:05d} [{ind}]{vsuf}{tsuf}", end="", flush=True)
 
         except KeyboardInterrupt:
             print("\r\n[*] Interrupted.")

@@ -544,8 +544,8 @@ def u64_put(path, params=None):
 
 def write_mem(addr, data):
     data = bytes(data)
-    for i in range(0, len(data), 512):
-        chunk    = data[i:i + 512]
+    for i in range(0, len(data), 128):
+        chunk    = data[i:i + 128]
         data_hex = "".join(f"{b:02X}" for b in chunk)
         u64_put("machine:writemem", {"address": f"{addr + i:X}", "data": data_hex})
 
@@ -1141,26 +1141,28 @@ def main():
                 procs.append(save_proc)
 
         # --- Camera display area ---
-        # Without C64 audio: rows 2-24 are safe (no SID driver in screen RAM).
-        # With C64 audio:    rows 0-7 may hold SID code at $0400-$04FF; stay at row 8.
-        cam_height    = 23 if not c64_audio else HEIGHT   # rows available for camera
-        cam_start_row = 2  if not c64_audio else 8
-        cam_scr  = 0x0400 + cam_start_row * WIDTH   # screen RAM start for camera
-        cam_col  = 0xD800 + cam_start_row * WIDTH   # color RAM start for camera
-        cam_frame_size = WIDTH * cam_height          # bytes per camera frame
+        # Without C64 audio: rows 2-24 safe (no SID driver in screen RAM $0400-$04FF).
+        # With C64 audio:    rows 0-7 may hold SID code; restrict to rows 8-24.
+        # rows 8-24 always use the frame-buffer path (FRAME_BUF → copy_frame → ASM
+        # density routines).  rows 2-7 are written directly per-frame when available.
+        cam_ext_rows  = 0 if c64_audio else (HEIGHT - 17 + 6)  # 0 or 6 extra rows
+        cam_height    = HEIGHT + cam_ext_rows                   # 17 or 23
+        cam_frame_size = WIDTH * cam_height                     # 680 or 920
+        viz_frame_size = WIDTH * HEIGHT                         # always 680
+        _cam_ext_scr  = 0x0400 + 2 * WIDTH                     # $0450 (row 2)
+        _cam_ext_col  = 0xD800 + 2 * WIDTH                     # $D850 (row 2 color RAM)
+        _CAM_RTAB     = [2,2,8,8,7,7,7,7,5,5,5,5,13,13,14,14,
+                         6,6,6,6,4,4,4,4,10,10,2,2,8,8,7,7,
+                         5,5,13,13,14,14,6,6]
 
-        # viz blend uses fixed HEIGHT (17 rows), padded to cam_height if needed
-        viz_frame_size = WIDTH * HEIGHT
-
-        # Build camera color lookup tables (screen_code → C64 color)
-        cam_white_lut = bytearray(128)
-        cam_fire_lut  = bytearray(128)
-        for _code, _wcol, _fcol in CHARS_CAMERA_DEF:
-            cam_white_lut[_code] = _wcol
-            cam_fire_lut[_code]  = _fcol
-        # Rainbow column stripe matching ASM rainbow_table
-        _rtab = [2,2,8,8,7,7,7,7,5,5,5,5,13,13,14,14,6,6,6,6,4,4,4,4,10,10,2,2,8,8,7,7,5,5,13,13,14,14,6,6]
-        cam_rainbow_colors = bytes(_rtab[col] for _ in range(cam_height) for col in range(WIDTH))
+        def _top_colors(cmode):
+            """6-row rainbow/density color stripe for rows 2-7."""
+            if cmode == 0:
+                return bytes(_CAM_RTAB[col] for _ in range(6) for col in range(WIDTH))
+            elif cmode == 1:
+                return bytes([1] * 6 * WIDTH)   # all white
+            else:
+                return bytes([8] * 6 * WIDTH)   # all orange (fire mid-tone)
 
         # --- Start camera ---
         cam_proc = start_ffmpeg_camera(camera_device, height=cam_height)
@@ -1173,13 +1175,18 @@ def main():
                 except: pass
             sys.exit(1)
 
-        # Clear camera zone directly in screen RAM (no copy_frame path needed)
-        write_mem(cam_scr, [0x20] * cam_frame_size)
-        write_mem(cam_col, [0x00] * cam_frame_size)   # black until first frame
+        # Clear waveform zone (rows 8-24) via frame buffer + direct write
+        write_mem(FRAME_BUF, [0x20] * viz_frame_size)
+        write_mem(0x0540,    [0x20] * viz_frame_size)
+        write_byte(FRAME_FLAG, 1)
+        # If extended: also clear rows 2-7 screen + color RAM
+        if cam_ext_rows:
+            write_mem(_cam_ext_scr, [0x20] * (cam_ext_rows * WIDTH))
+            write_mem(_cam_ext_col, _top_colors(color_mode_init))
         print("[*] Camera zone cleared.")
 
-        # Background thread keeps the latest viz frame for blending
-        last_viz_frame = bytearray(viz_frame_size)   # all-zero = no blend contribution
+        # Background thread keeps the latest viz frame for blending (17-row)
+        last_viz_frame = bytearray(viz_frame_size)
         viz_lock = threading.Lock()
 
         if viz_ffmpeg_proc:
@@ -1251,7 +1258,10 @@ def main():
 
                 if state["color_pending"]:
                     state["color_pending"] = False
-                    # Python writes colors directly — no need to notify ASM via COLOR_FLAG.
+                    write_byte(COLOR_FLAG, _cflag_map[state["color_mode"]])
+                    if cam_ext_rows:
+                        # Update rows 2-7 static colors to match new mode
+                        write_mem(_cam_ext_col, _top_colors(state["color_mode"]))
 
                 ready, _, _ = _select.select([cam_proc.stdout], [], [], 0.5)
                 if not ready:
@@ -1261,28 +1271,29 @@ def main():
                 if len(raw) < cam_frame_size:
                     print("\r\n[*] Camera stream ended."); break
 
-                # Blend: per-pixel max of camera brightness and viz brightness.
-                # Viz is viz_frame_size (17 rows); pad with zeros for camera-only rows.
+                # Split into top (rows 2-7, direct) and bottom (rows 8-24, frame buf)
+                if cam_ext_rows:
+                    top_raw = raw[:cam_ext_rows * WIDTH]
+                    bot_raw = raw[cam_ext_rows * WIDTH:]
+                else:
+                    top_raw = b""
+                    bot_raw = raw
+
+                # Bottom rows (8-24): blend with viz, write via frame buffer path
                 if viz_ffmpeg_proc:
                     with viz_lock:
-                        viz_pad = bytes(max(0, cam_frame_size - viz_frame_size)) + bytes(last_viz_frame)
-                    blended = bytes(max(c, v) for c, v in zip(raw, viz_pad))
+                        blended = bytes(max(c, v) for c, v in zip(bot_raw, last_viz_frame))
                 else:
-                    blended = raw
+                    blended = bot_raw
 
-                # Compute screen chars and write directly to screen RAM
-                screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended)
-                write_mem(cam_scr, screen)
+                bot_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended)
+                write_mem(FRAME_BUF, bot_screen)
+                write_byte(FRAME_FLAG, 1)
 
-                # Compute and write color RAM based on current color mode
-                cmode = state["color_mode"]
-                if cmode == 0:
-                    colors = cam_rainbow_colors
-                elif cmode == 1:
-                    colors = bytes(cam_white_lut[c] for c in screen)
-                else:
-                    colors = bytes(cam_fire_lut[c] for c in screen)
-                write_mem(cam_col, colors)
+                # Top rows (2-7): write directly to screen RAM, colors stay static
+                if top_raw:
+                    top_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in top_raw)
+                    write_mem(_cam_ext_scr, top_screen)
 
                 frame_num += 1
                 ind = ["R","W","F"][state["color_mode"]]
@@ -1300,8 +1311,11 @@ def main():
                 time.sleep(0.3)
             else:
                 write_mem(0xD400, [0] * 25)
-                write_mem(cam_scr, [0x20] * cam_frame_size)
-                write_mem(cam_col, [0x00] * cam_frame_size)
+                write_byte(FRAME_FLAG, 0)
+                write_mem(FRAME_BUF, [0x20] * viz_frame_size)
+                if cam_ext_rows:
+                    write_mem(_cam_ext_scr, [0x20] * (cam_ext_rows * WIDTH))
+                    write_mem(_cam_ext_col, [0x00] * (cam_ext_rows * WIDTH))
                 write_mem(TICKER_ROW, [0x20] * 40)
             def _stop(proc):
                 if proc is None:

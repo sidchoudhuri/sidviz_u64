@@ -1196,14 +1196,20 @@ def main():
 
         if viz_ffmpeg_proc:
             def _read_viz():
+                # read1() drains whatever is available (including Python's internal
+                # BufferedReader buffer); select() on a BufferedReader fd is unreliable
+                # because Python's buffer may have already consumed the bytes from the fd.
+                buf = bytearray()
                 while not state["quit"]:
                     try:
-                        r, _, _ = _select.select([viz_ffmpeg_proc.stdout], [], [], 0.2)
-                        if r:
-                            data = viz_ffmpeg_proc.stdout.read(viz_frame_size)
-                            if len(data) == viz_frame_size:
-                                with viz_lock:
-                                    last_viz_frame[:] = data
+                        chunk = viz_ffmpeg_proc.stdout.read1(max(viz_frame_size * 4, 65536))
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                        while len(buf) >= viz_frame_size:
+                            with viz_lock:
+                                last_viz_frame[:] = buf[:viz_frame_size]
+                            del buf[:viz_frame_size]
                     except Exception:
                         break
 

@@ -194,7 +194,13 @@ ml_not_rainbow:
         jmp clr_cflag
 
 ml_not_white:
+        cmp #$03
+        bne ml_manual
         lda #$02
+        sta color_mode
+        jmp clr_cflag
+ml_manual:
+        lda #$03
         sta color_mode
 
 clr_cflag:
@@ -209,6 +215,8 @@ check_frame:
         beq main_loop
         cmp #$01
         beq do_density_white
+        cmp #$03
+        beq main_loop
         jsr density_colors_fire
         jmp main_loop
 do_density_white:

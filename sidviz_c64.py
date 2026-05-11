@@ -44,6 +44,7 @@ HEIGHT       = 17              # rows 8-24 — protects SID driver at $0400-$04F
 FRAME_BUF    = 0xC100
 FRAME_FLAG   = 0xC000
 COLOR_FLAG   = 0xC001
+WAVE_COL_ADDR = 0xD940   # color RAM rows 8-24 ($D940-$DBE7)
 C64_AUDIO_FLAG = 0xC002  # 0=off, 1=waiting, 2=SID ready
 QUIT_FLAG      = 0xC003  # Python writes 1 → C64 silences SID and JMPs to BASIC
 TICKER_BUF   = 0xC500
@@ -873,10 +874,15 @@ def make_keypress_listener(state):
                 ch = sys.stdin.read(1)
                 if not ch: break
                 if ch in ("c", "C"):
-                    state["color_mode"]    = (state["color_mode"] + 1) % 3
+                    state["cam_color"]     = (state["cam_color"] + 1) % 3
                     state["color_pending"] = True
-                    label = ["rainbow", "white", "fire"][state["color_mode"]]
-                    sys.stdout.write(f"\r\n[*] Color -> {label}\r\n")
+                    label = ["rainbow", "white", "fire"][state["cam_color"]]
+                    sys.stdout.write(f"\r\n[*] Camera color -> {label}\r\n")
+                    sys.stdout.flush()
+                elif ch in ("v", "V"):
+                    state["viz_color"]     = (state["viz_color"] + 1) % 3
+                    label = ["rainbow", "white", "fire"][state["viz_color"]]
+                    sys.stdout.write(f"\r\n[*] Viz color -> {label}\r\n")
                     sys.stdout.flush()
                 elif ch in ("q", "Q", "\x03"):
                     state["quit"] = True
@@ -892,6 +898,20 @@ def make_keypress_listener(state):
 
 def pixel_to_char(val, chars=CHARS):
     return chars[val * (len(chars) - 1) // 255]
+
+def _build_color_luts(chars_def):
+    return (
+        {code: wcol for code, wcol, fcol in chars_def},
+        {code: fcol for code, wcol, fcol in chars_def},
+    )
+
+def _pixel_color(pixel, chars, color_mode, col_x, white_lut, fire_lut, rainbow_tab):
+    if color_mode == 0:
+        return rainbow_tab[col_x]
+    char_code = pixel_to_char(pixel, chars)
+    if color_mode == 1:
+        return white_lut.get(char_code, 1)
+    return fire_lut.get(char_code, 8)
 
 def _apply_freq_gradient(raw, color_mode, height=HEIGHT):
     """Apply a per-mode vertical gradient to showfreqs frames so density/fire
@@ -1007,6 +1027,31 @@ def main():
             if blend_viz_mode:
                 print(f"[*] Blend viz: {blend_viz_mode}")
 
+        # --- Viz color (only meaningful in blend mode) ---
+        if blend_viz_mode:
+            if args.color:      viz_color_mode_init = 0
+            elif args.no_color: viz_color_mode_init = 1
+            else:
+                ans = input("Viz color mode? [0=rainbow, 1=white, 2=fire] (default 2): ").strip()
+                viz_color_mode_init = int(ans) if ans in ("0","1","2") else 2
+        else:
+            viz_color_mode_init = 2
+
+        # --- Color lookup tables for per-pixel dual-color blend ---
+        _cam_wlut, _cam_flut = _build_color_luts(CHARS_CAMERA_DEF)
+        if blend_viz_mode:
+            _viz_chars_def = {
+                "showwaves":    CHARS_DEF,
+                "showfreqs":    CHARS_FREQ_DEF,
+                "avectorscope": CHARS_SCOPE_DEF,
+                "showspectrum": CHARS_SPECTRUM_DEF,
+                "ahistogram":   CHARS_HIST_DEF,
+            }.get(blend_viz_mode, CHARS_DEF)
+            _viz_chars = [t[0] for t in _viz_chars_def]
+            _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
+        else:
+            _viz_chars, _viz_wlut, _viz_flut = None, {}, {}
+
         # --- Audio mode detection ---
         audio_mode        = None
         c64_audio         = False
@@ -1117,7 +1162,10 @@ def main():
             write_byte(0xDC0E, 0x11)
 
         _cflag_map = {0: 2, 1: 1, 2: 3}
-        write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
+        if blend_viz_mode:
+            write_byte(COLOR_FLAG, 5)  # manual mode — Python writes color RAM per-pixel
+        else:
+            write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
         send_ticker(ticker_str)
 
         # --- Camera display dimensions (needed by viz ffmpeg start calls below) ---
@@ -1298,7 +1346,12 @@ def main():
                 except Exception:
                     break
 
-        state   = {"color_mode": color_mode_init, "color_pending": False, "quit": False}
+        state   = {
+            "cam_color":     color_mode_init,
+            "viz_color":     viz_color_mode_init,
+            "color_pending": False,
+            "quit":          False,
+        }
         kthread = make_keypress_listener(state)
         kthread.start()
 
@@ -1311,7 +1364,11 @@ def main():
 
         frame_num = 0
         blend_tag = f"+{blend_viz_mode}" if blend_viz_mode else ""
-        print(f"[*] Camera{blend_tag} streaming to C64 at {FPS}fps -- [c] color, [q] quit\n")
+        if blend_viz_mode:
+            controls = "[c] cam-color, [v] viz-color, [q] quit"
+        else:
+            controls = "[c] color, [q] quit"
+        print(f"[*] Camera{blend_tag} streaming to C64 at {FPS}fps -- {controls}\n")
 
         # Streams need time to buffer; don't declare "Song ended" until this many
         # seconds have elapsed — prevents false early-exit if yt-dlp is slow to start.
@@ -1364,13 +1421,18 @@ def main():
                     if verr:
                         print(f"[!] ffmpeg viz: {verr[:300]}")
                     viz_ffmpeg_proc = None  # suppress further checks
+                    # Revert C64 to single-color mode (camera color)
+                    write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                    if cam_ext_rows:
+                        write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
 
                 if state["color_pending"]:
                     state["color_pending"] = False
-                    write_byte(COLOR_FLAG, _cflag_map[state["color_mode"]])
-                    if cam_ext_rows:
-                        # Update rows 2-7 static colors to match new mode
-                        write_mem(_cam_ext_col, _top_colors(state["color_mode"]))
+                    if not viz_ffmpeg_proc:
+                        # Non-blend: let C64 IRQ handle color RAM
+                        write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                        if cam_ext_rows:
+                            write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
 
                 with cam_frame_lock:
                     raw = latest_cam_frame[0]
@@ -1394,11 +1456,36 @@ def main():
                         vz_bot = last_viz_frame[cam_ext_rows * WIDTH:]
                     blended_top = bytes(max(c, v) for c, v in zip(top_raw, vz_top)) if top_raw else b""
                     blended_bot = bytes(max(c, v) for c, v in zip(bot_raw, vz_bot))
+
+                    # Per-pixel color: camera color when cam wins, viz color when viz wins
+                    cam_cmode = state["cam_color"]
+                    viz_cmode = state["viz_color"]
+                    if cam_ext_rows:
+                        color_top = bytearray(cam_ext_rows * WIDTH)
+                        for i in range(cam_ext_rows * WIDTH):
+                            col_x = i % WIDTH
+                            cp, vp = top_raw[i], vz_top[i]
+                            if cp >= vp:
+                                color_top[i] = _pixel_color(cp, CHARS_CAMERA, cam_cmode, col_x,
+                                                            _cam_wlut, _cam_flut, _CAM_RTAB)
+                            else:
+                                color_top[i] = _pixel_color(vp, _viz_chars, viz_cmode, col_x,
+                                                            _viz_wlut, _viz_flut, _CAM_RTAB)
+                    color_bot = bytearray(HEIGHT * WIDTH)
+                    for i in range(HEIGHT * WIDTH):
+                        col_x = i % WIDTH
+                        cp, vp = bot_raw[i], vz_bot[i]
+                        if cp >= vp:
+                            color_bot[i] = _pixel_color(cp, CHARS_CAMERA, cam_cmode, col_x,
+                                                        _cam_wlut, _cam_flut, _CAM_RTAB)
+                        else:
+                            color_bot[i] = _pixel_color(vp, _viz_chars, viz_cmode, col_x,
+                                                        _viz_wlut, _viz_flut, _CAM_RTAB)
                 else:
                     blended_top = top_raw
                     blended_bot = bot_raw
 
-                # Bottom rows (8-24): write via frame buffer path
+                # Bottom rows (8-24): write screen chars via frame buffer path
                 bot_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended_bot)
                 write_mem(FRAME_BUF, bot_screen)
                 write_byte(FRAME_FLAG, 1)
@@ -1407,10 +1494,22 @@ def main():
                 if blended_top:
                     top_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended_top)
                     write_mem(_cam_ext_scr, top_screen)
-                    write_mem(_cam_ext_col, _top_colors(state["color_mode"]))
+                    if viz_ffmpeg_proc:
+                        write_mem(_cam_ext_col, color_top)
+                    else:
+                        write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+
+                # Bottom rows color RAM: Python writes directly in blend mode
+                if viz_ffmpeg_proc:
+                    write_mem(WAVE_COL_ADDR, color_bot)
 
                 frame_num += 1
-                ind = ["R","W","F"][state["color_mode"]]
+                if blend_viz_mode and viz_ffmpeg_proc:
+                    cam_ind = ["R","W","F"][state["cam_color"]]
+                    viz_ind = ["R","W","F"][state["viz_color"]]
+                    ind = f"cam:{cam_ind} viz:{viz_ind}"
+                else:
+                    ind = ["R","W","F"][state["cam_color"]]
                 vfc = viz_frame_count[0] if viz_ffmpeg_proc else -1
                 vsuf = f" viz={vfc:05d}" if vfc >= 0 else ""
                 tsuf = f" top={len(top_raw)}" if cam_ext_rows else ""
@@ -1685,7 +1784,7 @@ def main():
 
     frame_size   = WIDTH * _DISP_HEIGHT
     sid_end_time = (time.time() + sid_duration_secs) if mode == "sid" and sid_duration_secs else None
-    state        = {"color_mode": color_mode_init, "color_pending": False, "quit": False}
+    state        = {"cam_color": color_mode_init, "viz_color": 2, "color_pending": False, "quit": False}
     kthread      = make_keypress_listener(state)
     kthread.start()
 
@@ -1705,8 +1804,8 @@ def main():
 
             if state["color_pending"]:
                 state["color_pending"] = False
-                write_byte(COLOR_FLAG, _cflag_map[state["color_mode"]])
-                write_mem(_ext_col, _ext_top_colors(state["color_mode"]))
+                write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                write_mem(_ext_col, _ext_top_colors(state["cam_color"]))
 
             # Check if data available before blocking read (allows q to work)
             ready, _, _ = _select.select([ffmpeg_proc.stdout], [], [], 0.5)
@@ -1722,7 +1821,7 @@ def main():
             bot_raw = raw[_EXT_ROWS * WIDTH:]
 
             if VIZ_MODE == "showfreqs":
-                raw_grad = _apply_freq_gradient(raw, state["color_mode"], height=_DISP_HEIGHT)
+                raw_grad = _apply_freq_gradient(raw, state["cam_color"], height=_DISP_HEIGHT)
                 top_raw  = raw_grad[:_EXT_ROWS * WIDTH]
                 bot_raw  = raw_grad[_EXT_ROWS * WIDTH:]
                 top_screen = bytes(pixel_to_char(p, CHARS_FREQ) for p in top_raw)
@@ -1741,12 +1840,12 @@ def main():
                 bot_screen = bytes(pixel_to_char(p) for p in bot_raw)
 
             write_mem(_ext_scr, top_screen)
-            write_mem(_ext_col, _ext_top_colors(state["color_mode"]))
+            write_mem(_ext_col, _ext_top_colors(state["cam_color"]))
             write_mem(FRAME_BUF, bot_screen)
             write_byte(FRAME_FLAG, 1)
 
             frame_num += 1
-            ind = ["R","W","F"][state["color_mode"]]
+            ind = ["R","W","F"][state["cam_color"]]
             print(f"\r[*] Frame {frame_num:05d} [{ind}]", end="", flush=True)
 
     except KeyboardInterrupt:

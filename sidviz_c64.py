@@ -148,6 +148,7 @@ def parse_args():
     p.add_argument("--camera",        action="store_true", help="Live camera mode: stream webcam as PETSCII art on C64")
     p.add_argument("--camera-device", default="0",         metavar="DEV",
                    help="Camera device: index (0,1,…) or path (/dev/video0). Default: 0")
+    p.add_argument("--list-cameras",  action="store_true", help="List available camera devices and exit")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -666,16 +667,14 @@ def start_ffmpeg_waveform_file(filepath):
 def start_ffmpeg_camera(device="0"):
     """Capture live camera frames, scale to C64 screen size, output as raw gray pixels."""
     if sys.platform == "darwin":
-        # macOS: AVFoundation — "N:none" = video device N, no audio capture.
-        # Do NOT specify -framerate on input: AVFoundation only accepts specific
-        # rates (25/30/50/60) and rejects anything else. Let it run at native
-        # rate; the output -r flag downsamples to our target FPS.
-        cam = f"{device}:none"
-        input_flags = ["-f", "avfoundation", "-i", cam]
+        # macOS: AVFoundation — just the numeric device index.
+        # "N:none" looks intuitive but "none" is not a valid audio device
+        # specifier and causes an I/O error on modern ffmpeg/AVFoundation.
+        # Omit -framerate: AVFoundation only accepts specific rates (25/30/50/60)
+        # and rejects 10fps. Camera runs at native rate; output -r downsamples.
+        input_flags = ["-f", "avfoundation", "-i", str(device)]
     else:
         # Linux: v4l2 — accept bare index ("0") or full path ("/dev/video0").
-        # v4l2 cameras generally support a wide rate range, but omit -framerate
-        # here too for consistency; output -r handles downsampling.
         dev = device if device.startswith("/") else f"/dev/video{device}"
         input_flags = ["-f", "v4l2", "-i", dev]
     # -vf scale only — "-pix_fmt gray" on the output side handles grayscale conversion.
@@ -886,6 +885,15 @@ def main():
 
     if args.version:
         print(f"sidviz_u64  v{VERSION}  build {BUILD}")
+        sys.exit(0)
+
+    if args.list_cameras:
+        if sys.platform == "darwin":
+            subprocess.run(["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                           stderr=None)
+        else:
+            print("Linux: available video devices:")
+            subprocess.run(["ls", "-1", "/dev/video*"], shell=False)
         sys.exit(0)
 
     # -------------------------------------------------------------------------

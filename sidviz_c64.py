@@ -896,13 +896,18 @@ def main():
         sys.exit(0)
 
     # -------------------------------------------------------------------------
-    # Camera mode: bypass all file/stream logic
+    # Camera mode: camera = visual source; optional file/URL = audio source
     # -------------------------------------------------------------------------
     if args.camera:
         U64 = f"http://{args.ip}"
         FPS = args.fps
         VIZ_MODE = "camera"
         camera_device = args.camera_device
+
+        # Optional audio alongside camera visuals
+        filepath = os.path.expanduser(args.file) if args.file else None
+        if filepath and not is_url(filepath) and not os.path.isfile(filepath):
+            print(f"[!] File not found: {filepath}"); sys.exit(1)
 
         if args.color:      color_mode_init = 0
         elif args.no_color: color_mode_init = 1
@@ -912,6 +917,60 @@ def main():
 
         print(f"[*] Viz mode: camera  device: {camera_device}")
 
+        # --- Audio setup (mirrors normal mode, minus the waveform ffmpeg) ---
+        audio_mode        = None
+        c64_audio         = False
+        sid_duration_secs = None
+        psid              = None
+        stream_url        = filepath
+        info              = {}
+
+        if filepath:
+            audio_mode = detect_mode(filepath, force_sid=args.sid, force_audio=args.audio)
+
+            if audio_mode == "sid":
+                info = get_sid_info(filepath)
+                raw_len = info.get("Song Length", "")
+                if raw_len:
+                    try:
+                        parts = raw_len.split(".")[0].split(":")
+                        sid_duration_secs = int(parts[0]) * 60 + int(parts[1])
+                    except Exception:
+                        pass
+                if args.c64audio:
+                    c64_audio = True
+                elif args.macaudio:
+                    c64_audio = False
+                else:
+                    ans = input("Audio output? [m=local/sidplayfp (default), c=C64]: ").strip().lower()
+                    c64_audio = ans in ("c", "c64")
+                print(f"[*] SID audio: {'C64 hardware' if c64_audio else 'local (sidplayfp)'}")
+                if c64_audio:
+                    psid = parse_psid(filepath)
+                    if not psid:
+                        print("[!] PSID parse failed, falling back to local audio")
+                        c64_audio = False
+
+            elif audio_mode == "stream":
+                info = get_stream_info(filepath)
+                if info is None:
+                    print("[!] Failed to fetch stream metadata"); sys.exit(1)
+                if get_service(filepath) == "spotify":
+                    stream_url = resolve_stream_url(filepath, info)
+                    if not stream_url:
+                        print("[!] Could not find YouTube match for Spotify track"); sys.exit(1)
+            else:
+                info = get_audio_info(filepath)
+
+            display_mode = "sid" if audio_mode == "sid" else "audio"
+            show_info_header(info, display_mode, filepath)
+            ticker_str = build_ticker_string(info, display_mode)
+        else:
+            ticker_str = f"CAMERA LIVE   *   SIDVIZ U64 V{VERSION}   *   DEVICE {camera_device}        "
+            if len(ticker_str) > 253:
+                ticker_str = ticker_str[:253]
+
+        # --- C64 setup ---
         if not os.path.isfile(PRG_LOCAL):
             print(f"[!] {PRG_REMOTE} not found at {PRG_LOCAL}")
             print(f"    Build: 64tass -a -B -o sidviz.prg sidviz.asm")
@@ -928,25 +987,62 @@ def main():
 
         print(f"[*] Running {PRG_REMOTE}...")
         if not run_prg_from_temp(PRG_REMOTE): sys.exit(1)
+
+        if c64_audio:
+            print("[*] Signalling C64 audio mode to PRG ($C002=1)...")
+            write_byte(C64_AUDIO_FLAG, 1)
+
         time.sleep(1.0)
 
         write_color_tables()
         print("[*] Color tables written ($C3A8/$C428).")
 
+        if c64_audio:
+            if psid.get("clock") == 2:
+                print("[*] NTSC SID — setting CIA1 timer for 60Hz...")
+                write_mem(0xDC04, [0x95, 0x42])
+            else:
+                print("[*] Setting CIA1 timer for PAL 50Hz...")
+                write_mem(0xDC04, [0xF8, 0x4C])
+            write_byte(0xDC0E, 0x11)
+
         _cflag_map = {0: 2, 1: 1, 2: 3}
         write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
-
-        # Ticker shows camera info
-        ticker_str = f"CAMERA LIVE   *   SIDVIZ U64 V{VERSION}   *   DEVICE {camera_device}        "
-        if len(ticker_str) > 253:
-            ticker_str = ticker_str[:253]
         send_ticker(ticker_str)
 
+        # --- Start audio processes (camera replaces waveform ffmpeg entirely) ---
+        procs          = []
+        sid_audio_proc = None
+        ffplay_proc    = None
+        sid_end_time   = (time.time() + sid_duration_secs) if sid_duration_secs else None
+
+        if audio_mode == "sid":
+            if c64_audio:
+                upload_sid_to_c64(psid)
+                # sidplayfp to FIFO still needed so C64 timing stays accurate,
+                # but we discard its output — open FIFO in write-only throwaway mode
+                make_fifo(FIFO_PATH)
+                sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
+                procs = [sid_fifo_proc]
+            else:
+                sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
+                procs = [sid_audio_proc]
+        elif audio_mode == "audio":
+            ffplay_proc = start_ffplay_audio(filepath)
+            procs = [ffplay_proc]
+        elif audio_mode == "stream":
+            yt_audio_proc, ffplay_proc = start_ffplay_stream(stream_url)
+            procs = [yt_audio_proc, ffplay_proc]
+
+        # --- Start camera ---
         ffmpeg_proc = start_ffmpeg_camera(camera_device)
         if ffmpeg_proc is None:
             print("[!] Cannot open camera — check device index and permissions.")
             print(f"    Linux: ls /dev/video*  |  try --camera-device 1")
             print(f"    macOS: check System Settings → Privacy → Camera")
+            for p in procs:
+                try: p.terminate()
+                except: pass
             sys.exit(1)
 
         frame_size = WIDTH * HEIGHT
@@ -959,6 +1055,14 @@ def main():
 
         try:
             while not state["quit"]:
+                # Stop when audio finishes
+                if sid_audio_proc is not None and sid_audio_proc.poll() is not None:
+                    print("\r\n[*] Song ended."); break
+                if ffplay_proc is not None and ffplay_proc.poll() is not None:
+                    print("\r\n[*] Song ended."); break
+                if sid_end_time is not None and time.time() >= sid_end_time:
+                    print("\r\n[*] Song ended."); break
+
                 if ffmpeg_proc.poll() is not None:
                     err = ffmpeg_proc.stderr.read().decode(errors="replace").strip()
                     print("\r\n[*] Camera stream ended.")
@@ -990,11 +1094,23 @@ def main():
             print("\r\n[*] Interrupted.")
         finally:
             state["quit"] = True
-            write_mem(0xD400, [0] * 25)
-            write_byte(FRAME_FLAG, 0)
-            write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
-            write_mem(TICKER_ROW, [0x20] * 40)
+            if c64_audio:
+                write_byte(C64_AUDIO_FLAG, 0)
+                time.sleep(0.04)
+                write_mem(0xD400, [0] * 25)
+                write_byte(QUIT_FLAG, 1)
+                time.sleep(0.3)
+            else:
+                write_mem(0xD400, [0] * 25)
+                write_byte(FRAME_FLAG, 0)
+                write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
+                write_mem(TICKER_ROW, [0x20] * 40)
             try: ffmpeg_proc.terminate()
+            except: pass
+            for p in procs:
+                try: p.terminate()
+                except: pass
+            try: os.remove(FIFO_PATH)
             except: pass
             if "_term_fd" in state and "_term_old" in state:
                 try:

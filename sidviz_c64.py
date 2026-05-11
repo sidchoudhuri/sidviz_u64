@@ -1216,9 +1216,11 @@ def main():
                 except: pass
             sys.exit(1)
 
-        # Clear waveform zone (rows 8-24) via frame buffer + direct write
-        write_mem(FRAME_BUF, [0x20] * viz_frame_size)
-        write_mem(0x0540,    [0x20] * viz_frame_size)
+        # Clear waveform zone (rows 8-24) via frame buffer + direct write.
+        # Must use WIDTH*HEIGHT (680), not viz_frame_size (920) — FRAME_BUF
+        # is only 680 bytes; writing 920 would overflow into color tables at $C3A8.
+        write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
+        write_mem(0x0540,    [0x20] * (WIDTH * HEIGHT))
         write_byte(FRAME_FLAG, 1)
         # If extended: also clear rows 2-7 screen + color RAM.
         # Write color RAM 3× with small delays: the C64's color RAM SRAM is shared

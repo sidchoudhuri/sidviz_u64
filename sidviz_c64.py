@@ -1138,9 +1138,12 @@ def main():
 
         frame_size = WIDTH * HEIGHT
 
-        # Clear any residual garbage in the camera area (SID driver bytes that may
-        # have landed in screen RAM rows 20-24 if the SID loads near $0700).
+        # Clear waveform zone directly: write spaces to both the frame buffer
+        # ($C100, so copy_frame produces the same result) AND directly to screen
+        # RAM ($0540 = row 8).  Relying solely on copy_frame leaves a window where
+        # pre-existing C64 RAM content is visible — the direct write closes it.
         write_mem(FRAME_BUF, [0x20] * frame_size)
+        write_mem(0x0540,    [0x20] * frame_size)   # direct screen RAM rows 8-24
         write_byte(FRAME_FLAG, 1)
         print("[*] Frame buffer cleared.")
 

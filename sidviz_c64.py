@@ -1368,7 +1368,7 @@ def main():
             controls = "[c] cam-color, [v] viz-color, [q] quit"
         else:
             controls = "[c] color, [q] quit"
-        print(f"[*] Camera{blend_tag} streaming to C64 at {FPS}fps -- {controls}\n")
+        print(f"[*] Camera{blend_tag} streaming to C64 at {FPS}fps\n    {controls}\n")
 
         # Streams need time to buffer; don't declare "Song ended" until this many
         # seconds have elapsed — prevents false early-exit if yt-dlp is slow to start.

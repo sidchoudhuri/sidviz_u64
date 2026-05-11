@@ -914,8 +914,24 @@ def main():
         VIZ_MODE = "camera"
         camera_device = args.camera_device
 
-        # Optional audio + file
-        filepath = os.path.expanduser(args.file) if args.file else None
+        # Optional audio + file (mirrors normal mode filepath resolution)
+        if args.yt_search:
+            query = args.yt_search.strip()
+            if not query:
+                print("[!] --yt-search requires a non-empty query"); sys.exit(1)
+            print(f"[*] Searching YouTube: {query} (max {args.yt_max})")
+            candidates = youtube_search(query, args.yt_max)
+            if not candidates:
+                print("[!] No YouTube results found"); sys.exit(1)
+            chosen = choose_youtube_result(candidates)
+            if not chosen:
+                print("[*] Search cancelled."); sys.exit(0)
+            filepath = chosen
+            print(f"[*] Selected: {filepath}")
+        elif args.file:
+            filepath = os.path.expanduser(args.file)
+        else:
+            filepath = None
         if filepath and not is_url(filepath) and not os.path.isfile(filepath):
             print(f"[!] File not found: {filepath}"); sys.exit(1)
 
@@ -1199,11 +1215,20 @@ def main():
                 write_byte(FRAME_FLAG, 0)
                 write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
                 write_mem(TICKER_ROW, [0x20] * 40)
-            try: cam_proc.terminate()
-            except: pass
+            def _stop(proc):
+                if proc is None:
+                    return
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass
+            _stop(cam_proc)
             for p in procs:
-                try: p.terminate()
-                except: pass
+                _stop(p)
             try: os.remove(FIFO_PATH)
             except: pass
             if "_term_fd" in state and "_term_old" in state:

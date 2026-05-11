@@ -1108,6 +1108,14 @@ def main():
                 procs = [yt_audio_proc, ffplay_proc, yt_viz_proc, viz_ffmpeg_proc]
             else:
                 procs = [yt_audio_proc, ffplay_proc]
+            if args.save:
+                print(f"[*] Saving stream to: {args.save}")
+                save_proc = subprocess.Popen(
+                    ["yt-dlp", "-q", "-x", "--audio-format", "mp3"]
+                    + _YTDLP_COOKIE_ARGS + ["-o", args.save, stream_url],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+                procs.append(save_proc)
 
         # --- Start camera ---
         cam_proc = start_ffmpeg_camera(camera_device)

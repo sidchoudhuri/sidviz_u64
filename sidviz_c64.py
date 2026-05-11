@@ -1154,7 +1154,24 @@ def main():
         # With C64 audio:    rows 0-7 may hold SID code; restrict to rows 8-24.
         # rows 8-24 always use the frame-buffer path (FRAME_BUF → copy_frame → ASM
         # density routines).  rows 2-7 are written directly per-frame when available.
-        cam_ext_rows  = 0 if c64_audio else (HEIGHT - 17 + 6)  # 0 or 6 extra rows
+        #
+        # C64 audio mode: only use extra rows if the PSID binary doesn't land in
+        # the rows 2-7 screen RAM zone ($0450-$053F).  We check the static load
+        # range; SIDs whose INIT copies a runtime driver to $0400 (e.g. 3SID
+        # players) won't be caught here — for those the user will see a crash or
+        # garbled display, which is the same outcome as any demo that ignores the
+        # driver zone.  Non-C64-audio always gets rows 2-7 (no SID code risk).
+        if c64_audio and psid:
+            sid_end = psid["load_addr"] + len(psid["data"])
+            # Rows 2-7 screen RAM: $0450-$053F
+            overlaps_ext = psid["load_addr"] <= 0x053F and sid_end > 0x0450
+            cam_ext_rows = 0 if overlaps_ext else 6
+            if cam_ext_rows == 0:
+                print(f"[*] SID occupies screen RAM rows 2-7 — camera restricted to rows 8-24.")
+            else:
+                print(f"[*] SID load ${psid['load_addr']:04X}-${sid_end-1:04X} clears rows 2-7 — using full camera.")
+        else:
+            cam_ext_rows = 0 if c64_audio else 6
         cam_height    = HEIGHT + cam_ext_rows                   # 17 or 23
         cam_frame_size = WIDTH * cam_height                     # 680 or 920
         viz_frame_size = WIDTH * HEIGHT                         # always 680

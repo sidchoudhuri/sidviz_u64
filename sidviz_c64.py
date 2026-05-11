@@ -1120,6 +1120,12 @@ def main():
         write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
         send_ticker(ticker_str)
 
+        # --- Camera display dimensions (needed by viz ffmpeg start calls below) ---
+        cam_ext_rows   = 6
+        cam_height     = HEIGHT + cam_ext_rows   # 23 rows total (rows 2-24)
+        cam_frame_size = WIDTH * cam_height      # 920
+        viz_frame_size = WIDTH * cam_height      # 920 — blend covers all 23 rows
+
         # --- Start audio + optional blend viz processes ---
         procs          = []
         sid_audio_proc = None
@@ -1184,17 +1190,6 @@ def main():
                 procs.append(save_proc)
 
         # --- Camera display area ---
-        # Without C64 audio: rows 2-24 safe (no SID driver in screen RAM $0400-$04FF).
-        # With C64 audio:    rows 0-7 may hold SID code; restrict to rows 8-24.
-        # rows 8-24 always use the frame-buffer path (FRAME_BUF → copy_frame → ASM
-        # density routines).  rows 2-7 are written directly per-frame when available.
-        #
-        # Always try rows 2-7 — most SIDs load above $0540; those whose INIT
-        # copies a driver to $0400 may corrupt display but that is rare.
-        cam_ext_rows = 6
-        cam_height    = HEIGHT + cam_ext_rows                   # 17 or 23
-        cam_frame_size = WIDTH * cam_height                     # 920
-        viz_frame_size = WIDTH * cam_height                     # 920 — matches camera so blend covers all 23 rows
         _cam_ext_scr  = 0x0400 + 2 * WIDTH                     # $0450 (row 2)
         _cam_ext_col  = 0xD800 + 2 * WIDTH                     # $D850 (row 2 color RAM)
         _CAM_RTAB     = [2,2,8,8,7,7,7,7,5,5,5,5,13,13,14,14,

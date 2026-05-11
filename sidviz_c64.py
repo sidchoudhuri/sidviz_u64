@@ -1136,17 +1136,30 @@ def main():
 
         if audio_mode == "sid":
             if c64_audio:
-                # C64 plays audio via SID chip; sidplayfp → FIFO only if blending
+                # C64 plays audio via SID chip; sidplayfp → FIFO only if blending.
+                # Upload SID first so INIT runs, then do a post-INIT check: some SIDs
+                # (especially multi-SID arrangements) copy a runtime player into
+                # $0450-$053F (screen RAM rows 2-7) during INIT.  Writing camera
+                # pixels there every frame would overwrite the player and crash the C64.
+                # Read back $0450-$053F after INIT; if any non-space byte is found,
+                # restrict the camera to rows 8-24 only.
+                upload_sid_to_c64(psid)
+                time.sleep(0.25)   # give INIT time to finish
+                _post = u64_get("machine:readmem?address=450&length=F0")  # $0450, 240 bytes
+                if _post and any(b != 0x20 for b in _post):
+                    print("[!] SID INIT placed code at $0450-$053F (rows 2-7) — "
+                          "restricting camera to rows 8-24 to avoid corrupting SID driver")
+                    cam_ext_rows   = 0
+                    cam_height     = HEIGHT
+                    cam_frame_size = WIDTH * HEIGHT
+                    viz_frame_size = WIDTH * HEIGHT
                 if blend_viz_mode:
                     make_fifo(FIFO_PATH)
                     VIZ_MODE = blend_viz_mode
                     viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(realtime=True, height=cam_height)
                     VIZ_MODE = "camera"
-                    upload_sid_to_c64(psid)
                     sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
                     procs = [sid_fifo_proc, viz_ffmpeg_proc]
-                else:
-                    upload_sid_to_c64(psid)
             else:
                 if blend_viz_mode:
                     make_fifo(FIFO_PATH)

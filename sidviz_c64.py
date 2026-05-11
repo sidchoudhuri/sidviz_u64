@@ -666,13 +666,18 @@ def start_ffmpeg_waveform_file(filepath):
 def start_ffmpeg_camera(device="0"):
     """Capture live camera frames, scale to C64 screen size, output as raw gray pixels."""
     if sys.platform == "darwin":
-        # macOS: AVFoundation — "N:none" = video device N, no audio capture
+        # macOS: AVFoundation — "N:none" = video device N, no audio capture.
+        # Do NOT specify -framerate on input: AVFoundation only accepts specific
+        # rates (25/30/50/60) and rejects anything else. Let it run at native
+        # rate; the output -r flag downsamples to our target FPS.
         cam = f"{device}:none"
-        input_flags = ["-f", "avfoundation", "-framerate", str(FPS), "-i", cam]
+        input_flags = ["-f", "avfoundation", "-i", cam]
     else:
-        # Linux: v4l2 — accept bare index ("0") or full path ("/dev/video0")
+        # Linux: v4l2 — accept bare index ("0") or full path ("/dev/video0").
+        # v4l2 cameras generally support a wide rate range, but omit -framerate
+        # here too for consistency; output -r handles downsampling.
         dev = device if device.startswith("/") else f"/dev/video{device}"
-        input_flags = ["-f", "v4l2", "-framerate", str(FPS), "-i", dev]
+        input_flags = ["-f", "v4l2", "-i", dev]
     # -vf scale only — "-pix_fmt gray" on the output side handles grayscale conversion.
     # stderr goes to PIPE so we can print a useful message if the camera fails to open.
     cmd = (["ffmpeg", "-loglevel", "error"] + input_flags +

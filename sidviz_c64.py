@@ -666,18 +666,28 @@ def start_ffmpeg_waveform_file(filepath):
 def start_ffmpeg_camera(device="0"):
     """Capture live camera frames, scale to C64 screen size, output as raw gray pixels."""
     if sys.platform == "darwin":
-        # macOS: AVFoundation — device "N:none" means video index N, no audio
+        # macOS: AVFoundation — "N:none" = video device N, no audio capture
         cam = f"{device}:none"
         input_flags = ["-f", "avfoundation", "-framerate", str(FPS), "-i", cam]
     else:
-        # Linux: v4l2 — accept either a bare index ("0") or a full path ("/dev/video0")
+        # Linux: v4l2 — accept bare index ("0") or full path ("/dev/video0")
         dev = device if device.startswith("/") else f"/dev/video{device}"
         input_flags = ["-f", "v4l2", "-framerate", str(FPS), "-i", dev]
-    cmd = (["ffmpeg", "-loglevel", "quiet"] + input_flags +
-           ["-vf", f"scale={WIDTH}:{HEIGHT}:flags=lanczos,format=gray",
+    # -vf scale only — "-pix_fmt gray" on the output side handles grayscale conversion.
+    # stderr goes to PIPE so we can print a useful message if the camera fails to open.
+    cmd = (["ffmpeg", "-loglevel", "error"] + input_flags +
+           ["-vf", f"scale={WIDTH}:{HEIGHT}",
             "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"])
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL)
+                         stderr=subprocess.PIPE)
+    # Give ffmpeg a moment to open the device; if it exits immediately the camera failed.
+    time.sleep(0.5)
+    if p.poll() is not None:
+        err = p.stderr.read().decode(errors="replace").strip()
+        print(f"[!] ffmpeg camera failed to open device '{device}'")
+        if err:
+            print(f"[!] ffmpeg: {err}")
+        return None
     print(f"[*] ffmpeg camera started (device: {device})")
     return p
 
@@ -921,6 +931,11 @@ def main():
         send_ticker(ticker_str)
 
         ffmpeg_proc = start_ffmpeg_camera(camera_device)
+        if ffmpeg_proc is None:
+            print("[!] Cannot open camera — check device index and permissions.")
+            print(f"    Linux: ls /dev/video*  |  try --camera-device 1")
+            print(f"    macOS: check System Settings → Privacy → Camera")
+            sys.exit(1)
 
         frame_size = WIDTH * HEIGHT
         state      = {"color_mode": color_mode_init, "color_pending": False, "quit": False}
@@ -933,7 +948,11 @@ def main():
         try:
             while not state["quit"]:
                 if ffmpeg_proc.poll() is not None:
-                    print("\r\n[*] Camera stream ended."); break
+                    err = ffmpeg_proc.stderr.read().decode(errors="replace").strip()
+                    print("\r\n[*] Camera stream ended.")
+                    if err:
+                        print(f"[!] ffmpeg: {err}")
+                    break
 
                 if state["color_pending"]:
                     state["color_pending"] = False

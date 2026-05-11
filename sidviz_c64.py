@@ -4,7 +4,7 @@ sidviz_u64.py -- SID/audio waveform + live camera visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 Camera mode: streams webcam footage as PETSCII character art on the C64 screen.
 
-version 1.8.1 (2026-05-11)
+version 1.9.0 (2026-05-11)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -28,7 +28,7 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 BUILD   = "2026-05-11"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
@@ -41,6 +41,7 @@ _YTDLP_COOKIE_ARGS: list = []
 FIFO_PATH    = "/tmp/sidpipe.wav"
 WIDTH        = 40
 HEIGHT       = 17              # rows 8-24 — protects SID driver at $0400-$04FF
+VIDEO_EXTS   = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".ts", ".wmv", ".3gp"}
 FRAME_BUF    = 0xC100
 FRAME_FLAG   = 0xC000
 COLOR_FLAG   = 0xC001
@@ -150,6 +151,7 @@ def parse_args():
     p.add_argument("--avectorscope",  action="store_true", help="Force vectorscope (oscilloscope) visualization")
     p.add_argument("--showspectrum",  action="store_true", help="Force scrolling spectrogram visualization")
     p.add_argument("--ahistogram",    action="store_true", help="Force amplitude histogram visualization")
+    p.add_argument("--video",         action="store_true", help="Video file/URL mode: display as PETSCII art on C64")
     p.add_argument("--camera",        action="store_true", help="Live camera mode: stream webcam as PETSCII art on C64")
     p.add_argument("--camera-device", default="0",         metavar="DEV",
                    help="Camera device: index (0,1,…) or path (/dev/video0). Default: 0")
@@ -721,11 +723,44 @@ def start_ffmpeg_camera(device="0", height=HEIGHT):
     print(f"[*] ffmpeg camera started (device: {device})")
     return p
 
+def start_ffmpeg_video_frames(source, height=HEIGHT):
+    """Extract grayscale video frames from a file at target FPS."""
+    vf = (f"fps={FPS},scale={WIDTH}:{height}:flags=lanczos,"
+          f"eq=contrast=1.3,format=gray")
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-i", source,
+           "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    print(f"[*] ffmpeg video frames started: {os.path.basename(source)}")
+    return p
+
+def start_yt_video_frames(url, height=HEIGHT):
+    """Stream YouTube/URL video frames via yt-dlp piped to ffmpeg."""
+    yt_proc = subprocess.Popen(
+        ["yt-dlp", "-f", "bestvideo[height<=480]/bestvideo", "-o", "-",
+         "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [url],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    vf = (f"fps={FPS},scale={WIDTH}:{height}:flags=lanczos,"
+          f"eq=contrast=1.3,format=gray")
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
+           "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+    p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    yt_proc.stdout.close()
+    print("[*] yt-dlp + ffmpeg video frames started.")
+    return yt_proc, p
+
 def start_ffplay_audio(filepath):
     p = subprocess.Popen(
         ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", filepath],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("[*] ffplay audio started."); return p
+
+def start_ffplay_video_audio(filepath):
+    """Play audio track from a video file without showing a video window."""
+    p = subprocess.Popen(
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", filepath],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("[*] ffplay video audio started."); return p
 
 def start_sidplayfp_fifo(filepath, duration_secs=None):
     cmd = ["sidplayfp"]
@@ -1547,6 +1582,364 @@ def main():
             _stop(cam_proc)
             for p in procs:
                 _stop(p)
+            try: os.remove(FIFO_PATH)
+            except: pass
+            if "_term_fd" in state and "_term_old" in state:
+                try:
+                    termios.tcsetattr(state["_term_fd"], termios.TCSADRAIN, state["_term_old"])
+                except Exception:
+                    pass
+            print("[*] Done.")
+        return
+
+    # -------------------------------------------------------------------------
+    # Video mode: video file or URL displayed as PETSCII art on C64
+    # -------------------------------------------------------------------------
+    _video_file = (args.file and not is_url(args.file) and
+                   os.path.splitext(args.file)[1].lower() in VIDEO_EXTS)
+    if args.video or _video_file:
+        U64 = f"http://{args.ip}"
+        FPS = args.fps
+        VIZ_MODE = "camera"
+
+        # --- Resolve filepath ---
+        if args.yt_search:
+            query = args.yt_search.strip()
+            if not query:
+                print("[!] --yt-search requires a non-empty query"); sys.exit(1)
+            print(f"[*] Searching YouTube: {query} (max {args.yt_max})")
+            candidates = youtube_search(query, args.yt_max)
+            if not candidates:
+                print("[!] No YouTube results found"); sys.exit(1)
+            chosen = choose_youtube_result(candidates)
+            if not chosen:
+                print("[*] Search cancelled."); sys.exit(0)
+            filepath = chosen
+            _yt_chosen = next((c for c in candidates if c["url"] == chosen), None)
+        else:
+            filepath = os.path.expanduser(args.file) if args.file else \
+                       os.path.expanduser(input("Video file or URL: ").strip())
+
+        if not is_url(filepath) and not os.path.isfile(filepath):
+            print(f"[!] File not found: {filepath}"); sys.exit(1)
+
+        stream_url = filepath
+
+        # --- Color mode ---
+        if args.color:      color_mode_init = 0
+        elif args.no_color: color_mode_init = 1
+        else:
+            ans = input("Color mode? [0=rainbow, 1=white, 2=fire] (default 0): ").strip()
+            color_mode_init = int(ans) if ans in ("0","1","2") else 0
+
+        src_label = os.path.basename(filepath) if not is_url(filepath) else filepath
+        print(f"[*] Viz mode: video  source: {src_label}")
+
+        # --- Blend viz overlay ---
+        blend_viz_mode = None
+        if args.showwaves:      blend_viz_mode = "showwaves"
+        elif args.showfreqs:    blend_viz_mode = "showfreqs"
+        elif args.avectorscope: blend_viz_mode = "avectorscope"
+        elif args.showspectrum: blend_viz_mode = "showspectrum"
+        elif args.ahistogram:   blend_viz_mode = "ahistogram"
+        else:
+            ans = input(
+                "Blend audio viz? [0=none, 1=waveform, 2=spectrum, 3=scope, "
+                "4=spectrogram, 5=histogram] (default 0): "
+            ).strip()
+            blend_viz_mode = {
+                "1": "showwaves", "2": "showfreqs", "3": "avectorscope",
+                "4": "showspectrum", "5": "ahistogram",
+            }.get(ans)
+        if blend_viz_mode:
+            print(f"[*] Blend viz: {blend_viz_mode}")
+
+        # --- Viz color (blend mode only) ---
+        if blend_viz_mode:
+            if args.color:      viz_color_mode_init = 0
+            elif args.no_color: viz_color_mode_init = 1
+            else:
+                ans = input("Viz color mode? [0=rainbow, 1=white, 2=fire] (default 2): ").strip()
+                viz_color_mode_init = int(ans) if ans in ("0","1","2") else 2
+        else:
+            viz_color_mode_init = 2
+
+        # --- Color lookup tables for per-pixel dual-color blend ---
+        _cam_wlut, _cam_flut = _build_color_luts(CHARS_CAMERA_DEF)
+        if blend_viz_mode:
+            _viz_chars_def = {
+                "showwaves":    CHARS_DEF,
+                "showfreqs":    CHARS_FREQ_DEF,
+                "avectorscope": CHARS_SCOPE_DEF,
+                "showspectrum": CHARS_SPECTRUM_DEF,
+                "ahistogram":   CHARS_HIST_DEF,
+            }.get(blend_viz_mode, CHARS_DEF)
+            _viz_chars = [t[0] for t in _viz_chars_def]
+            _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
+        else:
+            _viz_chars, _viz_wlut, _viz_flut = None, {}, {}
+
+        # --- Metadata and ticker ---
+        info = {}
+        if is_url(filepath):
+            info = get_stream_info(filepath) or {}
+        else:
+            info = get_audio_info(filepath)
+        show_info_header(info, "audio", filepath)
+        ticker_str = build_ticker_string(info, "audio")
+        if not ticker_str.strip("* "):
+            ticker_str = f"{src_label}   *   SIDVIZ U64 V{VERSION}        "
+
+        # --- Reboot + upload PRG ---
+        if not smoke_test(): sys.exit(1)
+        print("[*] Rebooting C64...")
+        u64_put("machine:reboot")
+        time.sleep(4.0)
+        print(f"[*] Uploading {PRG_REMOTE}...")
+        if not ftp_upload(PRG_LOCAL, PRG_REMOTE): sys.exit(1)
+        print(f"[*] Running {PRG_REMOTE}...")
+        if not run_prg_from_temp(PRG_REMOTE): sys.exit(1)
+
+        time.sleep(1.0)
+        write_color_tables()
+
+        _cflag_map = {0: 2, 1: 1, 2: 3}
+        if blend_viz_mode:
+            write_byte(COLOR_FLAG, 5)
+        else:
+            write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
+        send_ticker(ticker_str)
+
+        # --- Display dimensions (always full 23 rows for video) ---
+        cam_ext_rows   = 6
+        cam_height     = HEIGHT + cam_ext_rows   # 23 rows (rows 2-24)
+        cam_frame_size = WIDTH * cam_height      # 920
+        viz_frame_size = WIDTH * cam_height
+
+        _cam_ext_scr = 0x0400 + 2 * WIDTH       # $0450 row 2 screen RAM
+        _cam_ext_col = 0xD800 + 2 * WIDTH       # $D850 row 2 color RAM
+        _CAM_RTAB    = [2,2,8,8,7,7,7,7,5,5,5,5,13,13,14,14,
+                        6,6,6,6,4,4,4,4,10,10,2,2,8,8,7,7,
+                        5,5,13,13,14,14,6,6]
+
+        def _top_colors(cmode):
+            if cmode == 0:
+                return bytes(_CAM_RTAB[col] for _ in range(6) for col in range(WIDTH))
+            elif cmode == 1:
+                return bytes([1] * 6 * WIDTH)
+            else:
+                return bytes([8] * 6 * WIDTH)
+
+        # --- Clear display area ---
+        write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
+        write_mem(0x0540,    [0x20] * (WIDTH * HEIGHT))
+        write_byte(FRAME_FLAG, 1)
+        write_mem(_cam_ext_scr, [0x20] * (cam_ext_rows * WIDTH))
+        for _ in range(3):
+            write_mem(_cam_ext_col, _top_colors(color_mode_init))
+            time.sleep(0.05)
+        print("[*] Video zone cleared.")
+
+        # --- Start processes ---
+        procs        = []
+        yt_vid_proc  = None
+        viz_ffmpeg_proc = None
+        yt_viz_proc  = None
+        audio_proc   = None
+
+        if is_url(filepath):
+            yt_vid_proc, vid_proc = start_yt_video_frames(stream_url, height=cam_height)
+            procs += [yt_vid_proc, vid_proc]
+            yt_audio_proc, audio_proc = start_ffplay_stream(stream_url)
+            procs += [yt_audio_proc, audio_proc]
+        else:
+            vid_proc   = start_ffmpeg_video_frames(filepath, height=cam_height)
+            audio_proc = start_ffplay_video_audio(filepath)
+            procs += [vid_proc, audio_proc]
+
+        if blend_viz_mode:
+            VIZ_MODE = blend_viz_mode
+            if is_url(filepath):
+                yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(stream_url, height=cam_height)
+                procs += [yt_viz_proc, viz_ffmpeg_proc]
+            else:
+                viz_ffmpeg_proc = start_ffmpeg_waveform_file(filepath, height=cam_height)
+                procs.append(viz_ffmpeg_proc)
+            VIZ_MODE = "camera"
+
+        if args.save and is_url(filepath):
+            print(f"[*] Saving video to: {args.save}")
+            save_proc = subprocess.Popen(
+                ["yt-dlp", "-f", "bestvideo+bestaudio/best",
+                 "--merge-output-format", "mp4"]
+                + _YTDLP_COOKIE_ARGS + ["-o", args.save, stream_url],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            procs.append(save_proc)
+
+        # --- Background threads ---
+        last_viz_frame  = bytearray(viz_frame_size)
+        viz_lock        = threading.Lock()
+        viz_frame_count = [0]
+
+        if viz_ffmpeg_proc:
+            def _read_viz():
+                buf = bytearray()
+                while True:
+                    try:
+                        chunk = viz_ffmpeg_proc.stdout.read1(65536)
+                        if not chunk: break
+                        buf.extend(chunk)
+                        while len(buf) >= viz_frame_size:
+                            with viz_lock:
+                                last_viz_frame[:] = buf[:viz_frame_size]
+                                viz_frame_count[0] += 1
+                            del buf[:viz_frame_size]
+                    except Exception:
+                        break
+            threading.Thread(target=_read_viz, daemon=True).start()
+
+        latest_vid_frame = [None]
+        vid_frame_lock   = threading.Lock()
+
+        def _read_vid():
+            buf = bytearray()
+            while True:
+                try:
+                    chunk = vid_proc.stdout.read1(65536)
+                    if not chunk: break
+                    buf.extend(chunk)
+                    while len(buf) >= cam_frame_size:
+                        with vid_frame_lock:
+                            latest_vid_frame[0] = bytes(buf[:cam_frame_size])
+                        del buf[:cam_frame_size]
+                except Exception:
+                    break
+        threading.Thread(target=_read_vid, daemon=True).start()
+
+        # --- State + keypress ---
+        state = {
+            "cam_color":     color_mode_init,
+            "viz_color":     viz_color_mode_init,
+            "color_pending": False,
+            "quit":          False,
+        }
+        kthread = make_keypress_listener(state)
+        kthread.start()
+
+        frame_num = 0
+        blend_tag = f"+{blend_viz_mode}" if blend_viz_mode else ""
+        controls  = "[c] vid-color, [v] viz-color, [q] quit" if blend_viz_mode else "[c] color, [q] quit"
+        print(f"[*] Video{blend_tag} streaming to C64 at {FPS}fps\n    {controls}\n")
+
+        try:
+            while not state["quit"]:
+                if audio_proc is not None and audio_proc.poll() is not None:
+                    print("\r\n[*] Audio ended."); break
+                if vid_proc.poll() is not None:
+                    print("\r\n[*] Video ended."); break
+
+                if viz_ffmpeg_proc is not None and viz_ffmpeg_proc.poll() is not None:
+                    try:
+                        verr = viz_ffmpeg_proc.stderr.read(4096).decode(errors="replace").strip()
+                    except Exception:
+                        verr = ""
+                    print(f"\r\n[!] Viz ffmpeg exited.")
+                    if verr: print(f"[!] ffmpeg viz: {verr[:300]}")
+                    viz_ffmpeg_proc = None
+                    write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                    write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+
+                if state["color_pending"]:
+                    state["color_pending"] = False
+                    if not viz_ffmpeg_proc:
+                        write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                        write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+
+                with vid_frame_lock:
+                    raw = latest_vid_frame[0]
+                    latest_vid_frame[0] = None
+                if raw is None:
+                    time.sleep(0.010)
+                    continue
+
+                top_raw = raw[:cam_ext_rows * WIDTH]
+                bot_raw = raw[cam_ext_rows * WIDTH:]
+
+                if viz_ffmpeg_proc:
+                    with viz_lock:
+                        vz_top = last_viz_frame[:cam_ext_rows * WIDTH]
+                        vz_bot = last_viz_frame[cam_ext_rows * WIDTH:]
+                    blended_top = bytes(max(c, v) for c, v in zip(top_raw, vz_top))
+                    blended_bot = bytes(max(c, v) for c, v in zip(bot_raw, vz_bot))
+                    cam_cmode = state["cam_color"]
+                    viz_cmode = state["viz_color"]
+                    color_top = bytearray(cam_ext_rows * WIDTH)
+                    for i in range(cam_ext_rows * WIDTH):
+                        col_x = i % WIDTH
+                        cp, vp = top_raw[i], vz_top[i]
+                        if cp >= vp:
+                            color_top[i] = _pixel_color(cp, CHARS_CAMERA, cam_cmode, col_x,
+                                                        _cam_wlut, _cam_flut, _CAM_RTAB)
+                        else:
+                            color_top[i] = _pixel_color(vp, _viz_chars, viz_cmode, col_x,
+                                                        _viz_wlut, _viz_flut, _CAM_RTAB)
+                    color_bot = bytearray(HEIGHT * WIDTH)
+                    for i in range(HEIGHT * WIDTH):
+                        col_x = i % WIDTH
+                        cp, vp = bot_raw[i], vz_bot[i]
+                        if cp >= vp:
+                            color_bot[i] = _pixel_color(cp, CHARS_CAMERA, cam_cmode, col_x,
+                                                        _cam_wlut, _cam_flut, _CAM_RTAB)
+                        else:
+                            color_bot[i] = _pixel_color(vp, _viz_chars, viz_cmode, col_x,
+                                                        _viz_wlut, _viz_flut, _CAM_RTAB)
+                else:
+                    blended_top = top_raw
+                    blended_bot = bot_raw
+
+                bot_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended_bot)
+                write_mem(FRAME_BUF, bot_screen)
+                write_byte(FRAME_FLAG, 1)
+
+                top_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended_top)
+                write_mem(_cam_ext_scr, top_screen)
+                if viz_ffmpeg_proc:
+                    write_mem(_cam_ext_col, color_top)
+                    write_mem(WAVE_COL_ADDR, color_bot)
+                else:
+                    write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+
+                frame_num += 1
+                if blend_viz_mode and viz_ffmpeg_proc:
+                    vid_ind = ["R","W","F"][state["cam_color"]]
+                    viz_ind = ["R","W","F"][state["viz_color"]]
+                    ind = f"vid:{vid_ind} viz:{viz_ind}"
+                else:
+                    ind = ["R","W","F"][state["cam_color"]]
+                vfc  = viz_frame_count[0] if viz_ffmpeg_proc else -1
+                vsuf = f" viz={vfc:05d}" if vfc >= 0 else ""
+                print(f"\r[*] Frame {frame_num:05d} [{ind}]{vsuf}", end="", flush=True)
+
+        except KeyboardInterrupt:
+            print("\r\n[*] Interrupted.")
+        finally:
+            state["quit"] = True
+            write_mem(0xD400, [0] * 25)
+            write_byte(FRAME_FLAG, 0)
+            write_mem(FRAME_BUF,    [0x20] * (WIDTH * HEIGHT))
+            write_mem(_cam_ext_scr, [0x20] * (cam_ext_rows * WIDTH))
+            write_mem(_cam_ext_col, [0x00] * (cam_ext_rows * WIDTH))
+            write_mem(TICKER_ROW, [0x20] * 40)
+            def _stop(proc):
+                if proc is None: return
+                try:
+                    proc.terminate(); proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.wait()
+                except Exception:
+                    pass
+            _stop(vid_proc)
+            for p in procs: _stop(p)
             try: os.remove(FIFO_PATH)
             except: pass
             if "_term_fd" in state and "_term_old" in state:

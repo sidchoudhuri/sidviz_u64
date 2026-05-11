@@ -194,7 +194,6 @@ ml_not_rainbow:
         jmp clr_cflag
 
 ml_not_white:
-        jsr fill_color_white
         lda #$02
         sta color_mode
 

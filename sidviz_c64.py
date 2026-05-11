@@ -433,7 +433,7 @@ def start_ffmpeg_waveform_stream(url):
     """Stream audio via yt-dlp piped to ffmpeg for waveform generation."""
     yt_proc = subprocess.Popen(
         ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [url],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
            "-filter_complex", _build_viz_filter(),
@@ -447,12 +447,12 @@ def start_ffplay_stream(url):
     """Stream audio via yt-dlp piped to ffplay."""
     yt_proc = subprocess.Popen(
         ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [url],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     p = subprocess.Popen(
         ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
          "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-i", "pipe:0"],
-        stdin=yt_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        stdin=yt_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
     )
     yt_proc.stdout.close()
     print("[*] ffplay audio (stream) started.")
@@ -681,12 +681,15 @@ def start_ffmpeg_camera(device="0"):
         dev = device if device.startswith("/") else f"/dev/video{device}"
         input_flags = ["-f", "v4l2", "-i", dev]
     # Filter chain:
-    #   scale=W:-2          scale width to W, compute height preserving AR (round to even)
-    #   crop=W:H            center-crop height to H (removes top/bottom excess)
-    #   If scaled height < H (very wide cameras): pad instead of crop.
+    #   crop=iw:iw*H/W      crop source to the target AR (removes top/bottom rows)
+    #   scale=W:H           uniform scale: both axes shrink by the same factor, no squash
     #   eq=contrast=1.8     boost contrast so brightness differences map to distinct chars
-    # Using scale first then crop avoids the AR squash from forcing W:H directly.
-    vf = (f"scale={WIDTH}:-2,crop={WIDTH}:{HEIGHT},"
+    # Cropping to target AR first is the only correct way to avoid horizontal squash:
+    # scaling to 40 wide first and then height-cropping preserves AR in ffmpeg pixel space
+    # but the character grid displays at 40:17 = 2.35:1, so a 16:9 source appears 1.32×
+    # wider than intended.  All practical cameras (4:3 or 16:9) have AR < 2.35 so the
+    # crop always removes rows from a taller-than-target source; never clips width.
+    vf = (f"crop=iw:iw*{HEIGHT}/{WIDTH},scale={WIDTH}:{HEIGHT},"
           f"eq=contrast=1.8:brightness=0.05")
     cmd = (["ffmpeg", "-loglevel", "error"] + input_flags +
            ["-vf", vf,
@@ -1059,6 +1062,7 @@ def main():
         procs          = []
         sid_audio_proc = None
         ffplay_proc    = None
+        yt_audio_proc  = None
         viz_ffmpeg_proc = None
         sid_end_time   = (time.time() + sid_duration_secs) if sid_duration_secs else None
 
@@ -1165,12 +1169,38 @@ def main():
         blend_tag = f"+{blend_viz_mode}" if blend_viz_mode else ""
         print(f"[*] Camera{blend_tag} streaming to C64 at {FPS}fps -- [c] color, [q] quit\n")
 
+        # Streams need time to buffer; don't declare "Song ended" until this many
+        # seconds have elapsed — prevents false early-exit if yt-dlp is slow to start.
+        loop_start = time.time()
+        STREAM_GRACE = 12  # seconds
+
+        def _stream_err(proc, label):
+            """Read and print stderr from a process if it died early."""
+            if proc is None or proc.stderr is None:
+                return
+            try:
+                err = proc.stderr.read(4096).decode(errors="replace").strip()
+                if err:
+                    print(f"\r\n[!] {label}: {err[:300]}")
+            except Exception:
+                pass
+
         try:
             while not state["quit"]:
+                elapsed = time.time() - loop_start
+                # SID player (local): exit is genuine whenever it happens
                 if sid_audio_proc is not None and sid_audio_proc.poll() is not None:
                     print("\r\n[*] Song ended."); break
+                # Stream player: give yt-dlp time to buffer before treating exit as fatal
                 if ffplay_proc is not None and ffplay_proc.poll() is not None:
-                    print("\r\n[*] Song ended."); break
+                    if elapsed < STREAM_GRACE:
+                        # Died during grace period — likely a yt-dlp error; show it
+                        _stream_err(ffplay_proc,   "ffplay")
+                        _stream_err(yt_audio_proc, "yt-dlp audio")
+                        print("\r\n[!] Audio stream failed (see above). Camera continues without audio.")
+                        ffplay_proc = None  # suppress further checks; camera keeps running
+                    else:
+                        print("\r\n[*] Song ended."); break
                 if sid_end_time is not None and time.time() >= sid_end_time:
                     print("\r\n[*] Song ended."); break
 

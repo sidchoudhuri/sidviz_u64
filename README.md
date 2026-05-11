@@ -327,6 +327,7 @@ Options:
 | --camera-device N	| Select capture device index (default: 0) |
 | --blend-viz MODE | Overlay audio waveform on camera image (same modes as --showwaves etc.) |
 | --list-cameras | List available camera devices and exit |
+| --save-petscii FILE.mp4 | Save the PETSCII rendering itself as an MP4 video (camera and video modes) |
 
 The webcam crop is adaptive — any source aspect ratio (16:9, 4:3, square) is center-cropped to fill the 40-wide C64 character grid without stretching.
 

@@ -57,6 +57,13 @@ TIMEOUT      = 5.0
 # C64 colors: 0=black 1=white 2=red 7=yellow 8=orange 9=brown 10=ltred 11=dkgray 12=mdgray 15=ltgray
 WHITE_CTABLE_ADDR = 0xC3A8   # 128-byte table written by Python: screen_code → C64 color
 FIRE_CTABLE_ADDR  = 0xC428   # 128-byte table written by Python: screen_code → C64 color
+PETSCII_BLOCK   = 16   # pixels per char cell in saved PETSCII video (640×368 for 40×23)
+C64_PALETTE_RGB = [    # standard C64 VICE palette (R, G, B)
+    (  0,  0,  0), (255,255,255), (136,  0,  0), (170,255,238),
+    (204, 68,204), (  0,204, 85), (  0,  0,170), (238,238,119),
+    (221,136, 85), (102, 68,  0), (255,119,119), ( 51, 51, 51),
+    (119,119,119), (170,255,102), (  0,136,255), (187,187,187),
+]
 
 #                             code       white       fire
 CHARS_DEF = [               # showwaves  (least → most dense)
@@ -140,6 +147,8 @@ def parse_args():
     p.add_argument("--macaudio", action="store_true",    help="Play SID audio locally via sidplayfp (default)")
     p.add_argument("--fps",      type=int, default=10,   help="Frame rate (default 10)")
     p.add_argument("--save",     metavar="FILE.mp3",     help="Save YouTube stream to MP3 (YouTube mode only)")
+    p.add_argument("--save-petscii", metavar="FILE.mp4",
+                   help="Save the PETSCII rendering itself as an MP4 video (camera and video modes)")
     p.add_argument("--yt-search", metavar="QUERY",        help="Search YouTube by title/artist and choose a result")
     p.add_argument("--yt-max",   type=int, default=10,    help="Max YouTube search results (default 10)")
     p.add_argument("--cookies-from-browser", metavar="BROWSER",
@@ -952,6 +961,35 @@ def _pixel_color(pixel, chars, color_mode, col_x, white_lut, fire_lut, rainbow_t
         return white_lut.get(char_code, 1)
     return fire_lut.get(char_code, 8)
 
+def start_petscii_recorder(filepath, num_cols, num_rows, block=PETSCII_BLOCK):
+    """Start an ffmpeg subprocess that accepts raw RGB24 frames and writes MP4."""
+    w, h = num_cols * block, num_rows * block
+    cmd = ["ffmpeg", "-y",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(FPS),
+           "-i", "pipe:0",
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", filepath]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"[*] PETSCII recorder: {filepath} ({w}x{h} @ {FPS}fps)")
+    return p
+
+def _render_petscii_frame(pixels, colors, num_cols, num_rows, block=PETSCII_BLOCK):
+    """Render a PETSCII frame as raw RGB24 bytes.
+    pixels: grayscale byte sequence (num_cols*num_rows); colors: C64 color indices."""
+    w = num_cols * block
+    buf = bytearray(w * num_rows * block * 3)
+    for row in range(num_rows):
+        for col in range(num_cols):
+            idx = row * num_cols + col
+            r, g, b = C64_PALETTE_RGB[colors[idx] & 0x0F]
+            scale = pixels[idx] / 255.0
+            pr, pg, pb = int(r * scale), int(g * scale), int(b * scale)
+            cell_rgb = bytes([pr, pg, pb]) * block
+            for br in range(block):
+                base = ((row * block + br) * w + col * block) * 3
+                buf[base:base + block * 3] = cell_rgb
+    return bytes(buf)
+
 def _apply_freq_gradient(raw, color_mode, height=HEIGHT):
     """Apply a per-mode vertical gradient to showfreqs frames so density/fire
     color modes see a range of character values instead of flat solid white.
@@ -1333,6 +1371,10 @@ def main():
                 time.sleep(0.05)
         print("[*] Camera zone cleared.")
 
+        petscii_recorder = None
+        if args.save_petscii:
+            petscii_recorder = start_petscii_recorder(args.save_petscii, WIDTH, cam_height)
+
         # Background thread keeps the latest viz frame for blending (17-row)
         last_viz_frame = bytearray(viz_frame_size)
         viz_lock = threading.Lock()
@@ -1542,6 +1584,24 @@ def main():
                 if viz_ffmpeg_proc:
                     write_mem(WAVE_COL_ADDR, color_bot)
 
+                if petscii_recorder is not None:
+                    all_pixels = bytes(blended_top) + bytes(blended_bot)
+                    if viz_ffmpeg_proc:
+                        top_c = bytes(color_top) if cam_ext_rows else b""
+                        all_colors = top_c + bytes(color_bot)
+                    else:
+                        cmode = state["cam_color"]
+                        all_colors = bytearray(len(all_pixels))
+                        for i, pix in enumerate(all_pixels):
+                            all_colors[i] = _pixel_color(pix, CHARS_CAMERA, cmode,
+                                                         i % WIDTH, _cam_wlut, _cam_flut, _CAM_RTAB)
+                    try:
+                        petscii_recorder.stdin.write(
+                            _render_petscii_frame(all_pixels, all_colors, WIDTH, cam_height))
+                        petscii_recorder.stdin.flush()
+                    except Exception:
+                        pass
+
                 frame_num += 1
                 if blend_viz_mode and viz_ffmpeg_proc:
                     cam_ind = ["R","W","F"][state["cam_color"]]
@@ -1558,6 +1618,13 @@ def main():
             print("\r\n[*] Interrupted.")
         finally:
             state["quit"] = True
+            if petscii_recorder is not None:
+                try:
+                    petscii_recorder.stdin.close()
+                    petscii_recorder.wait(timeout=15)
+                    print(f"\r\n[*] PETSCII recording saved.")
+                except Exception:
+                    petscii_recorder.kill()
             if c64_audio:
                 write_byte(C64_AUDIO_FLAG, 0)
                 time.sleep(0.04)
@@ -1744,6 +1811,10 @@ def main():
             time.sleep(0.05)
         print("[*] Video zone cleared.")
 
+        petscii_recorder = None
+        if args.save_petscii:
+            petscii_recorder = start_petscii_recorder(args.save_petscii, WIDTH, cam_height)
+
         # --- Start processes ---
         procs        = []
         yt_vid_proc  = None
@@ -1913,6 +1984,23 @@ def main():
                 else:
                     write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
 
+                if petscii_recorder is not None:
+                    all_pixels = bytes(blended_top) + bytes(blended_bot)
+                    if viz_ffmpeg_proc:
+                        all_colors = bytes(color_top) + bytes(color_bot)
+                    else:
+                        cmode = state["cam_color"]
+                        all_colors = bytearray(len(all_pixels))
+                        for i, pix in enumerate(all_pixels):
+                            all_colors[i] = _pixel_color(pix, CHARS_CAMERA, cmode,
+                                                         i % WIDTH, _cam_wlut, _cam_flut, _CAM_RTAB)
+                    try:
+                        petscii_recorder.stdin.write(
+                            _render_petscii_frame(all_pixels, all_colors, WIDTH, cam_height))
+                        petscii_recorder.stdin.flush()
+                    except Exception:
+                        pass
+
                 frame_num += 1
                 if blend_viz_mode and viz_ffmpeg_proc:
                     vid_ind = ["R","W","F"][state["cam_color"]]
@@ -1928,6 +2016,13 @@ def main():
             print("\r\n[*] Interrupted.")
         finally:
             state["quit"] = True
+            if petscii_recorder is not None:
+                try:
+                    petscii_recorder.stdin.close()
+                    petscii_recorder.wait(timeout=15)
+                    print(f"\r\n[*] PETSCII recording saved.")
+                except Exception:
+                    petscii_recorder.kill()
             write_mem(0xD400, [0] * 25)
             write_byte(FRAME_FLAG, 0)
             write_mem(FRAME_BUF,    [0x20] * (WIDTH * HEIGHT))

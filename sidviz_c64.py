@@ -727,7 +727,9 @@ def start_ffmpeg_video_frames(source, height=HEIGHT):
     """Extract grayscale video frames from a file at target FPS."""
     vf = (f"fps={FPS},scale={WIDTH}:{height}:flags=lanczos,"
           f"eq=contrast=1.3,format=gray")
-    cmd = ["ffmpeg", "-loglevel", "quiet", "-i", source,
+    # -re: pace output to real-time so the pipe doesn't overflow and ffmpeg
+    # doesn't race through the whole file before the main loop can consume frames.
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-re", "-i", source,
            "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     print(f"[*] ffmpeg video frames started: {os.path.basename(source)}")
@@ -741,7 +743,9 @@ def start_yt_video_frames(url, height=HEIGHT):
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     vf = (f"fps={FPS},scale={WIDTH}:{height}:flags=lanczos,"
           f"eq=contrast=1.3,format=gray")
-    cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
+    # -re: read input at native speed — yt-dlp delivers compressed video faster
+    # than real-time; without it ffmpeg races through all frames at once.
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-re", "-i", "pipe:0",
            "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
     p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     yt_proc.stdout.close()

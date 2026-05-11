@@ -32,7 +32,7 @@ VERSION = "1.9.1"
 BUILD   = "2026-05-11"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
-import argparse, threading, termios, tty, re, json, select as _select, struct
+import argparse, threading, termios, tty, re, json, select as _select, struct, queue
 
 # Populated in main() from --cookies-from-browser / --cookies CLI flags;
 # injected into every yt-dlp subprocess call.
@@ -57,13 +57,96 @@ TIMEOUT      = 5.0
 # C64 colors: 0=black 1=white 2=red 7=yellow 8=orange 9=brown 10=ltred 11=dkgray 12=mdgray 15=ltgray
 WHITE_CTABLE_ADDR = 0xC3A8   # 128-byte table written by Python: screen_code → C64 color
 FIRE_CTABLE_ADDR  = 0xC428   # 128-byte table written by Python: screen_code → C64 color
-PETSCII_BLOCK   = 16   # pixels per char cell in saved PETSCII video (640×368 for 40×23)
+PETSCII_BLOCK   = 16   # pixels per char cell in saved PETSCII video (640×400 for 40×25)
 C64_PALETTE_RGB = [    # standard C64 VICE palette (R, G, B)
     (  0,  0,  0), (255,255,255), (136,  0,  0), (170,255,238),
     (204, 68,204), (  0,204, 85), (  0,  0,170), (238,238,119),
     (221,136, 85), (102, 68,  0), (255,119,119), ( 51, 51, 51),
     (119,119,119), (170,255,102), (  0,136,255), (187,187,187),
 ]
+SCROLL_RATE = 6   # IRQ ticks per ticker scroll step (matches sidviz.asm)
+
+# ---------------------------------------------------------------------------
+# C64 character ROM — load from VICE install if present, else use fallback.
+# Each char is 8 bytes: MSB = leftmost pixel, rows top→bottom.
+# ---------------------------------------------------------------------------
+
+def _load_c64_chargen():
+    for p in [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "chargen"),
+        os.path.expanduser("~/Library/Application Support/VICE/C64/chargen"),
+        "/opt/homebrew/share/vice/C64/chargen",
+        "/usr/local/share/vice/C64/chargen",
+        "/usr/share/vice/C64/chargen",
+        "/usr/lib/vice/C64/chargen",
+    ]:
+        try:
+            d = open(p, "rb").read()
+            if len(d) >= 2048:
+                print(f"[*] C64 chargen ROM loaded: {p}")
+                return d[:2048]
+        except OSError:
+            pass
+    return None
+
+_C64_CHARGEN = _load_c64_chargen()
+
+# Hardcoded 8×8 bitmaps for chars used by sidviz (CHARS_CAMERA + ticker A-Z/0-9).
+# Used when VICE chargen ROM is not installed.
+_C64_CHAR_FALLBACK: dict = {
+    32: b'\x00\x00\x00\x00\x00\x00\x00\x00',  # space
+    35: b'\x66\x66\xff\x66\xff\x66\x66\x00',  # #
+    37: b'\x62\x66\x0c\x18\x30\x66\x46\x00',  # %
+    42: b'\x00\x66\x3c\xff\x3c\x66\x00\x00',  # *
+    43: b'\x00\x18\x18\x7e\x18\x18\x00\x00',  # +
+    44: b'\x00\x00\x00\x00\x00\x18\x18\x30',  # ,
+    45: b'\x00\x00\x00\x7e\x00\x00\x00\x00',  # -
+    46: b'\x00\x00\x00\x00\x00\x00\x18\x00',  # .
+    47: b'\x02\x06\x0c\x18\x30\x60\x40\x00',  # /
+    58: b'\x00\x18\x18\x00\x18\x18\x00\x00',  # :
+    61: b'\x00\x00\x7e\x00\x7e\x00\x00\x00',  # =
+    63: b'\x3c\x66\x06\x1c\x18\x00\x18\x00',  # ?
+    64: b'\xff\xff\xff\xff\xff\xff\xff\xff',   # screen code 64 (dense graphic block)
+    # A-Z (screen codes 1-26)
+     1: b'\x3c\x66\x66\x7e\x66\x66\x66\x00',  # A
+     2: b'\x7c\x66\x66\x7c\x66\x66\x7c\x00',  # B
+     3: b'\x3c\x66\x60\x60\x60\x66\x3c\x00',  # C
+     4: b'\x78\x6c\x66\x66\x66\x6c\x78\x00',  # D
+     5: b'\x7e\x60\x60\x7c\x60\x60\x7e\x00',  # E
+     6: b'\x7e\x60\x60\x7c\x60\x60\x60\x00',  # F
+     7: b'\x3c\x66\x60\x6e\x66\x66\x3c\x00',  # G
+     8: b'\x66\x66\x66\x7e\x66\x66\x66\x00',  # H
+     9: b'\x3c\x18\x18\x18\x18\x18\x3c\x00',  # I
+    10: b'\x1e\x0c\x0c\x0c\x0c\x6c\x38\x00',  # J
+    11: b'\x66\x6c\x78\x70\x78\x6c\x66\x00',  # K
+    12: b'\x60\x60\x60\x60\x60\x60\x7e\x00',  # L
+    13: b'\x63\x77\x7f\x6b\x63\x63\x63\x00',  # M
+    14: b'\x66\x76\x7e\x6e\x66\x66\x66\x00',  # N
+    15: b'\x3c\x66\x66\x66\x66\x66\x3c\x00',  # O
+    16: b'\x7c\x66\x66\x7c\x60\x60\x60\x00',  # P
+    17: b'\x3c\x66\x66\x66\x6e\x3c\x0e\x00',  # Q
+    18: b'\x7c\x66\x66\x7c\x6c\x66\x66\x00',  # R
+    19: b'\x3c\x66\x60\x3c\x06\x66\x3c\x00',  # S
+    20: b'\x7e\x18\x18\x18\x18\x18\x18\x00',  # T
+    21: b'\x66\x66\x66\x66\x66\x66\x3c\x00',  # U
+    22: b'\x66\x66\x66\x66\x66\x3c\x18\x00',  # V
+    23: b'\x63\x63\x63\x6b\x7f\x77\x63\x00',  # W
+    24: b'\x66\x66\x3c\x18\x3c\x66\x66\x00',  # X
+    25: b'\x66\x66\x66\x3c\x18\x18\x18\x00',  # Y
+    26: b'\x7e\x06\x0c\x18\x30\x60\x7e\x00',  # Z
+    # 0-9 (screen codes 48-57)
+    48: b'\x3c\x66\x6e\x76\x66\x66\x3c\x00',  # 0
+    49: b'\x18\x38\x18\x18\x18\x18\x3c\x00',  # 1
+    50: b'\x3c\x66\x06\x0c\x18\x30\x7e\x00',  # 2
+    51: b'\x3c\x66\x06\x1c\x06\x66\x3c\x00',  # 3
+    52: b'\x0c\x1c\x3c\x6c\x7e\x0c\x0c\x00',  # 4
+    53: b'\x7e\x60\x7c\x06\x06\x66\x3c\x00',  # 5
+    54: b'\x3c\x60\x60\x7c\x66\x66\x3c\x00',  # 6
+    55: b'\x7e\x06\x0c\x18\x18\x18\x18\x00',  # 7
+    56: b'\x3c\x66\x66\x3c\x66\x66\x3c\x00',  # 8
+    57: b'\x3c\x66\x66\x3e\x06\x06\x3c\x00',  # 9
+}
+_char_cell_cache: dict = {}
 
 #                             code       white       fire
 CHARS_DEF = [               # showwaves  (least → most dense)
@@ -961,45 +1044,83 @@ def _pixel_color(pixel, chars, color_mode, col_x, white_lut, fire_lut, rainbow_t
         return white_lut.get(char_code, 1)
     return fire_lut.get(char_code, 8)
 
-def start_petscii_recorder(filepath, num_cols, num_rows, block=PETSCII_BLOCK, audio_source=None):
-    """Start an ffmpeg subprocess that accepts raw RGB24 frames and writes MP4."""
+def start_petscii_recorder(filepath, num_cols, num_rows, block=PETSCII_BLOCK,
+                           audio_source=None, audio_fd=None):
+    """Start ffmpeg PETSCII video recorder (all 25 C64 rows = 640×400).
+    audio_source: local file path.  audio_fd: open fd from a yt-dlp pipe."""
     w, h = num_cols * block, num_rows * block
     cmd = ["ffmpeg", "-y",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(FPS),
            "-i", "pipe:0"]
+    pass_fds = ()
     if audio_source:
         cmd += ["-i", audio_source]
+    elif audio_fd is not None:
+        cmd += ["-i", f"/dev/fd/{audio_fd}"]
+        pass_fds = (audio_fd,)
+    has_audio = bool(audio_source) or (audio_fd is not None)
     cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-crf", "23", "-preset", "fast", "-tune", "animation",
             "-r", str(FPS)]
-    if audio_source:
+    if has_audio:
         cmd += ["-c:a", "aac", "-shortest", "-map", "0:v", "-map", "1:a"]
     cmd += [filepath]
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    audio_tag = f" + audio from {os.path.basename(audio_source)}" if audio_source else ""
-    print(f"[*] PETSCII recorder: {filepath} ({w}x{h} @ {FPS}fps){audio_tag}")
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         pass_fds=pass_fds)
+    atag = (f" + audio: {os.path.basename(audio_source)}" if audio_source
+            else " + audio: stream" if audio_fd is not None else "")
+    print(f"[*] PETSCII recorder: {filepath} ({w}x{h} @ {FPS}fps){atag}")
     return p
 
-def _render_petscii_frame(pixels, colors, num_cols, num_rows, block=PETSCII_BLOCK):
-    """Render a PETSCII frame as raw RGB24 bytes.
-    Each cell is a vertical bar: bottom `fill` rows in full C64 color, rest black.
-    Matches the C64's binary foreground/background rendering — no brightness scaling."""
+def _cached_char_cell(screen_code, fg_color, block=PETSCII_BLOCK):
+    """Render one C64 character cell as block×block RGB bytes; result is cached."""
+    key = (screen_code, fg_color & 0x0F)
+    cached = _char_cell_cache.get(key)
+    if cached is not None:
+        return cached
+    if _C64_CHARGEN is not None:
+        bm = _C64_CHARGEN[screen_code * 8 : screen_code * 8 + 8]
+    else:
+        bm = _C64_CHAR_FALLBACK.get(screen_code, b'\x00' * 8)
+    r, g, b = C64_PALETTE_RGB[fg_color & 0x0F]
+    fg = bytes([r, g, b])
+    bg = b'\x00\x00\x00'
+    scale = block // 8   # 2× for block=16
+    cell = bytearray(block * block * 3)
+    for row8 in range(8):
+        byte = bm[row8] if row8 < len(bm) else 0
+        for col8 in range(8):
+            pix = fg if (byte >> (7 - col8)) & 1 else bg
+            for dr in range(scale):
+                for dc in range(scale):
+                    off = ((row8 * scale + dr) * block + col8 * scale + dc) * 3
+                    cell[off:off + 3] = pix
+    result = bytes(cell)
+    _char_cell_cache[key] = result
+    return result
+
+def _render_petscii_frame(screen_codes, colors, num_cols, num_rows, block=PETSCII_BLOCK):
+    """Render a full PETSCII frame as raw RGB24 bytes using cached C64 char bitmaps.
+    screen_codes: PETSCII screen code per cell; colors: C64 color index per cell."""
     w = num_cols * block
-    buf = bytearray(w * num_rows * block * 3)  # zero = black
+    buf = bytearray(w * num_rows * block * 3)
     for row in range(num_rows):
         for col in range(num_cols):
             idx = row * num_cols + col
-            fill = pixels[idx] * block // 255  # rows to fill from bottom (0–block)
-            if fill == 0:
-                continue
-            r, g, b = C64_PALETTE_RGB[colors[idx] & 0x0F]
-            color_row = bytes([r, g, b]) * block
-            fill_start = block - fill
-            for br in range(fill_start, block):
+            cell = _cached_char_cell(screen_codes[idx], colors[idx], block)
+            for br in range(block):
                 base = ((row * block + br) * w + col * block) * 3
-                buf[base:base + block * 3] = color_row
+                buf[base:base + block * 3] = cell[br * block * 3 : (br + 1) * block * 3]
     return bytes(buf)
+
+def _screen_code_color(screen_code, color_mode, col_x, white_lut, fire_lut, rainbow_tab):
+    """Map a screen code to a C64 color index for the recorder (mirrors C64 ASM logic)."""
+    if color_mode == 0:
+        return rainbow_tab[col_x]
+    if color_mode == 1:
+        return white_lut.get(screen_code, 1)
+    return fire_lut.get(screen_code, 8)
 
 def _apply_freq_gradient(raw, color_mode, height=HEIGHT):
     """Apply a per-mode vertical gradient to showfreqs frames so density/fire
@@ -1382,12 +1503,42 @@ def main():
                 time.sleep(0.05)
         print("[*] Camera zone cleared.")
 
-        petscii_recorder = None
+        petscii_recorder  = None
+        petscii_queue     = None
+        petscii_thread    = None
+        yt_petscii_audio  = None
+        _prec_ticker_petscii = None
+        _prec_ticker_t0   = None
         if args.save_petscii:
-            _prec_audio = (filepath if audio_mode == "audio" and filepath and not is_url(filepath)
-                           else None)
-            petscii_recorder = start_petscii_recorder(args.save_petscii, WIDTH, cam_height,
-                                                      audio_source=_prec_audio)
+            _prec_ticker_petscii = bytes(ascii_to_petscii(ticker_str))[:253] or b'\x20'
+            _prec_ticker_t0 = time.time()
+            _prec_audio_src, _prec_audio_fd = None, None
+            if audio_mode == "audio" and filepath and not is_url(filepath):
+                _prec_audio_src = filepath
+            elif audio_mode == "stream":
+                yt_petscii_audio = subprocess.Popen(
+                    ["yt-dlp", "-f", "bestaudio/best", "-o", "-", "-q", "--no-playlist"]
+                    + _YTDLP_COOKIE_ARGS + [stream_url],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                _prec_audio_fd = yt_petscii_audio.stdout.fileno()
+            petscii_recorder = start_petscii_recorder(
+                args.save_petscii, WIDTH, 25,  # 25 rows = full C64 screen (640×400)
+                audio_source=_prec_audio_src, audio_fd=_prec_audio_fd)
+            if yt_petscii_audio is not None:
+                yt_petscii_audio.stdout.close()
+            petscii_queue = queue.Queue(maxsize=2)
+            def _petscii_worker():
+                while True:
+                    item = petscii_queue.get()
+                    if item is None:
+                        break
+                    sc, col = item
+                    try:
+                        petscii_recorder.stdin.write(_render_petscii_frame(sc, col, WIDTH, 25))
+                    except Exception:
+                        pass
+            petscii_thread = threading.Thread(target=_petscii_worker, daemon=True)
+            petscii_thread.start()
 
         # Background thread keeps the latest viz frame for blending (17-row)
         last_viz_frame = bytearray(viz_frame_size)
@@ -1598,22 +1749,31 @@ def main():
                 if viz_ffmpeg_proc:
                     write_mem(WAVE_COL_ADDR, color_bot)
 
-                if petscii_recorder is not None:
-                    all_pixels = bytes(blended_top) + bytes(blended_bot)
+                if petscii_queue is not None:
+                    # Rows 2-7 screen codes (already computed for C64 write above)
+                    sc_top = top_screen if cam_ext_rows else bytes([0x20] * 6 * WIDTH)
+                    sc_bot = bot_screen
                     if viz_ffmpeg_proc:
-                        top_c = bytes(color_top) if cam_ext_rows else b""
-                        all_colors = top_c + bytes(color_bot)
+                        col_top = bytes(color_top) if cam_ext_rows else bytes([0] * 6 * WIDTH)
+                        col_bot = bytes(color_bot)
                     else:
                         cmode = state["cam_color"]
-                        all_colors = bytearray(len(all_pixels))
-                        for i, pix in enumerate(all_pixels):
-                            all_colors[i] = _pixel_color(pix, CHARS_CAMERA, cmode,
-                                                         i % WIDTH, _cam_wlut, _cam_flut, _CAM_RTAB)
+                        col_top = bytes(_screen_code_color(sc_top[i], cmode, i % WIDTH,
+                                        _cam_wlut, _cam_flut, _CAM_RTAB) for i in range(len(sc_top)))
+                        col_bot = bytes(_screen_code_color(sc_bot[i], cmode, i % WIDTH,
+                                        _cam_wlut, _cam_flut, _CAM_RTAB) for i in range(len(sc_bot)))
+                    # Ticker simulation: advance at 50Hz / SCROLL_RATE chars per second
+                    _tlen = len(_prec_ticker_petscii)
+                    _tpos = int((time.time() - _prec_ticker_t0) * 50.0 / SCROLL_RATE) % _tlen
+                    ticker_sc  = bytes(_prec_ticker_petscii[(_tpos + i) % _tlen] for i in range(WIDTH))
+                    ticker_col = bytes([13] * WIDTH)   # light green
+                    # Assemble all 25 rows: row0 (black) + row1 (ticker) + rows2-7 + rows8-24
+                    all_sc  = bytes([0x20] * WIDTH) + ticker_sc  + sc_top  + sc_bot
+                    all_col = bytes([0]    * WIDTH) + ticker_col + col_top + col_bot
                     try:
-                        petscii_recorder.stdin.write(
-                            _render_petscii_frame(all_pixels, all_colors, WIDTH, cam_height))
-                    except Exception:
-                        pass
+                        petscii_queue.put_nowait((all_sc, all_col))
+                    except queue.Full:
+                        pass   # drop frame if renderer is behind; main loop must not block
 
                 frame_num += 1
                 if blend_viz_mode and viz_ffmpeg_proc:
@@ -1631,13 +1791,21 @@ def main():
             print("\r\n[*] Interrupted.")
         finally:
             state["quit"] = True
+            if petscii_queue is not None:
+                petscii_queue.put(None)
+                if petscii_thread is not None:
+                    petscii_thread.join(timeout=60)
             if petscii_recorder is not None:
                 try:
                     petscii_recorder.stdin.close()
-                    petscii_recorder.wait(timeout=15)
-                    print(f"\r\n[*] PETSCII recording saved.")
+                    petscii_recorder.wait(timeout=20)
+                    print("\r\n[*] PETSCII recording saved.")
                 except Exception:
-                    petscii_recorder.kill()
+                    try: petscii_recorder.kill()
+                    except Exception: pass
+            if yt_petscii_audio is not None:
+                try: yt_petscii_audio.terminate(); yt_petscii_audio.wait(timeout=3)
+                except Exception: pass
             if c64_audio:
                 write_byte(C64_AUDIO_FLAG, 0)
                 time.sleep(0.04)
@@ -1824,11 +1992,42 @@ def main():
             time.sleep(0.05)
         print("[*] Video zone cleared.")
 
-        petscii_recorder = None
+        petscii_recorder  = None
+        petscii_queue     = None
+        petscii_thread    = None
+        yt_petscii_audio  = None
+        _prec_ticker_petscii = None
+        _prec_ticker_t0   = None
         if args.save_petscii:
-            _prec_audio = (filepath if not is_url(filepath) else None)
-            petscii_recorder = start_petscii_recorder(args.save_petscii, WIDTH, cam_height,
-                                                      audio_source=_prec_audio)
+            _prec_ticker_petscii = bytes(ascii_to_petscii(ticker_str))[:253] or b'\x20'
+            _prec_ticker_t0 = time.time()
+            _prec_audio_src, _prec_audio_fd = None, None
+            if not is_url(filepath):
+                _prec_audio_src = filepath
+            else:
+                yt_petscii_audio = subprocess.Popen(
+                    ["yt-dlp", "-f", "bestaudio/best", "-o", "-", "-q", "--no-playlist"]
+                    + _YTDLP_COOKIE_ARGS + [stream_url],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                _prec_audio_fd = yt_petscii_audio.stdout.fileno()
+            petscii_recorder = start_petscii_recorder(
+                args.save_petscii, WIDTH, 25,
+                audio_source=_prec_audio_src, audio_fd=_prec_audio_fd)
+            if yt_petscii_audio is not None:
+                yt_petscii_audio.stdout.close()
+            petscii_queue = queue.Queue(maxsize=2)
+            def _petscii_worker():
+                while True:
+                    item = petscii_queue.get()
+                    if item is None:
+                        break
+                    sc, col = item
+                    try:
+                        petscii_recorder.stdin.write(_render_petscii_frame(sc, col, WIDTH, 25))
+                    except Exception:
+                        pass
+            petscii_thread = threading.Thread(target=_petscii_worker, daemon=True)
+            petscii_thread.start()
 
         # --- Start processes ---
         procs        = []
@@ -1999,20 +2198,27 @@ def main():
                 else:
                     write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
 
-                if petscii_recorder is not None:
-                    all_pixels = bytes(blended_top) + bytes(blended_bot)
+                if petscii_queue is not None:
+                    sc_top = top_screen
+                    sc_bot = bot_screen
                     if viz_ffmpeg_proc:
-                        all_colors = bytes(color_top) + bytes(color_bot)
+                        col_top = bytes(color_top)
+                        col_bot = bytes(color_bot)
                     else:
                         cmode = state["cam_color"]
-                        all_colors = bytearray(len(all_pixels))
-                        for i, pix in enumerate(all_pixels):
-                            all_colors[i] = _pixel_color(pix, CHARS_CAMERA, cmode,
-                                                         i % WIDTH, _cam_wlut, _cam_flut, _CAM_RTAB)
+                        col_top = bytes(_screen_code_color(sc_top[i], cmode, i % WIDTH,
+                                        _cam_wlut, _cam_flut, _CAM_RTAB) for i in range(len(sc_top)))
+                        col_bot = bytes(_screen_code_color(sc_bot[i], cmode, i % WIDTH,
+                                        _cam_wlut, _cam_flut, _CAM_RTAB) for i in range(len(sc_bot)))
+                    _tlen = len(_prec_ticker_petscii)
+                    _tpos = int((time.time() - _prec_ticker_t0) * 50.0 / SCROLL_RATE) % _tlen
+                    ticker_sc  = bytes(_prec_ticker_petscii[(_tpos + i) % _tlen] for i in range(WIDTH))
+                    ticker_col = bytes([13] * WIDTH)
+                    all_sc  = bytes([0x20] * WIDTH) + ticker_sc  + sc_top  + sc_bot
+                    all_col = bytes([0]    * WIDTH) + ticker_col + col_top + col_bot
                     try:
-                        petscii_recorder.stdin.write(
-                            _render_petscii_frame(all_pixels, all_colors, WIDTH, cam_height))
-                    except Exception:
+                        petscii_queue.put_nowait((all_sc, all_col))
+                    except queue.Full:
                         pass
 
                 frame_num += 1
@@ -2030,13 +2236,21 @@ def main():
             print("\r\n[*] Interrupted.")
         finally:
             state["quit"] = True
+            if petscii_queue is not None:
+                petscii_queue.put(None)
+                if petscii_thread is not None:
+                    petscii_thread.join(timeout=60)
             if petscii_recorder is not None:
                 try:
                     petscii_recorder.stdin.close()
-                    petscii_recorder.wait(timeout=15)
-                    print(f"\r\n[*] PETSCII recording saved.")
+                    petscii_recorder.wait(timeout=20)
+                    print("\r\n[*] PETSCII recording saved.")
                 except Exception:
-                    petscii_recorder.kill()
+                    try: petscii_recorder.kill()
+                    except Exception: pass
+            if yt_petscii_audio is not None:
+                try: yt_petscii_audio.terminate(); yt_petscii_audio.wait(timeout=3)
+                except Exception: pass
             write_mem(0xD400, [0] * 25)
             write_byte(FRAME_FLAG, 0)
             write_mem(FRAME_BUF,    [0x20] * (WIDTH * HEIGHT))

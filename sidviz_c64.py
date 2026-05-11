@@ -450,7 +450,10 @@ def start_ffmpeg_waveform_stream(url, height=HEIGHT):
         ["yt-dlp", "-f", "bestaudio", "-o", "-", "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [url],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
-    cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
+    # -re: read at 1x speed — yt-dlp delivers compressed audio faster than
+    # real-time; without -re ffmpeg races through the whole stream in seconds,
+    # generating all waveform frames at once before the song even starts.
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-re", "-i", "pipe:0",
            "-filter_complex", _build_viz_filter(height),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1131,7 +1134,7 @@ def main():
                 if blend_viz_mode:
                     make_fifo(FIFO_PATH)
                     VIZ_MODE = blend_viz_mode
-                    viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(realtime=True)
+                    viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(realtime=True, height=cam_height)
                     VIZ_MODE = "camera"
                     upload_sid_to_c64(psid)
                     sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
@@ -1142,7 +1145,7 @@ def main():
                 if blend_viz_mode:
                     make_fifo(FIFO_PATH)
                     VIZ_MODE = blend_viz_mode
-                    viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(realtime=True)
+                    viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(realtime=True, height=cam_height)
                     VIZ_MODE = "camera"
                     time.sleep(0.3)
                     sid_fifo_proc  = start_sidplayfp_fifo(filepath, sid_duration_secs)
@@ -1156,7 +1159,7 @@ def main():
             ffplay_proc = start_ffplay_audio(filepath)
             if blend_viz_mode:
                 VIZ_MODE = blend_viz_mode
-                viz_ffmpeg_proc = start_ffmpeg_waveform_file(filepath)
+                viz_ffmpeg_proc = start_ffmpeg_waveform_file(filepath, height=cam_height)
                 VIZ_MODE = "camera"
                 procs = [ffplay_proc, viz_ffmpeg_proc]
             else:
@@ -1166,7 +1169,7 @@ def main():
             yt_audio_proc, ffplay_proc = start_ffplay_stream(stream_url)
             if blend_viz_mode:
                 VIZ_MODE = blend_viz_mode
-                yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(stream_url)
+                yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(stream_url, height=cam_height)
                 VIZ_MODE = "camera"
                 procs = [yt_audio_proc, ffplay_proc, yt_viz_proc, viz_ffmpeg_proc]
             else:
@@ -1190,8 +1193,8 @@ def main():
         # copies a driver to $0400 may corrupt display but that is rare.
         cam_ext_rows = 6
         cam_height    = HEIGHT + cam_ext_rows                   # 17 or 23
-        cam_frame_size = WIDTH * cam_height                     # 680 or 920
-        viz_frame_size = WIDTH * HEIGHT                         # always 680
+        cam_frame_size = WIDTH * cam_height                     # 920
+        viz_frame_size = WIDTH * cam_height                     # 920 — matches camera so blend covers all 23 rows
         _cam_ext_scr  = 0x0400 + 2 * WIDTH                     # $0450 (row 2)
         _cam_ext_col  = 0xD800 + 2 * WIDTH                     # $D850 (row 2 color RAM)
         _CAM_RTAB     = [2,2,8,8,7,7,7,7,5,5,5,5,13,13,14,14,
@@ -1374,20 +1377,25 @@ def main():
                     top_raw = b""
                     bot_raw = raw
 
-                # Bottom rows (8-24): blend with viz, write via frame buffer path
+                # Blend viz (all 23 rows) with camera then split for writing paths.
                 if viz_ffmpeg_proc:
                     with viz_lock:
-                        blended = bytes(max(c, v) for c, v in zip(bot_raw, last_viz_frame))
+                        vz_top = last_viz_frame[:cam_ext_rows * WIDTH]
+                        vz_bot = last_viz_frame[cam_ext_rows * WIDTH:]
+                    blended_top = bytes(max(c, v) for c, v in zip(top_raw, vz_top)) if top_raw else b""
+                    blended_bot = bytes(max(c, v) for c, v in zip(bot_raw, vz_bot))
                 else:
-                    blended = bot_raw
+                    blended_top = top_raw
+                    blended_bot = bot_raw
 
-                bot_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended)
+                # Bottom rows (8-24): write via frame buffer path
+                bot_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended_bot)
                 write_mem(FRAME_BUF, bot_screen)
                 write_byte(FRAME_FLAG, 1)
 
                 # Top rows (2-7): write screen RAM and color RAM every frame.
-                if top_raw:
-                    top_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in top_raw)
+                if blended_top:
+                    top_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended_top)
                     write_mem(_cam_ext_scr, top_screen)
                     write_mem(_cam_ext_col, _top_colors(state["color_mode"]))
 
@@ -1411,7 +1419,7 @@ def main():
             else:
                 write_mem(0xD400, [0] * 25)
                 write_byte(FRAME_FLAG, 0)
-                write_mem(FRAME_BUF, [0x20] * viz_frame_size)
+                write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))  # FRAME_BUF = rows 8-24 only
                 if cam_ext_rows:
                     write_mem(_cam_ext_scr, [0x20] * (cam_ext_rows * WIDTH))
                     write_mem(_cam_ext_col, [0x00] * (cam_ext_rows * WIDTH))

@@ -961,33 +961,44 @@ def _pixel_color(pixel, chars, color_mode, col_x, white_lut, fire_lut, rainbow_t
         return white_lut.get(char_code, 1)
     return fire_lut.get(char_code, 8)
 
-def start_petscii_recorder(filepath, num_cols, num_rows, block=PETSCII_BLOCK):
+def start_petscii_recorder(filepath, num_cols, num_rows, block=PETSCII_BLOCK, audio_source=None):
     """Start an ffmpeg subprocess that accepts raw RGB24 frames and writes MP4."""
     w, h = num_cols * block, num_rows * block
     cmd = ["ffmpeg", "-y",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(FPS),
-           "-i", "pipe:0",
-           "-c:v", "libx264", "-pix_fmt", "yuv420p", filepath]
+           "-i", "pipe:0"]
+    if audio_source:
+        cmd += ["-i", audio_source]
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-crf", "23", "-preset", "fast", "-tune", "animation",
+            "-r", str(FPS)]
+    if audio_source:
+        cmd += ["-c:a", "aac", "-shortest", "-map", "0:v", "-map", "1:a"]
+    cmd += [filepath]
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"[*] PETSCII recorder: {filepath} ({w}x{h} @ {FPS}fps)")
+    audio_tag = f" + audio from {os.path.basename(audio_source)}" if audio_source else ""
+    print(f"[*] PETSCII recorder: {filepath} ({w}x{h} @ {FPS}fps){audio_tag}")
     return p
 
 def _render_petscii_frame(pixels, colors, num_cols, num_rows, block=PETSCII_BLOCK):
     """Render a PETSCII frame as raw RGB24 bytes.
-    pixels: grayscale byte sequence (num_cols*num_rows); colors: C64 color indices."""
+    Each cell is a vertical bar: bottom `fill` rows in full C64 color, rest black.
+    Matches the C64's binary foreground/background rendering — no brightness scaling."""
     w = num_cols * block
-    buf = bytearray(w * num_rows * block * 3)
+    buf = bytearray(w * num_rows * block * 3)  # zero = black
     for row in range(num_rows):
         for col in range(num_cols):
             idx = row * num_cols + col
+            fill = pixels[idx] * block // 255  # rows to fill from bottom (0–block)
+            if fill == 0:
+                continue
             r, g, b = C64_PALETTE_RGB[colors[idx] & 0x0F]
-            scale = pixels[idx] / 255.0
-            pr, pg, pb = int(r * scale), int(g * scale), int(b * scale)
-            cell_rgb = bytes([pr, pg, pb]) * block
-            for br in range(block):
+            color_row = bytes([r, g, b]) * block
+            fill_start = block - fill
+            for br in range(fill_start, block):
                 base = ((row * block + br) * w + col * block) * 3
-                buf[base:base + block * 3] = cell_rgb
+                buf[base:base + block * 3] = color_row
     return bytes(buf)
 
 def _apply_freq_gradient(raw, color_mode, height=HEIGHT):
@@ -1373,7 +1384,10 @@ def main():
 
         petscii_recorder = None
         if args.save_petscii:
-            petscii_recorder = start_petscii_recorder(args.save_petscii, WIDTH, cam_height)
+            _prec_audio = (filepath if audio_mode == "audio" and filepath and not is_url(filepath)
+                           else None)
+            petscii_recorder = start_petscii_recorder(args.save_petscii, WIDTH, cam_height,
+                                                      audio_source=_prec_audio)
 
         # Background thread keeps the latest viz frame for blending (17-row)
         last_viz_frame = bytearray(viz_frame_size)
@@ -1598,7 +1612,6 @@ def main():
                     try:
                         petscii_recorder.stdin.write(
                             _render_petscii_frame(all_pixels, all_colors, WIDTH, cam_height))
-                        petscii_recorder.stdin.flush()
                     except Exception:
                         pass
 
@@ -1813,7 +1826,9 @@ def main():
 
         petscii_recorder = None
         if args.save_petscii:
-            petscii_recorder = start_petscii_recorder(args.save_petscii, WIDTH, cam_height)
+            _prec_audio = (filepath if not is_url(filepath) else None)
+            petscii_recorder = start_petscii_recorder(args.save_petscii, WIDTH, cam_height,
+                                                      audio_source=_prec_audio)
 
         # --- Start processes ---
         procs        = []
@@ -1997,7 +2012,6 @@ def main():
                     try:
                         petscii_recorder.stdin.write(
                             _render_petscii_frame(all_pixels, all_colors, WIDTH, cam_height))
-                        petscii_recorder.stdin.flush()
                     except Exception:
                         pass
 

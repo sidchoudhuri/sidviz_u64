@@ -950,10 +950,14 @@ def main():
                 print("[*] Search cancelled."); sys.exit(0)
             filepath = chosen
             print(f"[*] Selected: {filepath}")
+            # Save candidate metadata — fallback if get_stream_info is blocked by YouTube
+            _yt_chosen = next((c for c in candidates if c["url"] == chosen), None)
         elif args.file:
             filepath = os.path.expanduser(args.file)
+            _yt_chosen = None
         else:
             filepath = None
+            _yt_chosen = None
         if filepath and not is_url(filepath) and not os.path.isfile(filepath):
             print(f"[!] File not found: {filepath}"); sys.exit(1)
 
@@ -1022,7 +1026,17 @@ def main():
             elif audio_mode == "stream":
                 info = get_stream_info(filepath)
                 if info is None:
-                    print("[!] Failed to fetch stream metadata"); sys.exit(1)
+                    if get_service(filepath) == "spotify":
+                        print("[!] Failed to fetch stream metadata"); sys.exit(1)
+                    # YouTube: metadata is display-only; stream URL is enough to proceed.
+                    # Fall back to yt-search candidate data if available.
+                    if _yt_chosen:
+                        info = {"Title":  _yt_chosen.get("title", ""),
+                                "Artist": _yt_chosen.get("uploader", "")}
+                        print("[!] yt-dlp full extraction blocked — using search result metadata.")
+                    else:
+                        info = {}
+                        print("[!] Metadata unavailable — continuing without track info.")
                 if get_service(filepath) == "spotify":
                     stream_url = resolve_stream_url(filepath, info)
                     if not stream_url:
@@ -1415,8 +1429,11 @@ def main():
     elif mode == "stream":
         info = get_stream_info(filepath)
         if info is None:
-            print("[!] Failed to fetch stream metadata — is yt-dlp installed and the URL valid?")
-            sys.exit(1)
+            if get_service(filepath) == "spotify":
+                print("[!] Failed to fetch stream metadata — is yt-dlp installed and the URL valid?")
+                sys.exit(1)
+            info = {}
+            print("[!] Metadata unavailable — continuing without track info.")
     else:
         info = get_audio_info(filepath)
     display_mode = "sid" if mode == "sid" else "audio"

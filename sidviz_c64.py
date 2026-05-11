@@ -744,6 +744,30 @@ def start_sidplayfp_audio(filepath, duration_secs=None):
 # PSID parser and C64 audio uploader (EXP)
 # ---------------------------------------------------------------------------
 
+def _psid_row_overlap(filepath):
+    """Return a warning string if the PSID binary overlaps screen RAM rows 2-7 ($0450-$053F), else None."""
+    try:
+        with open(filepath, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    if raw[0:4] not in (b"PSID", b"RSID"):
+        return None
+    data_offset = struct.unpack_from(">H", raw, 6)[0]
+    load_addr   = struct.unpack_from(">H", raw, 8)[0]
+    sid_data    = raw[data_offset:]
+    if load_addr == 0:
+        if len(sid_data) < 2:
+            return None
+        load_addr = struct.unpack_from("<H", sid_data, 0)[0]
+        sid_data  = sid_data[2:]
+    end_addr = load_addr + len(sid_data) - 1
+    # Screen RAM rows 2-7 = $0450-$053F
+    if load_addr <= 0x053F and end_addr >= 0x0450:
+        return (f"${load_addr:04X}–${end_addr:04X} overlaps screen RAM rows 2–7 ($0450–$053F)")
+    return None
+
+
 def parse_psid(filepath):
     """Parse PSID/RSID header, return dict with load/init/play addresses and data."""
     with open(filepath, "rb") as f:
@@ -1048,6 +1072,17 @@ def main():
             print(f"[!] {PRG_REMOTE} not found at {PRG_LOCAL}")
             print(f"    Build: 64tass -a -B -o sidviz.prg sidviz.asm")
             sys.exit(1)
+
+        if filepath and audio_mode == "sid":
+            _ow = _psid_row_overlap(filepath)
+            if _ow:
+                print(f"\n[!] WARNING: SID binary {_ow}.")
+                print("[!] The visualizer will still write rows 2-7, but those rows may show")
+                print("[!] SID driver bytes rendered as PETSCII artifacts.")
+                ans = input("Continue anyway? [y/N]: ").strip().lower()
+                if ans != "y":
+                    print("[*] Aborted.")
+                    sys.exit(0)
 
         if not smoke_test(): sys.exit(1)
 
@@ -1503,6 +1538,17 @@ def main():
         print(f"    Build: 64tass -a -B -o sidviz.prg sidviz.asm")
         sys.exit(1)
     print(f"[*] {PRG_REMOTE}: {os.path.getsize(PRG_LOCAL)} bytes")
+
+    if mode == "sid":
+        _ow = _psid_row_overlap(filepath)
+        if _ow:
+            print(f"\n[!] WARNING: SID binary {_ow}.")
+            print("[!] The visualizer will still write rows 2-7, but those rows may show")
+            print("[!] SID driver bytes rendered as PETSCII artifacts.")
+            ans = input("Continue anyway? [y/N]: ").strip().lower()
+            if ans != "y":
+                print("[*] Aborted.")
+                sys.exit(0)
 
     if not smoke_test(): sys.exit(1)
 

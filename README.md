@@ -295,6 +295,42 @@ python3 sidviz_u64.py 'https://soundcloud.com/artist/track' --save output.mp3
 A third `yt-dlp` process downloads and converts the stream to MP3 in parallel with playback. Works for YouTube and SoundCloud. For Spotify, the saved file comes from the YouTube match.
 
 ---
+## Camera (webcam PETSCII art)
+
+```bash
+python3 sidviz_c64.py --camera
+python3 sidviz_c64.py --camera --camera-device 1
+```
+Live webcam video is captured by ffmpeg, converted to grayscale, scaled to 40×17 character cells, and mapped to PETSCII block characters — then streamed to the C64 at up to 10 fps. The ticker, color cycling, and all audio modes work normally alongside the camera feed.
+
+Without C64 hardware audio, the camera expands to rows 2–24 (22 rows). With C64 audio, it is restricted to rows 8–24 (17 rows) to avoid overwriting SID driver code.
+
+With audio:
+```bash
+# Webcam + local SID audio
+python3 sidviz_c64.py tune.sid --camera
+
+# Webcam + YouTube audio (no waveform overlay)
+python3 sidviz_c64.py 'https://youtu.be/...' --camera
+
+# Webcam + YouTube search
+python3 sidviz_c64.py --yt-search "artist title" --camera
+
+# Webcam + audio waveform blended into the camera image
+python3 sidviz_c64.py tune.mp3 --camera --blend-viz showwaves
+```
+Options:
+
+| Option | Description |
+|---|---|
+| --camera | Enable webcam mode |
+| --camera-device N	| Select capture device index (default: 0) |
+| --blend-viz MODE | Overlay audio waveform on camera image (same modes as --showwaves etc.) |
+| --list-cameras | List available camera devices and exit |
+
+The webcam crop is adaptive — any source aspect ratio (16:9, 4:3, square) is center-cropped to fill the 40-wide C64 character grid without stretching.
+
+---
 
 ## Color modes
 

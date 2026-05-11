@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-sidviz_u64.py -- SID/audio waveform visualizer -> C64 via U64 API
+sidviz_u64.py -- SID/audio waveform + live camera visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
+Camera mode: streams webcam footage as PETSCII character art on the C64 screen.
 
 version 1.7.8 (2026-04-25)
 
@@ -27,8 +28,8 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.7.8"
-BUILD   = "2026-04-25"
+VERSION = "1.8.0"
+BUILD   = "2026-05-11"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, termios, tty, re, json, select as _select, struct
@@ -95,11 +96,20 @@ CHARS_HIST_DEF = [          # ahistogram (least → most dense)
     (42,  15,   8),         # *          light gray  orange
     (35,   1,   2),         # #          white       red
 ]
+CHARS_CAMERA_DEF = [        # camera (least → most dense — wider range for photo-like detail)
+    (32,   0,   0),         # space      black       black
+    (46,  11,   9),         # .          dark gray   brown
+    (58,  12,  10),         # :          med gray    light red
+    (43,  15,   8),         # +          light gray  orange
+    (42,   1,   2),         # *          white       red
+    (35,   1,   2),         # #          white       red
+]
 CHARS      = [t[0] for t in CHARS_DEF]
 CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]
 CHARS_SCOPE = [t[0] for t in CHARS_SCOPE_DEF]
 CHARS_SPECTRUM = [t[0] for t in CHARS_SPECTRUM_DEF]
 CHARS_HIST = [t[0] for t in CHARS_HIST_DEF]
+CHARS_CAMERA = [t[0] for t in CHARS_CAMERA_DEF]
 SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
@@ -135,6 +145,9 @@ def parse_args():
     p.add_argument("--avectorscope",  action="store_true", help="Force vectorscope (oscilloscope) visualization")
     p.add_argument("--showspectrum",  action="store_true", help="Force scrolling spectrogram visualization")
     p.add_argument("--ahistogram",    action="store_true", help="Force amplitude histogram visualization")
+    p.add_argument("--camera",        action="store_true", help="Live camera mode: stream webcam as PETSCII art on C64")
+    p.add_argument("--camera-device", default="0",         metavar="DEV",
+                   help="Camera device: index (0,1,…) or path (/dev/video0). Default: 0")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     return p.parse_args()
 
@@ -530,6 +543,8 @@ def write_color_tables():
         defs = CHARS_SCOPE_DEF
     elif VIZ_MODE == "showspectrum":
         defs = CHARS_SPECTRUM_DEF
+    elif VIZ_MODE == "camera":
+        defs = CHARS_CAMERA_DEF
     else:
         defs = CHARS_HIST_DEF
     for code, wcol, fcol in defs:
@@ -647,6 +662,24 @@ def start_ffmpeg_waveform_file(filepath):
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     print("[*] ffmpeg waveform (file) started."); return p
+
+def start_ffmpeg_camera(device="0"):
+    """Capture live camera frames, scale to C64 screen size, output as raw gray pixels."""
+    if sys.platform == "darwin":
+        # macOS: AVFoundation — device "N:none" means video index N, no audio
+        cam = f"{device}:none"
+        input_flags = ["-f", "avfoundation", "-framerate", str(FPS), "-i", cam]
+    else:
+        # Linux: v4l2 — accept either a bare index ("0") or a full path ("/dev/video0")
+        dev = device if device.startswith("/") else f"/dev/video{device}"
+        input_flags = ["-f", "v4l2", "-framerate", str(FPS), "-i", dev]
+    cmd = (["ffmpeg", "-loglevel", "quiet"] + input_flags +
+           ["-vf", f"scale={WIDTH}:{HEIGHT}:flags=lanczos,format=gray",
+            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"])
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL)
+    print(f"[*] ffmpeg camera started (device: {device})")
+    return p
 
 def start_ffplay_audio(filepath):
     p = subprocess.Popen(
@@ -827,7 +860,7 @@ def _apply_freq_gradient(raw, color_mode):
 # ---------------------------------------------------------------------------
 
 def main():
-    global U64, FPS, VIZ_MODE, _YTDLP_COOKIE_ARGS
+    global U64, FPS, VIZ_MODE, _YTDLP_COOKIE_ARGS  # noqa: PLW0603
 
     args = parse_args()
 
@@ -840,6 +873,109 @@ def main():
         print(f"sidviz_u64  v{VERSION}  build {BUILD}")
         sys.exit(0)
 
+    # -------------------------------------------------------------------------
+    # Camera mode: bypass all file/stream logic
+    # -------------------------------------------------------------------------
+    if args.camera:
+        U64 = f"http://{args.ip}"
+        FPS = args.fps
+        VIZ_MODE = "camera"
+        camera_device = args.camera_device
+
+        if args.color:      color_mode_init = 0
+        elif args.no_color: color_mode_init = 1
+        else:
+            ans = input("Color mode? [0=rainbow, 1=white, 2=fire] (default 0): ").strip()
+            color_mode_init = int(ans) if ans in ("0","1","2") else 0
+
+        print(f"[*] Viz mode: camera  device: {camera_device}")
+
+        if not os.path.isfile(PRG_LOCAL):
+            print(f"[!] {PRG_REMOTE} not found at {PRG_LOCAL}")
+            print(f"    Build: 64tass -a -B -o sidviz.prg sidviz.asm")
+            sys.exit(1)
+
+        if not smoke_test(): sys.exit(1)
+
+        print("[*] Rebooting C64...")
+        u64_put("machine:reboot")
+        time.sleep(4.0)
+
+        print(f"[*] Uploading {PRG_REMOTE}...")
+        if not ftp_upload(PRG_LOCAL, PRG_REMOTE): sys.exit(1)
+
+        print(f"[*] Running {PRG_REMOTE}...")
+        if not run_prg_from_temp(PRG_REMOTE): sys.exit(1)
+        time.sleep(1.0)
+
+        write_color_tables()
+        print("[*] Color tables written ($C3A8/$C428).")
+
+        _cflag_map = {0: 2, 1: 1, 2: 3}
+        write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
+
+        # Ticker shows camera info
+        ticker_str = f"CAMERA LIVE   *   SIDVIZ U64 V{VERSION}   *   DEVICE {camera_device}        "
+        if len(ticker_str) > 253:
+            ticker_str = ticker_str[:253]
+        send_ticker(ticker_str)
+
+        ffmpeg_proc = start_ffmpeg_camera(camera_device)
+
+        frame_size = WIDTH * HEIGHT
+        state      = {"color_mode": color_mode_init, "color_pending": False, "quit": False}
+        kthread    = make_keypress_listener(state)
+        kthread.start()
+
+        frame_num = 0
+        print(f"[*] Camera streaming to C64 at {FPS}fps -- [c] color, [q] quit\n")
+
+        try:
+            while not state["quit"]:
+                if ffmpeg_proc.poll() is not None:
+                    print("\r\n[*] Camera stream ended."); break
+
+                if state["color_pending"]:
+                    state["color_pending"] = False
+                    write_byte(COLOR_FLAG, _cflag_map[state["color_mode"]])
+
+                ready, _, _ = _select.select([ffmpeg_proc.stdout], [], [], 0.5)
+                if not ready:
+                    continue
+
+                raw = ffmpeg_proc.stdout.read(frame_size)
+                if len(raw) < frame_size:
+                    print("\r\n[*] Camera stream ended."); break
+
+                screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in raw)
+                write_mem(FRAME_BUF, screen)
+                write_byte(FRAME_FLAG, 1)
+
+                frame_num += 1
+                ind = ["R","W","F"][state["color_mode"]]
+                print(f"\r[*] Frame {frame_num:05d} [{ind}]", end="", flush=True)
+
+        except KeyboardInterrupt:
+            print("\r\n[*] Interrupted.")
+        finally:
+            state["quit"] = True
+            write_mem(0xD400, [0] * 25)
+            write_byte(FRAME_FLAG, 0)
+            write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
+            write_mem(TICKER_ROW, [0x20] * 40)
+            try: ffmpeg_proc.terminate()
+            except: pass
+            if "_term_fd" in state and "_term_old" in state:
+                try:
+                    termios.tcsetattr(state["_term_fd"], termios.TCSADRAIN, state["_term_old"])
+                except Exception:
+                    pass
+            print("[*] Done.")
+        return
+
+    # -------------------------------------------------------------------------
+    # Normal file / stream mode
+    # -------------------------------------------------------------------------
     if args.yt_search:
         query = args.yt_search.strip()
         if not query:

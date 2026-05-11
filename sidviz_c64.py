@@ -676,7 +676,11 @@ def start_ffmpeg_waveform_fifo(realtime=False):
     print("[*] ffmpeg waveform (FIFO) started."); return p
 
 def start_ffmpeg_waveform_file(filepath):
-    cmd = ["ffmpeg", "-loglevel", "quiet",
+    # -re: read at 1x (native) speed so viz stays synchronized with real-time
+    # audio playback.  Without it ffmpeg races through the whole file in seconds,
+    # last_viz_frame ends up at the end-of-song (silent) frame, then ffmpeg exits
+    # and the blend drops to camera-only.
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-re",
            "-i", filepath,
            "-filter_complex", _build_viz_filter(),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]

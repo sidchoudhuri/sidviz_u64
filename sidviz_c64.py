@@ -695,20 +695,11 @@ def start_ffmpeg_camera(device="0", height=HEIGHT):
         # Linux: v4l2 — accept bare index ("0") or full path ("/dev/video0").
         dev = device if device.startswith("/") else f"/dev/video{device}"
         input_flags = ["-f", "v4l2", "-i", dev]
-    # Filter chain:
-    #   crop=iw:iw*H/W      crop source to the target AR (removes top/bottom rows)
-    #   scale=W:H           uniform scale: both axes shrink by the same factor, no squash
-    #   eq=contrast=1.3     moderate contrast to spread brightness across all 10 density
-    #                       levels without saturating bright areas (desk, window) to the
-    #                       top level.  1.8 was too high: eq pushes mid-bright pixels
-    #                       (desk at ~200/255) all the way to 255 → uniform max-density
-    #                       chars fill the bottom rows.  1.3 keeps them at mid-high levels.
-    # Cropping to target AR first is the only correct way to avoid horizontal squash:
-    # scaling to 40 wide first and then height-cropping preserves AR in ffmpeg pixel space
-    # but the character grid displays at 40:17 = 2.35:1, so a 16:9 source appears 1.32×
-    # wider than intended.  All practical cameras (4:3 or 16:9) have AR < 2.35 so the
-    # crop always removes rows from a taller-than-target source; never clips width.
-    vf = (f"crop=iw:iw*{height}/{WIDTH},scale={WIDTH}:{height},"
+    # min(iw, ih*W/H) × min(ih, iw*H/W): correct crop regardless of source AR.
+    # Old formula crop=iw:iw*H/W fails when H/W > source AR (e.g. 40:23 with 16:9
+    # source: 1920*23/40=1104 > 1080).  min() picks the axis that needs cropping.
+    vf = (f"crop=min(iw\\,ih*{WIDTH}/{height}):min(ih\\,iw*{height}/{WIDTH}),"
+          f"scale={WIDTH}:{height},"
           f"eq=contrast=1.3")
     cmd = (["ffmpeg", "-loglevel", "error"] + input_flags +
            ["-vf", vf,

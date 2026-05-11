@@ -453,7 +453,7 @@ def start_ffmpeg_waveform_stream(url):
     cmd = ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
            "-filter_complex", _build_viz_filter(),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
-    p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     yt_proc.stdout.close()  # let ffmpeg own the pipe; yt_proc gets SIGPIPE if ffmpeg exits early
     print("[*] ffmpeg waveform (stream) started.")
     return yt_proc, p
@@ -672,7 +672,7 @@ def start_ffmpeg_waveform_fifo(realtime=False):
     cmd = ["ffmpeg", "-loglevel", "quiet"] + re_flag + ["-f", "wav", "-i", FIFO_PATH,
            "-filter_complex", _build_viz_filter(),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     print("[*] ffmpeg waveform (FIFO) started."); return p
 
 def start_ffmpeg_waveform_file(filepath):
@@ -680,7 +680,7 @@ def start_ffmpeg_waveform_file(filepath):
            "-i", filepath,
            "-filter_complex", _build_viz_filter(),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     print("[*] ffmpeg waveform (file) started."); return p
 
 def start_ffmpeg_camera(device="0", height=HEIGHT):
@@ -1193,6 +1193,7 @@ def main():
         # Background thread keeps the latest viz frame for blending (17-row)
         last_viz_frame = bytearray(viz_frame_size)
         viz_lock = threading.Lock()
+        viz_frame_count = [0]  # diagnostic: count frames received from viz ffmpeg
 
         if viz_ffmpeg_proc:
             def _read_viz():
@@ -1209,8 +1210,10 @@ def main():
                         while len(buf) >= viz_frame_size:
                             with viz_lock:
                                 last_viz_frame[:] = buf[:viz_frame_size]
+                            viz_frame_count[0] += 1
                             del buf[:viz_frame_size]
-                    except Exception:
+                    except Exception as e:
+                        print(f"\r\n[!] _read_viz error: {e}")
                         break
 
         # Background thread continuously drains the camera pipe to prevent
@@ -1293,8 +1296,18 @@ def main():
                     err = cam_proc.stderr.read().decode(errors="replace").strip()
                     print("\r\n[*] Camera stream ended.")
                     if err:
-                        print(f"[!] ffmpeg: {err}")
+                        print(f"[!] ffmpeg camera: {err}")
                     break
+
+                if viz_ffmpeg_proc is not None and viz_ffmpeg_proc.poll() is not None:
+                    try:
+                        verr = viz_ffmpeg_proc.stderr.read(4096).decode(errors="replace").strip()
+                    except Exception:
+                        verr = ""
+                    print(f"\r\n[!] Viz ffmpeg exited (viz={viz_frame_count[0]} frames received).")
+                    if verr:
+                        print(f"[!] ffmpeg viz: {verr[:300]}")
+                    viz_ffmpeg_proc = None  # suppress further checks
 
                 if state["color_pending"]:
                     state["color_pending"] = False
@@ -1336,7 +1349,9 @@ def main():
 
                 frame_num += 1
                 ind = ["R","W","F"][state["color_mode"]]
-                print(f"\r[*] Frame {frame_num:05d} [{ind}]", end="", flush=True)
+                vfc = viz_frame_count[0] if viz_ffmpeg_proc else -1
+                vsuf = f" viz={vfc:05d}" if vfc >= 0 else ""
+                print(f"\r[*] Frame {frame_num:05d} [{ind}]{vsuf}", end="", flush=True)
 
         except KeyboardInterrupt:
             print("\r\n[*] Interrupted.")

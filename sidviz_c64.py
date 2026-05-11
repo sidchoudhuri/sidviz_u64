@@ -680,10 +680,16 @@ def start_ffmpeg_camera(device="0"):
         # Linux: v4l2 — accept bare index ("0") or full path ("/dev/video0").
         dev = device if device.startswith("/") else f"/dev/video{device}"
         input_flags = ["-f", "v4l2", "-i", dev]
-    # -vf scale only — "-pix_fmt gray" on the output side handles grayscale conversion.
-    # stderr goes to PIPE so we can print a useful message if the camera fails to open.
+    # Filter chain:
+    #   scale=W:-2          scale width to W, compute height preserving AR (round to even)
+    #   crop=W:H            center-crop height to H (removes top/bottom excess)
+    #   If scaled height < H (very wide cameras): pad instead of crop.
+    #   eq=contrast=1.8     boost contrast so brightness differences map to distinct chars
+    # Using scale first then crop avoids the AR squash from forcing W:H directly.
+    vf = (f"scale={WIDTH}:-2,crop={WIDTH}:{HEIGHT},"
+          f"eq=contrast=1.8:brightness=0.05")
     cmd = (["ffmpeg", "-loglevel", "error"] + input_flags +
-           ["-vf", f"scale={WIDTH}:{HEIGHT}",
+           ["-vf", vf,
             "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"])
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
@@ -1099,6 +1105,12 @@ def main():
             sys.exit(1)
 
         frame_size = WIDTH * HEIGHT
+
+        # Clear any residual garbage in the camera area (SID driver bytes that may
+        # have landed in screen RAM rows 20-24 if the SID loads near $0700).
+        write_mem(FRAME_BUF, [0x20] * frame_size)
+        write_byte(FRAME_FLAG, 1)
+        print("[*] Frame buffer cleared.")
 
         # Background thread keeps the latest viz frame for blending
         last_viz_frame = bytearray(frame_size)   # all-zero = no blend contribution

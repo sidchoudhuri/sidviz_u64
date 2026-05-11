@@ -4,7 +4,7 @@ sidviz_u64.py -- SID/audio waveform + live camera visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 Camera mode: streams webcam footage as PETSCII character art on the C64 screen.
 
-version 1.9.0 (2026-05-11)
+version 1.9.1 (2026-05-11)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -28,7 +28,7 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 BUILD   = "2026-05-11"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse

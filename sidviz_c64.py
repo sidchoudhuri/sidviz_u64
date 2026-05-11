@@ -1188,10 +1188,15 @@ def main():
         write_mem(FRAME_BUF, [0x20] * viz_frame_size)
         write_mem(0x0540,    [0x20] * viz_frame_size)
         write_byte(FRAME_FLAG, 1)
-        # If extended: also clear rows 2-7 screen + color RAM
+        # If extended: also clear rows 2-7 screen + color RAM.
+        # Write color RAM 3× with small delays: the C64's color RAM SRAM is shared
+        # with the VIC-II on every raster cycle; a single U64 API write can lose
+        # to a bus conflict and be silently ignored.
         if cam_ext_rows:
             write_mem(_cam_ext_scr, [0x20] * (cam_ext_rows * WIDTH))
-            write_mem(_cam_ext_col, _top_colors(color_mode_init))
+            for _ in range(3):
+                write_mem(_cam_ext_col, _top_colors(color_mode_init))
+                time.sleep(0.05)
         print("[*] Camera zone cleared.")
 
         # Background thread keeps the latest viz frame for blending (17-row)
@@ -1346,14 +1351,11 @@ def main():
                 write_mem(FRAME_BUF, bot_screen)
                 write_byte(FRAME_FLAG, 1)
 
-                # Top rows (2-7): write screen RAM every frame, color RAM every 30 frames.
-                # Color RAM ($D850-$D93F) is a separate 4-bit SRAM chip; single writes via
-                # the U64 API can fail silently.  Repeating every ~3 s ensures it persists.
+                # Top rows (2-7): write screen RAM and color RAM every frame.
                 if top_raw:
                     top_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in top_raw)
                     write_mem(_cam_ext_scr, top_screen)
-                    if frame_num % 30 == 0:
-                        write_mem(_cam_ext_col, _top_colors(state["color_mode"]))
+                    write_mem(_cam_ext_col, _top_colors(state["color_mode"]))
 
                 frame_num += 1
                 ind = ["R","W","F"][state["color_mode"]]

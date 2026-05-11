@@ -667,12 +667,11 @@ def start_ffmpeg_waveform_file(filepath):
 def start_ffmpeg_camera(device="0"):
     """Capture live camera frames, scale to C64 screen size, output as raw gray pixels."""
     if sys.platform == "darwin":
-        # macOS: AVFoundation — just the numeric device index.
-        # "N:none" looks intuitive but "none" is not a valid audio device
-        # specifier and causes an I/O error on modern ffmpeg/AVFoundation.
-        # Omit -framerate: AVFoundation only accepts specific rates (25/30/50/60)
-        # and rejects 10fps. Camera runs at native rate; output -r downsamples.
-        input_flags = ["-f", "avfoundation", "-i", str(device)]
+        # macOS: AVFoundation. Must specify -framerate 30 explicitly:
+        # without it ffmpeg auto-selects 29.97 (NTSC drop-frame) which AVFoundation
+        # rejects — cameras advertise integer rates like 15/30/60, not 29.97.
+        # Output -r downsamples from 30 to our target FPS.
+        input_flags = ["-f", "avfoundation", "-framerate", "30", "-i", str(device)]
     else:
         # Linux: v4l2 — accept bare index ("0") or full path ("/dev/video0").
         dev = device if device.startswith("/") else f"/dev/video{device}"

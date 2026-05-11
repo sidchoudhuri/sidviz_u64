@@ -178,7 +178,7 @@ def get_sid_info(filepath):
     try:
         proc = subprocess.Popen(
             ["sidplayfp", "-v", filepath],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         output = ""
         deadline = time.time() + 3.0

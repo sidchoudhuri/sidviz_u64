@@ -1207,6 +1207,32 @@ def main():
                     except Exception:
                         break
 
+        # Background thread continuously drains the camera pipe to prevent
+        # deadlock: if the main loop falls behind (slow U64 HTTP writes), the
+        # 64 KB pipe buffer fills, ffmpeg blocks writing, Python blocks in
+        # read() — display freezes.  The thread always reads ahead; the main
+        # loop picks up the latest complete frame without ever blocking on I/O.
+        latest_cam_frame = [None]
+        cam_frame_lock   = threading.Lock()
+
+        def _read_cam():
+            buf = bytearray()
+            while not state["quit"]:
+                try:
+                    r, _, _ = _select.select([cam_proc.stdout], [], [], 0.1)
+                    if not r:
+                        continue
+                    chunk = cam_proc.stdout.read1(max(cam_frame_size * 4, 65536))
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    while len(buf) >= cam_frame_size:
+                        with cam_frame_lock:
+                            latest_cam_frame[0] = bytes(buf[:cam_frame_size])
+                        del buf[:cam_frame_size]
+                except Exception:
+                    break
+
         state   = {"color_mode": color_mode_init, "color_pending": False, "quit": False}
         kthread = make_keypress_listener(state)
         kthread.start()
@@ -1214,6 +1240,9 @@ def main():
         if viz_ffmpeg_proc:
             vt = threading.Thread(target=_read_viz, daemon=True)
             vt.start()
+
+        cam_read_thread = threading.Thread(target=_read_cam, daemon=True)
+        cam_read_thread.start()
 
         frame_num = 0
         blend_tag = f"+{blend_viz_mode}" if blend_viz_mode else ""
@@ -1268,13 +1297,12 @@ def main():
                         # Update rows 2-7 static colors to match new mode
                         write_mem(_cam_ext_col, _top_colors(state["color_mode"]))
 
-                ready, _, _ = _select.select([cam_proc.stdout], [], [], 0.5)
-                if not ready:
+                with cam_frame_lock:
+                    raw = latest_cam_frame[0]
+                    latest_cam_frame[0] = None
+                if raw is None:
+                    time.sleep(0.010)
                     continue
-
-                raw = cam_proc.stdout.read(cam_frame_size)
-                if len(raw) < cam_frame_size:
-                    print("\r\n[*] Camera stream ended."); break
 
                 # Split into top (rows 2-7, direct) and bottom (rows 8-24, frame buf)
                 if cam_ext_rows:

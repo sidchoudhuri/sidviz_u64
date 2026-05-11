@@ -175,6 +175,15 @@ def ascii_to_petscii(s):
 
 def get_sid_info(filepath):
     """Run sidplayfp -v, read header, kill immediately, parse metadata."""
+    # sidplayfp opens /dev/tty directly and sets raw mode for its interactive UI.
+    # SIGKILL skips its cleanup handlers, leaving the terminal in raw mode.
+    # Save and restore settings so subsequent input() prompts work normally.
+    _tty_fd, _tty_saved = None, None
+    try:
+        _tty_fd = sys.stdin.fileno()
+        _tty_saved = termios.tcgetattr(_tty_fd)
+    except Exception:
+        pass
     try:
         proc = subprocess.Popen(
             ["sidplayfp", "-v", filepath],
@@ -195,6 +204,12 @@ def get_sid_info(filepath):
     except Exception as e:
         print(f"[!] sidplayfp -v failed: {e}")
         return {}
+    finally:
+        if _tty_fd is not None and _tty_saved is not None:
+            try:
+                termios.tcsetattr(_tty_fd, termios.TCSADRAIN, _tty_saved)
+            except Exception:
+                pass
 
     info = {}
     fields = ["Title", "Author", "Released", "File format",
@@ -529,8 +544,8 @@ def u64_put(path, params=None):
 
 def write_mem(addr, data):
     data = bytes(data)
-    for i in range(0, len(data), 128):
-        chunk    = data[i:i + 128]
+    for i in range(0, len(data), 512):
+        chunk    = data[i:i + 512]
         data_hex = "".join(f"{b:02X}" for b in chunk)
         u64_put("machine:writemem", {"address": f"{addr + i:X}", "data": data_hex})
 
@@ -668,7 +683,7 @@ def start_ffmpeg_waveform_file(filepath):
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     print("[*] ffmpeg waveform (file) started."); return p
 
-def start_ffmpeg_camera(device="0"):
+def start_ffmpeg_camera(device="0", height=HEIGHT):
     """Capture live camera frames, scale to C64 screen size, output as raw gray pixels."""
     if sys.platform == "darwin":
         # macOS: AVFoundation. Must specify -framerate 30 explicitly:
@@ -693,7 +708,7 @@ def start_ffmpeg_camera(device="0"):
     # but the character grid displays at 40:17 = 2.35:1, so a 16:9 source appears 1.32×
     # wider than intended.  All practical cameras (4:3 or 16:9) have AR < 2.35 so the
     # crop always removes rows from a taller-than-target source; never clips width.
-    vf = (f"crop=iw:iw*{HEIGHT}/{WIDTH},scale={WIDTH}:{HEIGHT},"
+    vf = (f"crop=iw:iw*{height}/{WIDTH},scale={WIDTH}:{height},"
           f"eq=contrast=1.3")
     cmd = (["ffmpeg", "-loglevel", "error"] + input_flags +
            ["-vf", vf,
@@ -1125,8 +1140,30 @@ def main():
                     stderr=subprocess.DEVNULL)
                 procs.append(save_proc)
 
+        # --- Camera display area ---
+        # Without C64 audio: rows 2-24 are safe (no SID driver in screen RAM).
+        # With C64 audio:    rows 0-7 may hold SID code at $0400-$04FF; stay at row 8.
+        cam_height    = 23 if not c64_audio else HEIGHT   # rows available for camera
+        cam_start_row = 2  if not c64_audio else 8
+        cam_scr  = 0x0400 + cam_start_row * WIDTH   # screen RAM start for camera
+        cam_col  = 0xD800 + cam_start_row * WIDTH   # color RAM start for camera
+        cam_frame_size = WIDTH * cam_height          # bytes per camera frame
+
+        # viz blend uses fixed HEIGHT (17 rows), padded to cam_height if needed
+        viz_frame_size = WIDTH * HEIGHT
+
+        # Build camera color lookup tables (screen_code → C64 color)
+        cam_white_lut = bytearray(128)
+        cam_fire_lut  = bytearray(128)
+        for _code, _wcol, _fcol in CHARS_CAMERA_DEF:
+            cam_white_lut[_code] = _wcol
+            cam_fire_lut[_code]  = _fcol
+        # Rainbow column stripe matching ASM rainbow_table
+        _rtab = [2,2,8,8,7,7,7,7,5,5,5,5,13,13,14,14,6,6,6,6,4,4,4,4,10,10,2,2,8,8,7,7,5,5,13,13,14,14,6,6]
+        cam_rainbow_colors = bytes(_rtab[col] for _ in range(cam_height) for col in range(WIDTH))
+
         # --- Start camera ---
-        cam_proc = start_ffmpeg_camera(camera_device)
+        cam_proc = start_ffmpeg_camera(camera_device, height=cam_height)
         if cam_proc is None:
             print("[!] Cannot open camera — check device index and permissions.")
             print(f"    Linux: ls /dev/video*  |  try --camera-device 1")
@@ -1136,19 +1173,13 @@ def main():
                 except: pass
             sys.exit(1)
 
-        frame_size = WIDTH * HEIGHT
-
-        # Clear waveform zone directly: write spaces to both the frame buffer
-        # ($C100, so copy_frame produces the same result) AND directly to screen
-        # RAM ($0540 = row 8).  Relying solely on copy_frame leaves a window where
-        # pre-existing C64 RAM content is visible — the direct write closes it.
-        write_mem(FRAME_BUF, [0x20] * frame_size)
-        write_mem(0x0540,    [0x20] * frame_size)   # direct screen RAM rows 8-24
-        write_byte(FRAME_FLAG, 1)
-        print("[*] Frame buffer cleared.")
+        # Clear camera zone directly in screen RAM (no copy_frame path needed)
+        write_mem(cam_scr, [0x20] * cam_frame_size)
+        write_mem(cam_col, [0x00] * cam_frame_size)   # black until first frame
+        print("[*] Camera zone cleared.")
 
         # Background thread keeps the latest viz frame for blending
-        last_viz_frame = bytearray(frame_size)   # all-zero = no blend contribution
+        last_viz_frame = bytearray(viz_frame_size)   # all-zero = no blend contribution
         viz_lock = threading.Lock()
 
         if viz_ffmpeg_proc:
@@ -1157,8 +1188,8 @@ def main():
                     try:
                         r, _, _ = _select.select([viz_ffmpeg_proc.stdout], [], [], 0.2)
                         if r:
-                            data = viz_ffmpeg_proc.stdout.read(frame_size)
-                            if len(data) == frame_size:
+                            data = viz_ffmpeg_proc.stdout.read(viz_frame_size)
+                            if len(data) == viz_frame_size:
                                 with viz_lock:
                                     last_viz_frame[:] = data
                     except Exception:
@@ -1220,26 +1251,38 @@ def main():
 
                 if state["color_pending"]:
                     state["color_pending"] = False
-                    write_byte(COLOR_FLAG, _cflag_map[state["color_mode"]])
+                    # Python writes colors directly — no need to notify ASM via COLOR_FLAG.
 
                 ready, _, _ = _select.select([cam_proc.stdout], [], [], 0.5)
                 if not ready:
                     continue
 
-                raw = cam_proc.stdout.read(frame_size)
-                if len(raw) < frame_size:
+                raw = cam_proc.stdout.read(cam_frame_size)
+                if len(raw) < cam_frame_size:
                     print("\r\n[*] Camera stream ended."); break
 
-                # Blend: per-pixel max of camera brightness and viz brightness
+                # Blend: per-pixel max of camera brightness and viz brightness.
+                # Viz is viz_frame_size (17 rows); pad with zeros for camera-only rows.
                 if viz_ffmpeg_proc:
                     with viz_lock:
-                        blended = bytes(max(c, v) for c, v in zip(raw, last_viz_frame))
+                        viz_pad = bytes(max(0, cam_frame_size - viz_frame_size)) + bytes(last_viz_frame)
+                    blended = bytes(max(c, v) for c, v in zip(raw, viz_pad))
                 else:
                     blended = raw
 
+                # Compute screen chars and write directly to screen RAM
                 screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended)
-                write_mem(FRAME_BUF, screen)
-                write_byte(FRAME_FLAG, 1)
+                write_mem(cam_scr, screen)
+
+                # Compute and write color RAM based on current color mode
+                cmode = state["color_mode"]
+                if cmode == 0:
+                    colors = cam_rainbow_colors
+                elif cmode == 1:
+                    colors = bytes(cam_white_lut[c] for c in screen)
+                else:
+                    colors = bytes(cam_fire_lut[c] for c in screen)
+                write_mem(cam_col, colors)
 
                 frame_num += 1
                 ind = ["R","W","F"][state["color_mode"]]
@@ -1257,8 +1300,8 @@ def main():
                 time.sleep(0.3)
             else:
                 write_mem(0xD400, [0] * 25)
-                write_byte(FRAME_FLAG, 0)
-                write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
+                write_mem(cam_scr, [0x20] * cam_frame_size)
+                write_mem(cam_col, [0x00] * cam_frame_size)
                 write_mem(TICKER_ROW, [0x20] * 40)
             def _stop(proc):
                 if proc is None:

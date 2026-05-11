@@ -1111,7 +1111,7 @@ def main():
                 if blend_viz_mode:
                     make_fifo(FIFO_PATH)
                     VIZ_MODE = blend_viz_mode
-                    viz_ffmpeg_proc = start_ffmpeg_waveform_fifo()
+                    viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(realtime=True)
                     VIZ_MODE = "camera"
                     time.sleep(0.3)
                     sid_fifo_proc  = start_sidplayfp_fifo(filepath, sid_duration_secs)

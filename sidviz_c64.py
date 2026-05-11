@@ -96,13 +96,17 @@ CHARS_HIST_DEF = [          # ahistogram (least → most dense)
     (42,  15,   8),         # *          light gray  orange
     (35,   1,   2),         # #          white       red
 ]
-CHARS_CAMERA_DEF = [        # camera (least → most dense — wider range for photo-like detail)
+CHARS_CAMERA_DEF = [        # camera — 10 density levels for photo-like detail
     (32,   0,   0),         # space      black       black
     (46,  11,   9),         # .          dark gray   brown
+    (45,  11,   9),         # -          dark gray   brown
     (58,  12,  10),         # :          med gray    light red
     (43,  15,   8),         # +          light gray  orange
+    (61,  15,   8),         # =          light gray  orange
     (42,   1,   2),         # *          white       red
+    (37,   1,   2),         # %          white       red
     (35,   1,   2),         # #          white       red
+    (64,   1,   2),         # ─          white       red
 ]
 CHARS      = [t[0] for t in CHARS_DEF]
 CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]
@@ -904,7 +908,7 @@ def main():
         VIZ_MODE = "camera"
         camera_device = args.camera_device
 
-        # Optional audio alongside camera visuals
+        # Optional audio + file
         filepath = os.path.expanduser(args.file) if args.file else None
         if filepath and not is_url(filepath) and not os.path.isfile(filepath):
             print(f"[!] File not found: {filepath}"); sys.exit(1)
@@ -917,7 +921,27 @@ def main():
 
         print(f"[*] Viz mode: camera  device: {camera_device}")
 
-        # --- Audio setup (mirrors normal mode, minus the waveform ffmpeg) ---
+        # --- Blend viz: which audio visualization to overlay on camera frames ---
+        blend_viz_mode = None
+        if filepath:
+            if args.showwaves:      blend_viz_mode = "showwaves"
+            elif args.showfreqs:    blend_viz_mode = "showfreqs"
+            elif args.avectorscope: blend_viz_mode = "avectorscope"
+            elif args.showspectrum: blend_viz_mode = "showspectrum"
+            elif args.ahistogram:   blend_viz_mode = "ahistogram"
+            else:
+                ans = input(
+                    "Blend audio viz? [0=none, 1=waveform, 2=spectrum, 3=scope, "
+                    "4=spectrogram, 5=histogram] (default 0): "
+                ).strip()
+                blend_viz_mode = {
+                    "1": "showwaves", "2": "showfreqs", "3": "avectorscope",
+                    "4": "showspectrum", "5": "ahistogram",
+                }.get(ans)
+            if blend_viz_mode:
+                print(f"[*] Blend viz: {blend_viz_mode}")
+
+        # --- Audio mode detection ---
         audio_mode        = None
         c64_audio         = False
         sid_duration_secs = None
@@ -993,7 +1017,6 @@ def main():
             write_byte(C64_AUDIO_FLAG, 1)
 
         time.sleep(1.0)
-
         write_color_tables()
         print("[*] Color tables written ($C3A8/$C428).")
 
@@ -1010,33 +1033,63 @@ def main():
         write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
         send_ticker(ticker_str)
 
-        # --- Start audio processes (camera replaces waveform ffmpeg entirely) ---
+        # --- Start audio + optional blend viz processes ---
         procs          = []
         sid_audio_proc = None
         ffplay_proc    = None
+        viz_ffmpeg_proc = None
         sid_end_time   = (time.time() + sid_duration_secs) if sid_duration_secs else None
 
         if audio_mode == "sid":
             if c64_audio:
-                upload_sid_to_c64(psid)
-                # sidplayfp to FIFO still needed so C64 timing stays accurate,
-                # but we discard its output — open FIFO in write-only throwaway mode
-                make_fifo(FIFO_PATH)
-                sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
-                procs = [sid_fifo_proc]
+                # C64 plays audio via SID chip; sidplayfp → FIFO only if blending
+                if blend_viz_mode:
+                    make_fifo(FIFO_PATH)
+                    VIZ_MODE = blend_viz_mode
+                    viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(realtime=True)
+                    VIZ_MODE = "camera"
+                    upload_sid_to_c64(psid)
+                    sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
+                    procs = [sid_fifo_proc, viz_ffmpeg_proc]
+                else:
+                    upload_sid_to_c64(psid)
             else:
-                sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
-                procs = [sid_audio_proc]
+                if blend_viz_mode:
+                    make_fifo(FIFO_PATH)
+                    VIZ_MODE = blend_viz_mode
+                    viz_ffmpeg_proc = start_ffmpeg_waveform_fifo()
+                    VIZ_MODE = "camera"
+                    time.sleep(0.3)
+                    sid_fifo_proc  = start_sidplayfp_fifo(filepath, sid_duration_secs)
+                    sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
+                    procs = [sid_fifo_proc, sid_audio_proc, viz_ffmpeg_proc]
+                else:
+                    sid_audio_proc = start_sidplayfp_audio(filepath, sid_duration_secs)
+                    procs = [sid_audio_proc]
+
         elif audio_mode == "audio":
             ffplay_proc = start_ffplay_audio(filepath)
-            procs = [ffplay_proc]
+            if blend_viz_mode:
+                VIZ_MODE = blend_viz_mode
+                viz_ffmpeg_proc = start_ffmpeg_waveform_file(filepath)
+                VIZ_MODE = "camera"
+                procs = [ffplay_proc, viz_ffmpeg_proc]
+            else:
+                procs = [ffplay_proc]
+
         elif audio_mode == "stream":
             yt_audio_proc, ffplay_proc = start_ffplay_stream(stream_url)
-            procs = [yt_audio_proc, ffplay_proc]
+            if blend_viz_mode:
+                VIZ_MODE = blend_viz_mode
+                yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(stream_url)
+                VIZ_MODE = "camera"
+                procs = [yt_audio_proc, ffplay_proc, yt_viz_proc, viz_ffmpeg_proc]
+            else:
+                procs = [yt_audio_proc, ffplay_proc]
 
         # --- Start camera ---
-        ffmpeg_proc = start_ffmpeg_camera(camera_device)
-        if ffmpeg_proc is None:
+        cam_proc = start_ffmpeg_camera(camera_device)
+        if cam_proc is None:
             print("[!] Cannot open camera — check device index and permissions.")
             print(f"    Linux: ls /dev/video*  |  try --camera-device 1")
             print(f"    macOS: check System Settings → Privacy → Camera")
@@ -1046,16 +1099,38 @@ def main():
             sys.exit(1)
 
         frame_size = WIDTH * HEIGHT
-        state      = {"color_mode": color_mode_init, "color_pending": False, "quit": False}
-        kthread    = make_keypress_listener(state)
+
+        # Background thread keeps the latest viz frame for blending
+        last_viz_frame = bytearray(frame_size)   # all-zero = no blend contribution
+        viz_lock = threading.Lock()
+
+        if viz_ffmpeg_proc:
+            def _read_viz():
+                while not state["quit"]:
+                    try:
+                        r, _, _ = _select.select([viz_ffmpeg_proc.stdout], [], [], 0.2)
+                        if r:
+                            data = viz_ffmpeg_proc.stdout.read(frame_size)
+                            if len(data) == frame_size:
+                                with viz_lock:
+                                    last_viz_frame[:] = data
+                    except Exception:
+                        break
+
+        state   = {"color_mode": color_mode_init, "color_pending": False, "quit": False}
+        kthread = make_keypress_listener(state)
         kthread.start()
 
+        if viz_ffmpeg_proc:
+            vt = threading.Thread(target=_read_viz, daemon=True)
+            vt.start()
+
         frame_num = 0
-        print(f"[*] Camera streaming to C64 at {FPS}fps -- [c] color, [q] quit\n")
+        blend_tag = f"+{blend_viz_mode}" if blend_viz_mode else ""
+        print(f"[*] Camera{blend_tag} streaming to C64 at {FPS}fps -- [c] color, [q] quit\n")
 
         try:
             while not state["quit"]:
-                # Stop when audio finishes
                 if sid_audio_proc is not None and sid_audio_proc.poll() is not None:
                     print("\r\n[*] Song ended."); break
                 if ffplay_proc is not None and ffplay_proc.poll() is not None:
@@ -1063,8 +1138,8 @@ def main():
                 if sid_end_time is not None and time.time() >= sid_end_time:
                     print("\r\n[*] Song ended."); break
 
-                if ffmpeg_proc.poll() is not None:
-                    err = ffmpeg_proc.stderr.read().decode(errors="replace").strip()
+                if cam_proc.poll() is not None:
+                    err = cam_proc.stderr.read().decode(errors="replace").strip()
                     print("\r\n[*] Camera stream ended.")
                     if err:
                         print(f"[!] ffmpeg: {err}")
@@ -1074,15 +1149,22 @@ def main():
                     state["color_pending"] = False
                     write_byte(COLOR_FLAG, _cflag_map[state["color_mode"]])
 
-                ready, _, _ = _select.select([ffmpeg_proc.stdout], [], [], 0.5)
+                ready, _, _ = _select.select([cam_proc.stdout], [], [], 0.5)
                 if not ready:
                     continue
 
-                raw = ffmpeg_proc.stdout.read(frame_size)
+                raw = cam_proc.stdout.read(frame_size)
                 if len(raw) < frame_size:
                     print("\r\n[*] Camera stream ended."); break
 
-                screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in raw)
+                # Blend: per-pixel max of camera brightness and viz brightness
+                if viz_ffmpeg_proc:
+                    with viz_lock:
+                        blended = bytes(max(c, v) for c, v in zip(raw, last_viz_frame))
+                else:
+                    blended = raw
+
+                screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended)
                 write_mem(FRAME_BUF, screen)
                 write_byte(FRAME_FLAG, 1)
 
@@ -1105,7 +1187,7 @@ def main():
                 write_byte(FRAME_FLAG, 0)
                 write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
                 write_mem(TICKER_ROW, [0x20] * 40)
-            try: ffmpeg_proc.terminate()
+            try: cam_proc.terminate()
             except: pass
             for p in procs:
                 try: p.terminate()

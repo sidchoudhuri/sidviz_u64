@@ -57,7 +57,8 @@ TIMEOUT      = 5.0
 # C64 colors: 0=black 1=white 2=red 7=yellow 8=orange 9=brown 10=ltred 11=dkgray 12=mdgray 15=ltgray
 WHITE_CTABLE_ADDR = 0xC3A8   # 128-byte table written by Python: screen_code → C64 color
 FIRE_CTABLE_ADDR  = 0xC428   # 128-byte table written by Python: screen_code → C64 color
-PETSCII_BLOCK   = 16   # pixels per char cell in saved PETSCII video (640×400 for 40×25)
+PETSCII_BLOCK   = 16   # output pixels per char cell in saved PETSCII video (640×400 for 40×25)
+_REC_BLOCK      = 8    # render at native C64 resolution (320×200); ffmpeg scales up
 C64_PALETTE_RGB = [    # standard C64 VICE palette (R, G, B)
     (  0,  0,  0), (255,255,255), (136,  0,  0), (170,255,238),
     (204, 68,204), (  0,204, 85), (  0,  0,170), (238,238,119),
@@ -1047,10 +1048,13 @@ def _pixel_color(pixel, chars, color_mode, col_x, white_lut, fire_lut, rainbow_t
 def start_petscii_recorder(filepath, num_cols, num_rows, block=PETSCII_BLOCK,
                            audio_source=None, audio_fd=None):
     """Start ffmpeg PETSCII video recorder (all 25 C64 rows = 640×400).
+    Frames are piped at _REC_BLOCK (8px/cell = 320×200) and scaled up to
+    block×block (16px/cell = 640×400) inside ffmpeg — 4× less pipe data.
     audio_source: local file path.  audio_fd: open fd from a yt-dlp pipe."""
-    w, h = num_cols * block, num_rows * block
+    rw, rh = num_cols * _REC_BLOCK, num_rows * _REC_BLOCK   # pipe input size
+    out_w, out_h = num_cols * block, num_rows * block        # output file size
     cmd = ["ffmpeg", "-y",
-           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(FPS),
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{rw}x{rh}", "-r", str(FPS),
            "-i", "pipe:0"]
     pass_fds = ()
     if audio_source:
@@ -1059,9 +1063,10 @@ def start_petscii_recorder(filepath, num_cols, num_rows, block=PETSCII_BLOCK,
         cmd += ["-i", f"/dev/fd/{audio_fd}"]
         pass_fds = (audio_fd,)
     has_audio = bool(audio_source) or (audio_fd is not None)
+    vf = f"scale={out_w}:{out_h}:flags=neighbor"
     cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-crf", "23", "-preset", "fast", "-tune", "animation",
-            "-r", str(FPS)]
+            "-r", str(FPS), "-vf", vf]
     if has_audio:
         cmd += ["-c:a", "aac", "-map", "0:v", "-map", "1:a"]
     cmd += [filepath]
@@ -1070,7 +1075,7 @@ def start_petscii_recorder(filepath, num_cols, num_rows, block=PETSCII_BLOCK,
                          pass_fds=pass_fds)
     atag = (f" + audio: {os.path.basename(audio_source)}" if audio_source
             else " + audio: stream" if audio_fd is not None else "")
-    print(f"[*] PETSCII recorder: {filepath} ({w}x{h} @ {FPS}fps){atag}")
+    print(f"[*] PETSCII recorder: {filepath} ({out_w}x{out_h} @ {FPS}fps){atag}")
     return p
 
 def _cached_char_cell(screen_code, fg_color, block=PETSCII_BLOCK):
@@ -1103,16 +1108,17 @@ def _cached_char_cell(screen_code, fg_color, block=PETSCII_BLOCK):
 def _render_petscii_frame(screen_codes, colors, num_cols, num_rows, block=PETSCII_BLOCK):
     """Render a full PETSCII frame as raw RGB24 bytes using cached C64 char bitmaps.
     screen_codes: PETSCII screen code per cell; colors: C64 color index per cell."""
-    w = num_cols * block
-    buf = bytearray(w * num_rows * block * 3)
+    bstride = block * 3
+    lines = []
     for row in range(num_rows):
-        for col in range(num_cols):
-            idx = row * num_cols + col
-            cell = _cached_char_cell(screen_codes[idx], colors[idx], block)
-            for br in range(block):
-                base = ((row * block + br) * w + col * block) * 3
-                buf[base:base + block * 3] = cell[br * block * 3 : (br + 1) * block * 3]
-    return bytes(buf)
+        base = row * num_cols
+        cells = [_cached_char_cell(screen_codes[base + col], colors[base + col], block)
+                 for col in range(num_cols)]
+        for br in range(block):
+            off = br * bstride
+            end = off + bstride
+            lines.append(b''.join(c[off:end] for c in cells))
+    return b''.join(lines)
 
 def _screen_code_color(screen_code, color_mode, col_x, white_lut, fire_lut, rainbow_tab):
     """Map a screen code to a C64 color index for the recorder (mirrors C64 ASM logic)."""
@@ -1526,7 +1532,7 @@ def main():
                 audio_source=_prec_audio_src, audio_fd=_prec_audio_fd)
             if yt_petscii_audio is not None:
                 yt_petscii_audio.stdout.close()
-            petscii_queue = queue.Queue(maxsize=2)
+            petscii_queue = queue.Queue(maxsize=4)
             def _petscii_worker():
                 while True:
                     item = petscii_queue.get()
@@ -1534,7 +1540,7 @@ def main():
                         break
                     sc, col = item
                     try:
-                        petscii_recorder.stdin.write(_render_petscii_frame(sc, col, WIDTH, 25))
+                        petscii_recorder.stdin.write(_render_petscii_frame(sc, col, WIDTH, 25, block=_REC_BLOCK))
                     except Exception:
                         pass
             petscii_thread = threading.Thread(target=_petscii_worker, daemon=True)
@@ -2022,7 +2028,7 @@ def main():
                 audio_source=_prec_audio_src, audio_fd=_prec_audio_fd)
             if yt_petscii_audio is not None:
                 yt_petscii_audio.stdout.close()
-            petscii_queue = queue.Queue(maxsize=2)
+            petscii_queue = queue.Queue(maxsize=4)
             def _petscii_worker():
                 while True:
                     item = petscii_queue.get()
@@ -2030,7 +2036,7 @@ def main():
                         break
                     sc, col = item
                     try:
-                        petscii_recorder.stdin.write(_render_petscii_frame(sc, col, WIDTH, 25))
+                        petscii_recorder.stdin.write(_render_petscii_frame(sc, col, WIDTH, 25, block=_REC_BLOCK))
                     except Exception:
                         pass
             petscii_thread = threading.Thread(target=_petscii_worker, daemon=True)

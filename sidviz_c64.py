@@ -1515,23 +1515,32 @@ def main():
         yt_petscii_audio  = None
         _prec_ticker_petscii = None
         _prec_ticker_t0   = None
+        _prec_tmp_video   = None
+        _prec_tmp_audio   = None
         if args.save_petscii:
             _prec_ticker_petscii = bytes(ascii_to_petscii(ticker_str))[:253] or b'\x20'
             _prec_ticker_t0 = time.time()
-            _prec_audio_src, _prec_audio_fd = None, None
+            _prec_audio_src = None
             if audio_mode == "audio" and filepath and not is_url(filepath):
+                # Local file: pass audio directly to ffmpeg (no timing issues)
                 _prec_audio_src = filepath
+                _rec_dst = args.save_petscii
             elif audio_mode == "stream":
+                # Stream: download audio to temp file; mux after recording ends.
+                # Avoids the fast-download / muxer-interleave problem that cut
+                # video short when audio was piped directly into ffmpeg.
+                _prec_tmp_video = args.save_petscii + ".video.tmp"
+                _prec_tmp_audio = args.save_petscii + ".audio.tmp.m4a"
                 yt_petscii_audio = subprocess.Popen(
-                    ["yt-dlp", "-f", "bestaudio/best", "-o", "-", "-q", "--no-playlist"]
-                    + _YTDLP_COOKIE_ARGS + [stream_url],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                _prec_audio_fd = yt_petscii_audio.stdout.fileno()
+                    ["yt-dlp", "-f", "bestaudio/best", "-o", _prec_tmp_audio,
+                     "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [stream_url],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _rec_dst = _prec_tmp_video
+            else:
+                _rec_dst = args.save_petscii
             petscii_recorder = start_petscii_recorder(
-                args.save_petscii, WIDTH, 25,  # 25 rows = full C64 screen (640×400)
-                audio_source=_prec_audio_src, audio_fd=_prec_audio_fd)
-            if yt_petscii_audio is not None:
-                yt_petscii_audio.stdout.close()
+                _rec_dst, WIDTH, 25,  # 25 rows = full C64 screen (640×400)
+                audio_source=_prec_audio_src)
             petscii_queue = queue.Queue(maxsize=10)
             def _petscii_worker():
                 # Write at a fixed wall-clock rate (FPS), repeating the last
@@ -1838,14 +1847,26 @@ def main():
             if petscii_recorder is not None:
                 try:
                     petscii_recorder.stdin.close()
-                    petscii_recorder.wait(timeout=20)
-                    print("\r\n[*] PETSCII recording saved.")
+                    petscii_recorder.wait(timeout=120)
                 except Exception:
                     try: petscii_recorder.kill()
                     except Exception: pass
-            if yt_petscii_audio is not None:
+            if _prec_tmp_video and _prec_tmp_audio:
+                if yt_petscii_audio is not None:
+                    try: yt_petscii_audio.wait(timeout=60)
+                    except Exception: pass
+                print("\r\n[*] Muxing PETSCII audio+video...")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", _prec_tmp_video, "-i", _prec_tmp_audio,
+                     "-c:v", "copy", "-c:a", "aac", "-shortest", args.save_petscii],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for _f in (_prec_tmp_video, _prec_tmp_audio):
+                    try: os.unlink(_f)
+                    except Exception: pass
+            elif yt_petscii_audio is not None:
                 try: yt_petscii_audio.terminate(); yt_petscii_audio.wait(timeout=3)
                 except Exception: pass
+            print("\r\n[*] PETSCII recording saved.")
             if c64_audio:
                 write_byte(C64_AUDIO_FLAG, 0)
                 time.sleep(0.04)
@@ -2045,23 +2066,26 @@ def main():
         yt_petscii_audio  = None
         _prec_ticker_petscii = None
         _prec_ticker_t0   = None
+        _prec_tmp_video   = None
+        _prec_tmp_audio   = None
         if args.save_petscii:
             _prec_ticker_petscii = bytes(ascii_to_petscii(ticker_str))[:253] or b'\x20'
             _prec_ticker_t0 = time.time()
-            _prec_audio_src, _prec_audio_fd = None, None
+            _prec_audio_src = None
             if not is_url(filepath):
                 _prec_audio_src = filepath
+                _rec_dst = args.save_petscii
             else:
+                _prec_tmp_video = args.save_petscii + ".video.tmp"
+                _prec_tmp_audio = args.save_petscii + ".audio.tmp.m4a"
                 yt_petscii_audio = subprocess.Popen(
-                    ["yt-dlp", "-f", "bestaudio/best", "-o", "-", "-q", "--no-playlist"]
-                    + _YTDLP_COOKIE_ARGS + [stream_url],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                _prec_audio_fd = yt_petscii_audio.stdout.fileno()
+                    ["yt-dlp", "-f", "bestaudio/best", "-o", _prec_tmp_audio,
+                     "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [stream_url],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _rec_dst = _prec_tmp_video
             petscii_recorder = start_petscii_recorder(
-                args.save_petscii, WIDTH, 25,
-                audio_source=_prec_audio_src, audio_fd=_prec_audio_fd)
-            if yt_petscii_audio is not None:
-                yt_petscii_audio.stdout.close()
+                _rec_dst, WIDTH, 25,
+                audio_source=_prec_audio_src)
             petscii_queue = queue.Queue(maxsize=10)
             def _petscii_worker():
                 interval   = 1.0 / FPS
@@ -2320,14 +2344,26 @@ def main():
             if petscii_recorder is not None:
                 try:
                     petscii_recorder.stdin.close()
-                    petscii_recorder.wait(timeout=20)
-                    print("\r\n[*] PETSCII recording saved.")
+                    petscii_recorder.wait(timeout=120)
                 except Exception:
                     try: petscii_recorder.kill()
                     except Exception: pass
-            if yt_petscii_audio is not None:
+            if _prec_tmp_video and _prec_tmp_audio:
+                if yt_petscii_audio is not None:
+                    try: yt_petscii_audio.wait(timeout=60)
+                    except Exception: pass
+                print("\r\n[*] Muxing PETSCII audio+video...")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", _prec_tmp_video, "-i", _prec_tmp_audio,
+                     "-c:v", "copy", "-c:a", "aac", "-shortest", args.save_petscii],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for _f in (_prec_tmp_video, _prec_tmp_audio):
+                    try: os.unlink(_f)
+                    except Exception: pass
+            elif yt_petscii_audio is not None:
                 try: yt_petscii_audio.terminate(); yt_petscii_audio.wait(timeout=3)
                 except Exception: pass
+            print("\r\n[*] PETSCII recording saved.")
             write_mem(0xD400, [0] * 25)
             write_byte(FRAME_FLAG, 0)
             write_mem(FRAME_BUF,    [0x20] * (WIDTH * HEIGHT))

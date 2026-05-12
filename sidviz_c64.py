@@ -1532,17 +1532,51 @@ def main():
                 audio_source=_prec_audio_src, audio_fd=_prec_audio_fd)
             if yt_petscii_audio is not None:
                 yt_petscii_audio.stdout.close()
-            petscii_queue = queue.Queue(maxsize=4)
+            petscii_queue = queue.Queue(maxsize=10)
             def _petscii_worker():
+                # Write at a fixed wall-clock rate (FPS), repeating the last
+                # frame when no new one is available.  This decouples recording
+                # duration from the HTTP-limited main-loop frame rate.
+                interval   = 1.0 / FPS
+                last_item  = None
+                next_write = time.monotonic()
                 while True:
-                    item = petscii_queue.get()
-                    if item is None:
-                        break
-                    sc, col = item
-                    try:
-                        petscii_recorder.stdin.write(_render_petscii_frame(sc, col, WIDTH, 25, block=_REC_BLOCK))
-                    except Exception:
-                        pass
+                    wait = next_write - time.monotonic()
+                    if wait > 0:
+                        try:
+                            item = petscii_queue.get(timeout=wait)
+                            if item is None:
+                                break
+                            last_item = item
+                            # Drain any extras, keep only the latest
+                            while True:
+                                try:
+                                    i2 = petscii_queue.get_nowait()
+                                    if i2 is None:
+                                        if last_item is not None:
+                                            sc, col = last_item
+                                            try:
+                                                petscii_recorder.stdin.write(
+                                                    _render_petscii_frame(sc, col, WIDTH, 25, block=_REC_BLOCK))
+                                            except Exception:
+                                                pass
+                                        return
+                                    last_item = i2
+                                except queue.Empty:
+                                    break
+                            continue  # re-check next_write
+                        except queue.Empty:
+                            pass  # timed out → fall through to write
+                    if last_item is not None:
+                        sc, col = last_item
+                        try:
+                            petscii_recorder.stdin.write(
+                                _render_petscii_frame(sc, col, WIDTH, 25, block=_REC_BLOCK))
+                        except Exception:
+                            break
+                    next_write += interval
+                    if time.monotonic() > next_write + interval:
+                        next_write = time.monotonic()  # reset if too far behind
             petscii_thread = threading.Thread(target=_petscii_worker, daemon=True)
             petscii_thread.start()
 
@@ -2028,17 +2062,47 @@ def main():
                 audio_source=_prec_audio_src, audio_fd=_prec_audio_fd)
             if yt_petscii_audio is not None:
                 yt_petscii_audio.stdout.close()
-            petscii_queue = queue.Queue(maxsize=4)
+            petscii_queue = queue.Queue(maxsize=10)
             def _petscii_worker():
+                interval   = 1.0 / FPS
+                last_item  = None
+                next_write = time.monotonic()
                 while True:
-                    item = petscii_queue.get()
-                    if item is None:
-                        break
-                    sc, col = item
-                    try:
-                        petscii_recorder.stdin.write(_render_petscii_frame(sc, col, WIDTH, 25, block=_REC_BLOCK))
-                    except Exception:
-                        pass
+                    wait = next_write - time.monotonic()
+                    if wait > 0:
+                        try:
+                            item = petscii_queue.get(timeout=wait)
+                            if item is None:
+                                break
+                            last_item = item
+                            while True:
+                                try:
+                                    i2 = petscii_queue.get_nowait()
+                                    if i2 is None:
+                                        if last_item is not None:
+                                            sc, col = last_item
+                                            try:
+                                                petscii_recorder.stdin.write(
+                                                    _render_petscii_frame(sc, col, WIDTH, 25, block=_REC_BLOCK))
+                                            except Exception:
+                                                pass
+                                        return
+                                    last_item = i2
+                                except queue.Empty:
+                                    break
+                            continue
+                        except queue.Empty:
+                            pass
+                    if last_item is not None:
+                        sc, col = last_item
+                        try:
+                            petscii_recorder.stdin.write(
+                                _render_petscii_frame(sc, col, WIDTH, 25, block=_REC_BLOCK))
+                        except Exception:
+                            break
+                    next_write += interval
+                    if time.monotonic() > next_write + interval:
+                        next_write = time.monotonic()
             petscii_thread = threading.Thread(target=_petscii_worker, daemon=True)
             petscii_thread.start()
 

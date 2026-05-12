@@ -1869,6 +1869,7 @@ def main():
             filepath = chosen
             _yt_chosen = next((c for c in candidates if c["url"] == chosen), None)
         else:
+            _yt_chosen = None
             filepath = os.path.expanduser(args.file) if args.file else \
                        os.path.expanduser(input("Video file or URL: ").strip())
 
@@ -1935,6 +1936,12 @@ def main():
         info = {}
         if is_url(filepath):
             info = get_stream_info(filepath) or {}
+            if not info and _yt_chosen:
+                info = {
+                    "Title":    _yt_chosen.get("title", ""),
+                    "Artist":   _yt_chosen.get("uploader", ""),
+                    "Duration": _yt_chosen.get("duration", ""),
+                }
         else:
             info = get_audio_info(filepath)
         show_info_header(info, "audio", filepath)

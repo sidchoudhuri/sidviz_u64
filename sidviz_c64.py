@@ -1063,7 +1063,7 @@ def start_petscii_recorder(filepath, num_cols, num_rows, block=PETSCII_BLOCK,
             "-crf", "23", "-preset", "fast", "-tune", "animation",
             "-r", str(FPS)]
     if has_audio:
-        cmd += ["-c:a", "aac", "-shortest", "-map", "0:v", "-map", "1:a"]
+        cmd += ["-c:a", "aac", "-map", "0:v", "-map", "1:a"]
     cmd += [filepath]
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

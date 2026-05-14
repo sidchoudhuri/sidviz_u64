@@ -1,6 +1,6 @@
 # sidviz_u64
 
-Real-time waveform visualizer for the Commodore 64, driven by a Mac or Linux machine over the [Ultimate 64 (U64)](https://ultimate64.com) network API. Plays SID files, MP3s/audio files, and streams from YouTube, SoundCloud, and Spotify — and renders the live waveform on a real C64 screen with a scrolling metadata ticker.
+Real-time waveform visualizer for the Commodore 64, driven by a Windows, Mac, or Linux machine over the [Ultimate 64 (U64)](https://ultimate64.com) network API. Plays SID files, MP3s/audio files, and streams from YouTube, SoundCloud, and Spotify — and renders the live waveform on a real C64 screen with a scrolling metadata ticker.
 
 ```
 +------------------------------------------------------+

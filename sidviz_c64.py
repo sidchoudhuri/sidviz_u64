@@ -99,6 +99,8 @@ _C64_CHARGEN = _load_c64_chargen()
 # Used when VICE chargen ROM is not installed.
 _C64_CHAR_FALLBACK: dict = {
     32: b'\x00\x00\x00\x00\x00\x00\x00\x00',  # space
+    33: b'\x18\x18\x18\x18\x18\x00\x18\x00',  # !
+    34: b'\x66\x66\x22\x00\x00\x00\x00\x00',  # "
     35: b'\x66\x66\xff\x66\xff\x66\x66\x00',  # #
     37: b'\x62\x66\x0c\x18\x30\x66\x46\x00',  # %
     42: b'\x00\x66\x3c\xff\x3c\x66\x00\x00',  # *
@@ -111,6 +113,7 @@ _C64_CHAR_FALLBACK: dict = {
     61: b'\x00\x00\x7e\x00\x7e\x00\x00\x00',  # =
     63: b'\x3c\x66\x06\x1c\x18\x00\x18\x00',  # ?
     64: b'\xff\xff\xff\xff\xff\xff\xff\xff',   # screen code 64 (dense graphic block)
+   102: b'\xcc\xcc\x33\x33\xcc\xcc\x33\x33',  # screen code 102 (2×2 checker ▒)
     # A-Z (screen codes 1-26)
      1: b'\x3c\x66\x66\x7e\x66\x66\x66\x00',  # A
      2: b'\x7c\x66\x66\x7c\x66\x66\x7c\x00',  # B
@@ -159,7 +162,7 @@ CHARS_DEF = [               # showwaves  (least → most dense)
     (58,  12,  10),         # :          med gray    light red
     (42,  15,   8),         # *          light gray  orange
     (35,   1,   2),         # #          white       red
-    (64,   1,   2),         # ─          white       red
+    (102,  1,   2),         # ▒          white       red
 ]
 CHARS_FREQ_DEF = [          # showfreqs  (least → most dense)
     (32,   0,   0),         # space      black       black
@@ -202,7 +205,7 @@ CHARS_CAMERA_DEF = [        # camera — 10 density levels for photo-like detail
     (42,   1,   2),         # *          white       red
     (37,   1,   2),         # %          white       red
     (35,   1,   2),         # #          white       red
-    (64,   1,   2),         # ─          white       red
+    (102,  1,   2),         # ▒          white       red
 ]
 CHARS      = [t[0] for t in CHARS_DEF]
 CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]

@@ -2646,65 +2646,18 @@ def main():
 
     playback_start = time.time()
 
-    def _switch_viz_mode(new_viz):
-        nonlocal ffmpeg_proc, sid_fifo_proc, yt_viz_proc, procs
-        nonlocal _ext_defs, _ext_wlut, _ext_flut
-        global VIZ_MODE
-        sys.stdout.write(f"\r\n[*] Switching viz: {VIZ_LABELS.get(VIZ_MODE, VIZ_MODE)}"
-                         f" -> {VIZ_LABELS.get(new_viz, new_viz)}\r\n")
-        sys.stdout.flush()
-
-        # Stop old ffmpeg viz process
-        old_ffmpeg = ffmpeg_proc
+    def _kill_proc(p):
+        """SIGKILL a process immediately and reap it so fds are released."""
+        if p is None:
+            return
         try:
-            old_ffmpeg.terminate()
-            old_ffmpeg.wait(timeout=1.5)
+            p.kill()
         except Exception:
-            try: old_ffmpeg.kill()
-            except: pass
-
-        VIZ_MODE = new_viz
-
-        # Update character/color LUTs for the new mode
-        _ext_defs = {
-            "showwaves":    CHARS_DEF,
-            "showfreqs":    CHARS_FREQ_DEF,
-            "avectorscope": CHARS_SCOPE_DEF,
-            "showspectrum": CHARS_SPECTRUM_DEF,
-        }.get(VIZ_MODE, CHARS_HIST_DEF)
-        _ext_wlut, _ext_flut = _build_color_luts(_ext_defs)
-
-        if mode == "sid":
-            # FIFO is 1:1 — kill sidplayfp (which owns the write end) and restart both
-            old_sid = sid_fifo_proc
-            if old_sid:
-                try:
-                    old_sid.terminate()
-                    old_sid.wait(timeout=1.5)
-                except Exception:
-                    try: old_sid.kill()
-                    except: pass
-            make_fifo(FIFO_PATH)
-            ffmpeg_proc   = start_ffmpeg_waveform_fifo(realtime=True, height=_DISP_HEIGHT)
-            time.sleep(0.3)
-            sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
-            procs = [p for p in procs if p not in (old_ffmpeg, old_sid)] + [ffmpeg_proc, sid_fifo_proc]
-        elif mode == "stream":
-            old_yt = yt_viz_proc
-            if old_yt:
-                try:
-                    old_yt.terminate()
-                    old_yt.wait(timeout=1.5)
-                except Exception:
-                    try: old_yt.kill()
-                    except: pass
-            yt_viz_proc, ffmpeg_proc = start_ffmpeg_waveform_stream(stream_url, height=_DISP_HEIGHT)
-            procs = [p for p in procs if p not in (old_ffmpeg, old_yt)] + [yt_viz_proc, ffmpeg_proc]
-        else:
-            # File mode: seek to approximate playback position
-            elapsed = time.time() - playback_start
-            ffmpeg_proc = start_ffmpeg_waveform_file(filepath, height=_DISP_HEIGHT, seek_secs=elapsed)
-            procs = [p for p in procs if p is not old_ffmpeg] + [ffmpeg_proc]
+            pass
+        try:
+            p.wait(timeout=2.0)
+        except Exception:
+            pass
 
     frame_size     = WIDTH * _DISP_HEIGHT
     sid_end_time   = (time.time() + sid_duration_secs) if mode == "sid" and sid_duration_secs else None
@@ -2736,7 +2689,59 @@ def main():
                 new_viz = state["viz_pending"]
                 state["viz_pending"] = None
                 if new_viz != VIZ_MODE:
-                    _switch_viz_mode(new_viz)
+                    sys.stdout.write(
+                        f"\r\n[*] Switching viz: {VIZ_LABELS.get(VIZ_MODE, VIZ_MODE)}"
+                        f" -> {VIZ_LABELS.get(new_viz, new_viz)}\r\n")
+                    sys.stdout.flush()
+
+                    # Kill old waveform ffmpeg immediately and wait for fd release
+                    _old_ffmpeg = ffmpeg_proc
+                    _kill_proc(_old_ffmpeg)
+                    try: _old_ffmpeg.stdout.close()
+                    except: pass
+
+                    VIZ_MODE = new_viz
+
+                    # Rebuild LUTs for the new mode
+                    _ext_defs = {
+                        "showwaves":    CHARS_DEF,
+                        "showfreqs":    CHARS_FREQ_DEF,
+                        "avectorscope": CHARS_SCOPE_DEF,
+                        "showspectrum": CHARS_SPECTRUM_DEF,
+                    }.get(VIZ_MODE, CHARS_HIST_DEF)
+                    _ext_wlut, _ext_flut = _build_color_luts(_ext_defs)
+
+                    if mode == "sid":
+                        # FIFO is 1:1 — kill sidplayfp writer, recreate FIFO, restart both
+                        _old_sid = sid_fifo_proc
+                        _kill_proc(_old_sid)
+                        make_fifo(FIFO_PATH)
+                        ffmpeg_proc   = start_ffmpeg_waveform_fifo(realtime=True, height=_DISP_HEIGHT)
+                        time.sleep(0.3)
+                        sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
+                        procs = [p for p in procs
+                                 if p not in (_old_ffmpeg, _old_sid)] + [ffmpeg_proc, sid_fifo_proc]
+                    elif mode == "stream":
+                        _old_yt = yt_viz_proc
+                        _kill_proc(_old_yt)
+                        yt_viz_proc, ffmpeg_proc = start_ffmpeg_waveform_stream(
+                            stream_url, height=_DISP_HEIGHT)
+                        procs = [p for p in procs
+                                 if p not in (_old_ffmpeg, _old_yt)] + [yt_viz_proc, ffmpeg_proc]
+                    else:
+                        # File/MP3: seek to approximate playback position
+                        _elapsed = time.time() - playback_start
+                        ffmpeg_proc = start_ffmpeg_waveform_file(
+                            filepath, height=_DISP_HEIGHT, seek_secs=_elapsed)
+                        procs = [p for p in procs
+                                 if p is not _old_ffmpeg] + [ffmpeg_proc]
+
+                    # Verify new ffmpeg started (give it a moment)
+                    time.sleep(0.1)
+                    if ffmpeg_proc.poll() is not None:
+                        err = ffmpeg_proc.stderr.read(512).decode(errors="replace").strip()
+                        sys.stdout.write(f"\r\n[!] New ffmpeg exited immediately: {err}\r\n")
+                        sys.stdout.flush()
 
             # Check if data available before blocking read (allows q to work)
             ready, _, _ = _select.select([ffmpeg_proc.stdout], [], [], 0.5)

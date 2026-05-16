@@ -2566,10 +2566,20 @@ def main():
     _ext_scr     = 0x0450               # screen RAM rows 2-7
     _ext_col     = 0xD850               # color RAM rows 2-7
 
-    def _ext_top_colors(cmode):
+    # Build per-character color LUTs for the extended rows (mirrors write_color_tables defs).
+    _ext_defs = {
+        "showwaves": CHARS_DEF, "showfreqs": CHARS_FREQ_DEF,
+        "avectorscope": CHARS_SCOPE_DEF, "showspectrum": CHARS_SPECTRUM_DEF,
+    }.get(VIZ_MODE, CHARS_HIST_DEF)
+    _ext_wlut, _ext_flut = _build_color_luts(_ext_defs)
+
+    def _ext_top_colors(cmode, screen=None):
         if cmode == 0:
             return bytes(RAINBOW_TAB[col] for _ in range(_EXT_ROWS) for col in range(WIDTH))
-        return [1 if cmode == 1 else 8] * (_EXT_ROWS * WIDTH)
+        lut, default = (_ext_wlut, 1) if cmode == 1 else (_ext_flut, 8)
+        if screen is None:
+            return [default] * (_EXT_ROWS * WIDTH)
+        return bytes(lut.get(sc, default) for sc in screen)
 
     # Initialize rows 2-7 with spaces and set color RAM (3× for SRAM reliability)
     write_mem(_ext_scr, [0x20] * (_EXT_ROWS * WIDTH))
@@ -2669,7 +2679,7 @@ def main():
                 bot_screen = bytes(pixel_to_char(p) for p in bot_raw)
 
             write_mem(_ext_scr, top_screen)
-            write_mem(_ext_col, _ext_top_colors(state["cam_color"]))
+            write_mem(_ext_col, _ext_top_colors(state["cam_color"], top_screen))
             write_mem(FRAME_BUF, bot_screen)
             write_byte(FRAME_FLAG, 1)
 

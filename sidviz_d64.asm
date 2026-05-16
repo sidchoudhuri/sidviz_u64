@@ -67,16 +67,16 @@ SETNAM      = $ffbd
 SETLFS      = $ffba
 KLOAD       = $ffd5
 
-META_INIT   = $09b0
-META_PLAY   = $09b2
-META_FCOUNT = $09b4
-META_FPSDIV = $09b6
-META_NAMLEN = $09b7
-META_NAME   = $09b8     ; 8 bytes PETSCII filename
-TRAM_INIT   = $09c0     ; Python writes: $4C lo hi
-TRAM_PLAY   = $09c3     ; Python writes: $4C lo hi
-FDAT_PAGE_ADDR = $09c6
-FRAME_IDX   = $09c7
+META_INIT   = $09c0
+META_PLAY   = $09c2
+META_FCOUNT = $09c4
+META_FPSDIV = $09c6
+META_NAMLEN = $09c7
+META_NAME   = $09c8     ; 8 bytes PETSCII filename
+TRAM_INIT   = $09d0     ; Python writes: $4C lo hi
+TRAM_PLAY   = $09d3     ; Python writes: $4C lo hi
+FDAT_PAGE_ADDR = $09d6
+FRAME_IDX   = $09d7
 
 ; ---------------------------------------------------------------------------
 ; BASIC stub: 10 SYS 2064
@@ -98,6 +98,12 @@ next_line
 
 init:
         sei
+
+        ; disable BASIC ROM ($A000-$BFFF → RAM) while keeping KERNAL+I/O
+        ; $01 bits: 0=LORAM 1=HIRAM 2=CHAREN  ($36 = LORAM off, HIRAM+CHAREN on)
+        lda #$36
+        sta $01
+
         lda #$00
         sta border
         sta bgcol
@@ -397,4 +403,4 @@ inc_dst_rts:
 ; Pad so that metadata lands at $09B0
 ; ---------------------------------------------------------------------------
 
-        .fill $09b0 - *, $00
+        .fill $09c0 - *, $00

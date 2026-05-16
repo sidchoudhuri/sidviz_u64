@@ -1338,25 +1338,86 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", duration=None):
             "-f", "rawvideo", "-pix_fmt", "gray",
             "-r", str(actual_fps), "pipe:1",
         ]
-        print("[d64] Generating frames (this may take a while)...")
+        # ── C64 RAM budget ────────────────────────────────────────────────────
+        # The player PRG is loaded entirely into C64 RAM ($0801-$CFFF).
+        # Frame data must also land above the SID's own load range, because
+        # KERNAL LOAD of SIDDATA overwrites whatever is in that range.
+        #
+        # PRG layout:
+        #   [player binary  449 bytes  $0801-$09BF]
+        #   [metadata       16 bytes   $09C0-$09CF]
+        #   [TRAM_INIT       3 bytes   $09D0-$09D2]
+        #   [TRAM_PLAY       3 bytes   $09D3-$09D5]
+        #   [fdat_page       1 byte    $09D6      ]
+        #   [frame index  2*N bytes   $09D7-...  ]
+        #   [pad to page boundary                ]
+        #   [compressed frames  (must end < $D000)]
+
+        FRAME_IDX_C64  = 0x09D7   # C64 addr where frame index starts
+        IDX_FILE_OFF   = 472      # same expressed as file byte offset
+        MAX_C64_END    = 0xD000   # exclusive — stop before I/O at $D000
+
+        sid_load  = psid["load_addr"]
+        sid_end   = sid_load + len(psid["data"])
+        sid_end_page = (sid_end + 255) >> 8   # first page fully above SID
+
+        if sid_load < FRAME_IDX_C64 < sid_end:
+            print(f"[!] Warning: SID occupies ${sid_load:04X}-${sid_end-1:04X} "
+                  f"which overlaps the frame-index area — playback may be garbled")
+
+        # Frame data base = max(page after index, first page above SID)
+        # Computed per-iteration during capture as frame_count grows.
+        def _fdat_c64(n_frames):
+            """Return the page-aligned C64 address where frame data would start
+            if we have n_frames (each index entry = 2 bytes)."""
+            after_idx = FRAME_IDX_C64 + n_frames * 2
+            page = max((after_idx + 255) >> 8, sid_end_page)
+            return page << 8
+
+        # Pre-flight: how much space is available for frame data at all?
+        min_fdat_start = _fdat_c64(0)   # best case: 0 frames, so smallest idx
+        available_bytes = MAX_C64_END - min_fdat_start
+        if available_bytes <= 0:
+            print(f"[!] SID loads too high (${sid_load:04X}-${sid_end-1:04X}) — "
+                  f"no room for frame data below I/O ($D000)")
+            return False
+        print(f"[d64] SID range: ${sid_load:04X}-${sid_end-1:04X}  "
+              f"frame data starts at ${min_fdat_start:04X}+  "
+              f"budget ≤{available_bytes//1024}KB")
+
+        print("[d64] Generating frames (stopping when C64 RAM fills)...")
         ff = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE,
                               stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # ── read + compress frames ────────────────────────────────────────────
+        # ── read + compress frames — stop at C64 RAM limit ───────────────────
         compressed_frames = []
+        running_compressed = 0
         frame_num = 0
+        ram_capped = False
         while True:
             raw = ff.stdout.read(frame_size)
             if len(raw) < frame_size:
                 break
             screen_codes = bytes(pixel_to_char(p, chars) for p in raw)
-            compressed_frames.append(_rle_compress(screen_codes))
+            c_frame = _rle_compress(screen_codes)
+
+            # Would adding this frame push frame data end past $D000?
+            n_after = len(compressed_frames) + 1
+            fdat_start = _fdat_c64(n_after)
+            fdat_end   = fdat_start + running_compressed + len(c_frame)
+            if fdat_end >= MAX_C64_END:
+                ram_capped = True
+                break
+
+            compressed_frames.append(c_frame)
+            running_compressed += len(c_frame)
             frame_num += 1
             if frame_num % 50 == 0:
-                ratio = sum(len(f) for f in compressed_frames) / (frame_num * frame_size)
+                ratio = running_compressed / (frame_num * frame_size)
                 print(f"\r[d64] Frames: {frame_num}  "
-                      f"Compressed: {sum(len(f) for f in compressed_frames)//1024}KB  "
+                      f"Compressed: {running_compressed//1024}KB  "
                       f"Ratio: {ratio:.0%}", end="", flush=True)
+
         ff.stdout.close()
         ff.wait()
         print()
@@ -1366,127 +1427,93 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", duration=None):
             return False
 
         frame_count = len(compressed_frames)
-        total_compressed = sum(len(f) for f in compressed_frames)
+        total_compressed = running_compressed
         avg_frame = total_compressed // frame_count
-        print(f"[d64] Captured {frame_count} frames  "
-              f"Total: {total_compressed//1024}KB  "
+        loop_secs = frame_count / actual_fps
+        if ram_capped:
+            print(f"[d64] C64 RAM full — captured {frame_count} frames "
+                  f"({loop_secs:.0f}s loop @ {actual_fps}fps)  "
+                  f"Visualization will loop every {loop_secs:.0f}s")
+        else:
+            print(f"[d64] Captured {frame_count} frames ({loop_secs:.0f}s)")
+        print(f"[d64] Compressed: {total_compressed//1024}KB  "
               f"Avg/frame: {avg_frame}B  "
               f"(uncompressed: {frame_count*frame_size//1024}KB)")
 
         # ── build player PRG ─────────────────────────────────────────────────
-        #
-        # Layout:
-        #   [player binary  433 bytes  $0801-$09AF]
-        #   [metadata       16 bytes   $09B0-$09BF]
-        #   [TRAM_INIT       3 bytes   $09C0-$09C2]
-        #   [TRAM_PLAY       3 bytes   $09C3-$09C5]
-        #   [fdat_page       1 byte    $09C6      ]
-        #   [frame index  2*N bytes   $09C7-...  ]
-        #   [pad to page boundary                ]
-        #   [compressed frames                   ]
-        #
-        # fdat_page: high byte of frame-data base C64 address.
-        # Frame data must start on a page boundary (base low = $00).
-        # Python pads the frame-index area with zeros to reach the next page.
-
         player_bin = bytearray(open(player_prg, "rb").read())
-        # player_bin is 433 bytes (2-byte load-addr header + 431 bytes code)
 
-        # SIDDATA filename on disk (must match what player loads)
-        sid_disk_name = "SIDDATA"
-        sid_name_petscii = sid_disk_name.upper().encode("ascii")[:8]
+        sid_disk_name    = "SIDDATA"
+        sid_name_petscii = sid_disk_name.encode("ascii")[:8]
         sid_name_petscii = sid_name_petscii + b"\xa0" * (8 - len(sid_name_petscii))
 
         init_addr = psid["init_addr"]
         play_addr = psid["play_addr"]
 
-        # Metadata (16 bytes at file offset 433 → C64 addr $09B0)
+        # Metadata (16 bytes → $09C0-$09CF)
         meta = bytearray(16)
-        meta[0] = init_addr & 0xFF
-        meta[1] = (init_addr >> 8) & 0xFF
-        meta[2] = play_addr & 0xFF
-        meta[3] = (play_addr >> 8) & 0xFF
-        meta[4] = frame_count & 0xFF
-        meta[5] = (frame_count >> 8) & 0xFF
-        meta[6] = fps_div
-        meta[7] = len(sid_disk_name)
+        meta[0]  = init_addr & 0xFF
+        meta[1]  = (init_addr >> 8) & 0xFF
+        meta[2]  = play_addr & 0xFF
+        meta[3]  = (play_addr >> 8) & 0xFF
+        meta[4]  = frame_count & 0xFF
+        meta[5]  = (frame_count >> 8) & 0xFF
+        meta[6]  = fps_div
+        meta[7]  = len(sid_disk_name)
         meta[8:16] = sid_name_petscii
 
-        # Trampolines (6 bytes at $09C0-$09C5)
         tram_init = bytes([0x4C, init_addr & 0xFF, (init_addr >> 8) & 0xFF])
         tram_play = bytes([0x4C, play_addr & 0xFF, (play_addr >> 8) & 0xFF])
 
-        # Frame index (2 bytes per frame: LE byte-offset from frame-data base)
-        # We'll compute offsets after determining frame-data base addr.
-        # First, figure out where frame data will start in the C64 addr space.
-        #
-        # File structure so far:
-        #   433 + 16 + 3 + 3 + 1 = 456 bytes before frame index
-        # Frame index: 2 * frame_count bytes
-        # Frame data start file offset = 456 + 2*frame_count + padding
-        # C64 addr of that file offset = 0x0801 + (file_offset - 2)
-        # Pad until C64 addr is a multiple of 256 (page boundary).
-
-        IDX_FILE_OFFSET = 456  # file byte where frame index starts
-        idx_size = 2 * frame_count
-        raw_fdat_file = IDX_FILE_OFFSET + idx_size
-        # C64 addr of raw_fdat_file:
-        raw_fdat_c64 = 0x0801 + (raw_fdat_file - 2)
-        # Padding to next page boundary:
-        pad = (256 - raw_fdat_c64 % 256) % 256
-        fdat_file_offset = raw_fdat_file + pad
-        fdat_c64_addr = raw_fdat_c64 + pad
-        assert fdat_c64_addr % 256 == 0, "frame data not page-aligned!"
+        # Compute exact frame data base address
+        fdat_c64_addr = _fdat_c64(frame_count)
         fdat_page_val = fdat_c64_addr >> 8
 
-        # Frame index: compute cumulative offsets
+        # Padding from end of frame index to fdat_c64_addr
+        idx_end_c64 = FRAME_IDX_C64 + frame_count * 2
+        pad = fdat_c64_addr - idx_end_c64
+        assert pad >= 0 and fdat_c64_addr % 256 == 0
+
+        # Frame index: 2-byte LE offsets from fdat_c64_addr (all fit in uint16
+        # because total_compressed ≤ MAX_C64_END − fdat_c64_addr < 53248 < 65536)
         frame_index = bytearray()
         offset = 0
         for f in compressed_frames:
             frame_index += _struct.pack("<H", offset)
             offset += len(f)
 
-        # Padding bytes (zeros, part of unused frame index area)
-        index_padding = bytes(pad)
-
-        # Compressed frame data (concatenated)
         frame_data = b"".join(compressed_frames)
 
-        # Assemble final player PRG
         prg_data = (
-            player_bin          # 433 bytes: 2-byte header + code
-            + meta              # 16 bytes
-            + tram_init         # 3 bytes
-            + tram_play         # 3 bytes
-            + bytes([fdat_page_val])  # 1 byte ($09C6)
-            + frame_index       # 2 * frame_count bytes
-            + index_padding     # pad to page boundary
-            + frame_data        # compressed frames
+            player_bin               # 449 bytes: 2-byte header + code to $09BF
+            + meta                   # 16 bytes  ($09C0-$09CF)
+            + tram_init              # 3 bytes   ($09D0-$09D2)
+            + tram_play              # 3 bytes   ($09D3-$09D5)
+            + bytes([fdat_page_val]) # 1 byte    ($09D6)
+            + frame_index            # 2*N bytes ($09D7-...)
+            + bytes(pad)             # pad to page boundary
+            + frame_data             # compressed frames
         )
 
-        player_kb = len(prg_data) / 1024
-        print(f"[d64] Player PRG: {len(prg_data)} bytes ({player_kb:.1f} KB)  "
-              f"Frame data at C64 ${fdat_c64_addr:04X}  page ${fdat_page_val:02X}")
+        prg_end_c64 = 0x0801 + len(prg_data) - 2
+        print(f"[d64] Player PRG: {len(prg_data)//1024}KB  "
+              f"Frame data: ${fdat_c64_addr:04X}-${prg_end_c64:04X}  "
+              f"(page ${fdat_page_val:02X})")
 
         # ── build SIDDATA PRG ─────────────────────────────────────────────────
-        # Format: 2-byte LE load address + SID binary
-        sid_prg = (
-            _struct.pack("<H", psid["load_addr"])
-            + psid["data"]
-        )
+        sid_prg = _struct.pack("<H", psid["load_addr"]) + psid["data"]
         print(f"[d64] SIDDATA: {len(sid_prg)} bytes  "
-              f"(load ${psid['load_addr']:04X}  "
+              f"load ${psid['load_addr']:04X}  "
               f"init ${psid['init_addr']:04X}  "
-              f"play ${psid['play_addr']:04X})")
+              f"play ${psid['play_addr']:04X}")
 
-        # ── capacity check ────────────────────────────────────────────────────
+        # ── D64 capacity check ────────────────────────────────────────────────
         total_bytes = len(prg_data) + len(sid_prg)
-        D64_CAPACITY = 664 * 254  # 664 usable sectors × 254 bytes each
+        D64_CAPACITY = 664 * 254
         if total_bytes > D64_CAPACITY:
-            overage = total_bytes - D64_CAPACITY
-            print(f"[!] Data too large for D64: {total_bytes//1024}KB "
-                  f"({overage//1024}KB over {D64_CAPACITY//1024}KB capacity)")
-            print(f"[!] Try: --d64-fps 5  or  --d64-duration <shorter>")
+            print(f"[!] Data ({total_bytes//1024}KB) exceeds D64 capacity "
+                  f"({D64_CAPACITY//1024}KB) — this shouldn't happen; "
+                  f"C64 RAM limit should have caught this first")
             return False
 
         # ── create D64 image ──────────────────────────────────────────────────

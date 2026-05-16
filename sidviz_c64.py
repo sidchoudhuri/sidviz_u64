@@ -214,6 +214,14 @@ SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
 VIZ_MODE     = "showwaves"
+VIZ_ORDER    = ["showwaves", "showfreqs", "avectorscope", "showspectrum", "ahistogram"]
+VIZ_LABELS   = {
+    "showwaves":    "waveform",
+    "showfreqs":    "spectrum",
+    "avectorscope": "scope",
+    "showspectrum": "spectrogram",
+    "ahistogram":   "histogram",
+}
 
 # ---------------------------------------------------------------------------
 # Args
@@ -773,12 +781,13 @@ def start_ffmpeg_waveform_fifo(realtime=False, height=HEIGHT):
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     print("[*] ffmpeg waveform (FIFO) started."); return p
 
-def start_ffmpeg_waveform_file(filepath, height=HEIGHT):
+def start_ffmpeg_waveform_file(filepath, height=HEIGHT, seek_secs=0.0):
     # -re: read at 1x (native) speed so viz stays synchronized with real-time
     # audio playback.  Without it ffmpeg races through the whole file in seconds,
     # last_viz_frame ends up at the end-of-song (silent) frame, then ffmpeg exits
     # and the blend drops to camera-only.
-    cmd = ["ffmpeg", "-loglevel", "quiet", "-re",
+    seek_flags = ["-ss", str(int(seek_secs))] if seek_secs > 0.5 else []
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-re"] + seek_flags + [
            "-i", filepath,
            "-filter_complex", _build_viz_filter(height),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
@@ -1018,6 +1027,18 @@ def make_keypress_listener(state):
                     state["viz_color"]     = (state["viz_color"] + 1) % 3
                     label = ["rainbow", "white", "fire"][state["viz_color"]]
                     sys.stdout.write(f"\r\n[*] Viz color -> {label}\r\n")
+                    sys.stdout.flush()
+                elif ch in ("w", "W"):
+                    cur = VIZ_MODE
+                    idx = VIZ_ORDER.index(cur) if cur in VIZ_ORDER else 0
+                    new_mode = VIZ_ORDER[(idx + 1) % len(VIZ_ORDER)]
+                    state["viz_pending"] = new_mode
+                    sys.stdout.write(f"\r\n[*] Viz -> {VIZ_LABELS.get(new_mode, new_mode)}\r\n")
+                    sys.stdout.flush()
+                elif ch in ("1", "2", "3", "4", "5"):
+                    new_mode = VIZ_ORDER[int(ch) - 1]
+                    state["viz_pending"] = new_mode
+                    sys.stdout.write(f"\r\n[*] Viz -> {VIZ_LABELS.get(new_mode, new_mode)}\r\n")
                     sys.stdout.flush()
                 elif ch in ("q", "Q", "\x03"):
                     state["quit"] = True
@@ -2588,6 +2609,8 @@ def main():
         time.sleep(0.05)
 
     # Start audio/waveform processes
+    sid_fifo_proc = None
+    yt_viz_proc   = None
     if mode == "sid":
         make_fifo(FIFO_PATH)
         if c64_audio:
@@ -2621,14 +2644,77 @@ def main():
         ffplay_proc = start_ffplay_audio(filepath)
         procs = [ffplay_proc, ffmpeg_proc]
 
-    frame_size   = WIDTH * _DISP_HEIGHT
-    sid_end_time = (time.time() + sid_duration_secs) if mode == "sid" and sid_duration_secs else None
-    state        = {"cam_color": color_mode_init, "viz_color": 2, "color_pending": False, "quit": False}
-    kthread      = make_keypress_listener(state)
+    playback_start = time.time()
+
+    def _switch_viz_mode(new_viz):
+        nonlocal ffmpeg_proc, sid_fifo_proc, yt_viz_proc, procs
+        nonlocal _ext_defs, _ext_wlut, _ext_flut
+        global VIZ_MODE
+        sys.stdout.write(f"\r\n[*] Switching viz: {VIZ_LABELS.get(VIZ_MODE, VIZ_MODE)}"
+                         f" -> {VIZ_LABELS.get(new_viz, new_viz)}\r\n")
+        sys.stdout.flush()
+
+        # Stop old ffmpeg viz process
+        old_ffmpeg = ffmpeg_proc
+        try:
+            old_ffmpeg.terminate()
+            old_ffmpeg.wait(timeout=1.5)
+        except Exception:
+            try: old_ffmpeg.kill()
+            except: pass
+
+        VIZ_MODE = new_viz
+
+        # Update character/color LUTs for the new mode
+        _ext_defs = {
+            "showwaves":    CHARS_DEF,
+            "showfreqs":    CHARS_FREQ_DEF,
+            "avectorscope": CHARS_SCOPE_DEF,
+            "showspectrum": CHARS_SPECTRUM_DEF,
+        }.get(VIZ_MODE, CHARS_HIST_DEF)
+        _ext_wlut, _ext_flut = _build_color_luts(_ext_defs)
+
+        if mode == "sid":
+            # FIFO is 1:1 — kill sidplayfp (which owns the write end) and restart both
+            old_sid = sid_fifo_proc
+            if old_sid:
+                try:
+                    old_sid.terminate()
+                    old_sid.wait(timeout=1.5)
+                except Exception:
+                    try: old_sid.kill()
+                    except: pass
+            make_fifo(FIFO_PATH)
+            ffmpeg_proc   = start_ffmpeg_waveform_fifo(realtime=True, height=_DISP_HEIGHT)
+            time.sleep(0.3)
+            sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
+            procs = [p for p in procs if p not in (old_ffmpeg, old_sid)] + [ffmpeg_proc, sid_fifo_proc]
+        elif mode == "stream":
+            old_yt = yt_viz_proc
+            if old_yt:
+                try:
+                    old_yt.terminate()
+                    old_yt.wait(timeout=1.5)
+                except Exception:
+                    try: old_yt.kill()
+                    except: pass
+            yt_viz_proc, ffmpeg_proc = start_ffmpeg_waveform_stream(stream_url, height=_DISP_HEIGHT)
+            procs = [p for p in procs if p not in (old_ffmpeg, old_yt)] + [yt_viz_proc, ffmpeg_proc]
+        else:
+            # File mode: seek to approximate playback position
+            elapsed = time.time() - playback_start
+            ffmpeg_proc = start_ffmpeg_waveform_file(filepath, height=_DISP_HEIGHT, seek_secs=elapsed)
+            procs = [p for p in procs if p is not old_ffmpeg] + [ffmpeg_proc]
+
+    frame_size     = WIDTH * _DISP_HEIGHT
+    sid_end_time   = (time.time() + sid_duration_secs) if mode == "sid" and sid_duration_secs else None
+    state          = {"cam_color": color_mode_init, "viz_color": 2,
+                      "color_pending": False, "viz_pending": None, "quit": False}
+    kthread        = make_keypress_listener(state)
     kthread.start()
 
     frame_num = 0
-    print(f"[*] Streaming to C64 at {FPS}fps -- [c] color, [q] quit\n")
+    print(f"[*] Streaming to C64 at {FPS}fps -- [c] color, [w] viz, [1-5] viz direct, [q] quit\n")
 
     try:
         while not state["quit"]:
@@ -2645,6 +2731,12 @@ def main():
                 state["color_pending"] = False
                 write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
                 write_mem(_ext_col, _ext_top_colors(state["cam_color"]))
+
+            if state["viz_pending"] is not None:
+                new_viz = state["viz_pending"]
+                state["viz_pending"] = None
+                if new_viz != VIZ_MODE:
+                    _switch_viz_mode(new_viz)
 
             # Check if data available before blocking read (allows q to work)
             ready, _, _ = _select.select([ffmpeg_proc.stdout], [], [], 0.5)
@@ -2684,8 +2776,9 @@ def main():
             write_byte(FRAME_FLAG, 1)
 
             frame_num += 1
-            ind = ["R","W","F"][state["cam_color"]]
-            print(f"\r[*] Frame {frame_num:05d} [{ind}]", end="", flush=True)
+            ind  = ["R","W","F"][state["cam_color"]]
+            vind = VIZ_LABELS.get(VIZ_MODE, VIZ_MODE)[:3].upper()
+            print(f"\r[*] Frame {frame_num:05d} [{ind}|{vind}]", end="", flush=True)
 
     except KeyboardInterrupt:
         print("\r\n[*] Interrupted.")

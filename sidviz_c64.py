@@ -28,8 +28,8 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.9.1"
-BUILD   = "2026-05-11"
+VERSION = "1.9.5"
+BUILD   = "2026-05-16"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, termios, tty, re, json, select as _select, struct, queue
@@ -1307,22 +1307,24 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, dur
 
         # ── generate waveform frames via ffmpeg ──────────────────────────────
         viz_filters = {
+            # mode=fill draws from zero to the waveform tip (bar style) — far
+            # more pixels lit than mode=line's single-pixel trace.
             "showwaves":
-                f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=line:scale=sqrt"
+                f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=fill"
                 f":rate={actual_fps}:colors=#ffffff,format=gray",
             "showfreqs":
                 f"[0:a]showfreqs=s={WIDTH}x{HEIGHT}:mode=bar"
                 f":ascale=log:fscale=log:colors=#ffffff,format=gray",
             "avectorscope":
                 (f"[0:a]aformat=channel_layouts=mono,asplit=2[La][Ra];"
-                 f"[Ra]adelay=2[Rd];[La][Rd]amerge=inputs=2[S];"
-                 f"[S]avectorscope=s={WIDTH}x{HEIGHT}:zoom=1.8:draw=dot"
-                 f":scale=log,format=gray"),
+                 f"[Ra]adelay=50[Rd];[La][Rd]amerge=inputs=2[S];"
+                 f"[S]avectorscope=s={WIDTH}x{HEIGHT}:zoom=1.5:draw=line"
+                 f":scale=sqrt,format=gray"),
             "showspectrum":
                 f"[0:a]showspectrum=s={WIDTH}x{HEIGHT}:slide=scroll"
-                f":scale=log:color=intensity,format=gray",
+                f":scale=sqrt:color=intensity,format=gray",
             "ahistogram":
-                f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=log:slide=scroll"
+                f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=sqrt:slide=scroll"
                 f",format=gray",
         }
         filt = viz_filters.get(viz, viz_filters["showwaves"])
@@ -1362,6 +1364,16 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, dur
         sid_load  = psid["load_addr"]
         sid_end   = sid_load + len(psid["data"])
         sid_end_page = (sid_end + 255) >> 8   # first page fully above SID
+
+        # Player code lives at $0810-$09CF.  If the SID loads into that range,
+        # KERNAL LOAD of SIDDATA will overwrite the running player → crash.
+        PLAYER_CODE_START = 0x0810
+        PLAYER_CODE_END   = 0x09D0  # exclusive
+        if sid_load < PLAYER_CODE_END and sid_end > PLAYER_CODE_START:
+            print(f"[!] Error: SID loads at ${sid_load:04X}-${sid_end-1:04X}, "
+                  f"which overlaps the player code at $0810-$09CF.")
+            print(f"[!] This SID cannot be played from a D64 image.")
+            return False
 
         if sid_load < FRAME_IDX_C64 < sid_end:
             print(f"[!] Warning: SID occupies ${sid_load:04X}-${sid_end-1:04X} "

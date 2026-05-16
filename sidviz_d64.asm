@@ -1,7 +1,7 @@
 ; sidviz_d64.asm — standalone D64 player
 ; 64tass assembler  —  autostart: SYS 2064
 ;
-; v1.9.4 (2026-05-12)
+; v1.9.5 (2026-05-16)
 ;
 ; PRG layout (Python assembles final file by appending after $09AF):
 ;   $0801-$080C  BASIC stub (SYS 2064)
@@ -33,10 +33,13 @@
 ;   $B4      frame_tick      IRQ countdown until next frame
 ;   $B5      new_frame       1 = advance + display next frame (set by IRQ)
 ;   $B6/$B7  cur_lo/cur_hi   current frame number
-;   $B8/$B9  orig_irq_lo/hi  saved $0314/$0315
-;   $BA      scratch
-;   $BB/$BC  fidx_lo/fidx_hi frame-index base pointer
 ;   $BD      fdat_page       high byte of frame-data base addr (low = $00)
+;
+; NOTE: orig_irq is stored inline in irq_chain (self-patched by init) so
+; that a SID play routine using $B8/$B9 cannot corrupt the IRQ chain target.
+; fidx is inlined as immediate values (#<FRAME_IDX / #>FRAME_IDX) and
+; fdat_page is reloaded from FDAT_PAGE_ADDR each frame — both safe from SID
+; ZP collisions.
 
 src_lo      = $b0
 src_hi      = $b1
@@ -46,11 +49,6 @@ frame_tick  = $b4
 new_frame   = $b5
 cur_lo      = $b6
 cur_hi      = $b7
-orig_irq_lo = $b8
-orig_irq_hi = $b9
-scratch     = $ba
-fidx_lo     = $bb
-fidx_hi     = $bc
 fdat_page   = $bd
 
 screen      = $0400
@@ -128,33 +126,13 @@ cls_rm: sta (dst_lo),y  ; last 232 bytes of page $07
         cpy #232
         bne cls_rm
 
-        ; fill color RAM $D800-$DBE7 white (1) — same structure
-        lda #<color_ram
-        sta dst_lo
-        lda #>color_ram
-        sta dst_hi
-        lda #$01
-        ldx #$03
-col_pg: ldy #$00
-col_lp: sta (dst_lo),y
-        iny
-        bne col_lp
-        inc dst_hi
-        dex
-        bne col_pg
-        ldy #$00
-col_rm: sta (dst_lo),y
-        iny
-        cpy #232
-        bne col_rm
-
         ; init new_frame only (other ZP vars clobbered by KERNAL below; re-init after KLOAD)
         lda #$00
         sta new_frame
 
         ; KERNAL LOAD: SIDDATA from disk (SA=1 → loads to file's embedded address)
-        ; NOTE: SETNAM clobbers $B7(FNLEN)=cur_hi, $BB/$BC(FNADR)=fidx_lo/hi
-        ;       SETLFS clobbers $B8(LA)=orig_irq_lo, $B9(SA)=orig_irq_hi
+        ; NOTE: SETNAM clobbers $B7(FNLEN)=cur_hi, $BB/$BC(FNADR)
+        ;       SETLFS clobbers $B8(LA), $B9(SA)
         ;       All are re-initialised after KLOAD below.
         lda META_NAMLEN
         ldx #<META_NAME
@@ -176,19 +154,15 @@ col_rm: sta (dst_lo),y
         sta cur_lo
         sta cur_hi
 
-        lda #<FRAME_IDX
-        sta fidx_lo
-        lda #>FRAME_IDX
-        sta fidx_hi
-
         lda FDAT_PAGE_ADDR
         sta fdat_page
 
-        ; save KERNAL IRQ vector (after KLOAD so $B8/$B9 are free)
+        ; patch IRQ chain with KERNAL's original IRQ vector (before SID init
+        ; changes $0314/$0315).  Stored in code RAM so SID ZP use can't corrupt it.
         lda irq_vec_lo
-        sta orig_irq_lo
+        sta irq_chain+1
         lda irq_vec_hi
-        sta orig_irq_hi
+        sta irq_chain+2
 
         ; call SID init
         jsr TRAM_INIT
@@ -291,7 +265,10 @@ irq_done:
         pla
         tax
         pla
-        jmp (orig_irq_lo)
+; irq_chain is patched by init to: JMP <KERNAL IRQ vector>
+; Stored here in code RAM so that a SID using ZP $B8/$B9 cannot corrupt it.
+irq_chain:
+        .byte $4c, $00, $00
 
 ; ---------------------------------------------------------------------------
 ; decomp_frame
@@ -300,7 +277,13 @@ irq_done:
 ; ---------------------------------------------------------------------------
 
 decomp_frame:
-        ; address of index entry = fidx + cur*2
+        ; Reload fdat_page from its fixed PRG location each frame so that SID
+        ; play routines that use ZP $BD cannot permanently corrupt it.
+        lda FDAT_PAGE_ADDR
+        sta fdat_page
+
+        ; address of index entry = FRAME_IDX + cur*2
+        ; FRAME_IDX is $09E7 — used as immediate so ZP $BB/$BC are not needed
         lda cur_lo
         asl
         pha                 ; save low byte of cur*2
@@ -308,12 +291,12 @@ decomp_frame:
         rol                 ; A = high byte of cur*2
 
         clc
-        adc fidx_hi
+        adc #>FRAME_IDX
         sta src_hi
 
         pla                 ; A = low byte of cur*2
         clc
-        adc fidx_lo
+        adc #<FRAME_IDX
         sta src_lo
         bcc no_idx_carry
         inc src_hi
@@ -324,14 +307,14 @@ no_idx_carry:
         lda (src_lo),y      ; offset_lo
         pha
         ldy #$01
-        lda (src_lo),y      ; offset_hi
-        sta scratch
+        lda (src_lo),y      ; offset_hi — use X as scratch (IRQ saves/restores X)
+        tax
 
         ; frame data ptr = fdat_page:$00 + offset
         ; (Python ensures frame data starts on a page boundary, so base_lo=$00)
         pla
         sta src_lo          ; src_lo = offset_lo  (adds to $00, no carry)
-        lda scratch
+        txa                 ; A = offset_hi
         clc
         adc fdat_page
         sta src_hi

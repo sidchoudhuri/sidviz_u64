@@ -148,27 +148,14 @@ col_rm: sta (dst_lo),y
         cpy #232
         bne col_rm
 
-        ; init ZP
+        ; init new_frame only (other ZP vars clobbered by KERNAL below; re-init after KLOAD)
         lda #$00
-        sta cur_lo
-        sta cur_hi
         sta new_frame
 
-        lda #<FRAME_IDX
-        sta fidx_lo
-        lda #>FRAME_IDX
-        sta fidx_hi
-
-        lda FDAT_PAGE_ADDR
-        sta fdat_page
-
-        ; save KERNAL IRQ before SID init can change it
-        lda irq_vec_lo
-        sta orig_irq_lo
-        lda irq_vec_hi
-        sta orig_irq_hi
-
         ; KERNAL LOAD: SIDDATA from disk (SA=1 → loads to file's embedded address)
+        ; NOTE: SETNAM clobbers $B7(FNLEN)=cur_hi, $BB/$BC(FNADR)=fidx_lo/hi
+        ;       SETLFS clobbers $B8(LA)=orig_irq_lo, $B9(SA)=orig_irq_hi
+        ;       All are re-initialised after KLOAD below.
         lda META_NAMLEN
         ldx #<META_NAME
         ldy #>META_NAME
@@ -183,6 +170,25 @@ col_rm: sta (dst_lo),y
         ldx #$00
         ldy #$00
         jsr KLOAD
+
+        ; re-init ZP vars clobbered by KERNAL file routines
+        lda #$00
+        sta cur_lo
+        sta cur_hi
+
+        lda #<FRAME_IDX
+        sta fidx_lo
+        lda #>FRAME_IDX
+        sta fidx_hi
+
+        lda FDAT_PAGE_ADDR
+        sta fdat_page
+
+        ; save KERNAL IRQ vector (after KLOAD so $B8/$B9 are free)
+        lda irq_vec_lo
+        sta orig_irq_lo
+        lda irq_vec_hi
+        sta orig_irq_hi
 
         ; call SID init
         jsr TRAM_INIT

@@ -67,16 +67,16 @@ SETNAM      = $ffbd
 SETLFS      = $ffba
 KLOAD       = $ffd5
 
-META_INIT   = $09c0
-META_PLAY   = $09c2
-META_FCOUNT = $09c4
-META_FPSDIV = $09c6
-META_NAMLEN = $09c7
-META_NAME   = $09c8     ; 8 bytes PETSCII filename
-TRAM_INIT   = $09d0     ; Python writes: $4C lo hi
-TRAM_PLAY   = $09d3     ; Python writes: $4C lo hi
-FDAT_PAGE_ADDR = $09d6
-FRAME_IDX   = $09d7
+META_INIT   = $09d0
+META_PLAY   = $09d2
+META_FCOUNT = $09d4
+META_FPSDIV = $09d6
+META_NAMLEN = $09d7
+META_NAME   = $09d8     ; 8 bytes PETSCII filename
+TRAM_INIT   = $09e0     ; Python writes: $4C lo hi
+TRAM_PLAY   = $09e3     ; Python writes: $4C lo hi
+FDAT_PAGE_ADDR = $09e6
+FRAME_IDX   = $09e7
 
 ; ---------------------------------------------------------------------------
 ; BASIC stub: 10 SYS 2064
@@ -336,6 +336,26 @@ no_idx_carry:
         adc fdat_page
         sta src_hi
 
+        ; first byte of frame data = C64 color for the waveform area
+        ldy #$00
+        lda (src_lo),y      ; color byte
+        jsr inc_src
+        ; A = color, Y=0; fill color RAM $D940-$DBE7 (680 bytes) for rows 8-24
+        ; Three contiguous segments using ABS,Y — no per-byte boundary check
+        ldy #191            ; $D940+191 = $D9FF (192 bytes: $D940-$D9FF)
+cfill1: sta $d940,y
+        dey
+        bpl cfill1
+        ldy #255            ; $DA00+255 = $DAFF (256 bytes: $DA00-$DAFF)
+cfill2: sta $da00,y
+        dey
+        bpl cfill2
+        ldy #231            ; $DB00+231 = $DBE7 (232 bytes: $DB00-$DBE7)
+cfill3: sta $db00,y
+        dey
+        bpl cfill3
+        ldy #$00            ; restore Y=0 for decompressor
+
         ; destination = wave_scr ($0540)
         lda #<wave_scr
         sta dst_lo
@@ -409,4 +429,4 @@ inc_dst_rts:
 ; Pad so that metadata lands at $09B0
 ; ---------------------------------------------------------------------------
 
-        .fill $09c0 - *, $00
+        .fill $09d0 - *, $00

@@ -271,9 +271,11 @@ def parse_args():
                    help="Frame rate for D64 recording (default 10; 50 must be divisible)")
     p.add_argument("--d64-duration", type=int, default=None, metavar="SECS",
                    help="Capture duration in seconds for D64 (default: auto from SID length)")
-    p.add_argument("--d64-viz",      default="showwaves",
+    p.add_argument("--d64-viz",      default=None,
                    choices=["showwaves","showfreqs","avectorscope","showspectrum","ahistogram"],
-                   help="Visualization type for D64 frames (default: showwaves)")
+                   help="Visualization type for D64 frames (prompt if omitted)")
+    p.add_argument("--d64-color",    default=None, type=int, choices=[0,1,2],
+                   help="Color mode for D64 frames: 0=rainbow 1=white 2=fire (prompt if omitted)")
     return p.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -1240,7 +1242,7 @@ def _rle_compress(data: bytes) -> bytes:
     return bytes(out)
 
 
-def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", duration=None):
+def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, duration=None):
     """
     Generate a bootable D64 disk image from a SID file.
 
@@ -1353,8 +1355,8 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", duration=None):
         #   [pad to page boundary                ]
         #   [compressed frames  (must end < $D000)]
 
-        FRAME_IDX_C64  = 0x09D7   # C64 addr where frame index starts
-        IDX_FILE_OFF   = 472      # same expressed as file byte offset
+        FRAME_IDX_C64  = 0x09E7   # C64 addr where frame index starts
+        IDX_FILE_OFF   = 488      # same expressed as file byte offset
         MAX_C64_END    = 0xD000   # exclusive — stop before I/O at $D000
 
         sid_load  = psid["load_addr"]
@@ -1389,6 +1391,19 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", duration=None):
         ff = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE,
                               stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+        # colour lookup tables for color_mode 1 (white) and 2 (fire)
+        chars_def_map = {
+            "showwaves": CHARS_DEF, "showfreqs": CHARS_FREQ_DEF,
+            "avectorscope": CHARS_SCOPE_DEF, "showspectrum": CHARS_SPECTRUM_DEF,
+            "ahistogram": CHARS_HIST_DEF,
+        }
+        _wlut, _flut = _build_color_luts(chars_def_map.get(viz, CHARS_DEF))
+
+        def _frame_color(frame_idx):
+            if color_mode == 1:   return 1   # white
+            if color_mode == 2:   return 8   # orange (fire)
+            return RAINBOW_TAB[frame_idx % len(RAINBOW_TAB)]  # rainbow
+
         # ── read + compress frames — stop at C64 RAM limit ───────────────────
         compressed_frames = []
         running_compressed = 0
@@ -1399,7 +1414,10 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", duration=None):
             if len(raw) < frame_size:
                 break
             screen_codes = bytes(pixel_to_char(p, chars) for p in raw)
-            c_frame = _rle_compress(screen_codes)
+            color_byte   = _frame_color(frame_num)
+            # color byte is stored raw (1 byte) before the RLE stream;
+            # the player reads it, fills color RAM, then decompresses screen
+            c_frame = bytes([color_byte]) + _rle_compress(screen_codes)
 
             # Would adding this frame push frame data end past $D000?
             n_after = len(compressed_frames) + 1
@@ -1485,14 +1503,14 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", duration=None):
         frame_data = b"".join(compressed_frames)
 
         prg_data = (
-            player_bin               # 449 bytes: 2-byte header + code to $09BF
-            + meta                   # 16 bytes  ($09C0-$09CF)
-            + tram_init              # 3 bytes   ($09D0-$09D2)
-            + tram_play              # 3 bytes   ($09D3-$09D5)
-            + bytes([fdat_page_val]) # 1 byte    ($09D6)
-            + frame_index            # 2*N bytes ($09D7-...)
+            player_bin               # 465 bytes: 2-byte header + code to $09CF
+            + meta                   # 16 bytes  ($09D0-$09DF)
+            + tram_init              # 3 bytes   ($09E0-$09E2)
+            + tram_play              # 3 bytes   ($09E3-$09E5)
+            + bytes([fdat_page_val]) # 1 byte    ($09E6)
+            + frame_index            # 2*N bytes ($09E7-...)
             + bytes(pad)             # pad to page boundary
-            + frame_data             # compressed frames
+            + frame_data             # compressed frames (each: 1-byte color + RLE screen)
         )
 
         prg_end_c64 = 0x0801 + len(prg_data) - 2
@@ -1576,11 +1594,20 @@ def main():
         if not os.path.isfile(sid_path):
             print(f"[!] File not found: {sid_path}")
             sys.exit(1)
+        d64_viz = args.d64_viz
+        if d64_viz is None:
+            ans = input("Visualization? [0=waveform, 1=spectrum, 2=scope, 3=spectrogram, 4=histogram] (default 0): ").strip()
+            d64_viz = {"1":"showfreqs","2":"avectorscope","3":"showspectrum","4":"ahistogram"}.get(ans, "showwaves")
+        d64_color = args.d64_color
+        if d64_color is None:
+            ans = input("Color mode? [0=rainbow, 1=white, 2=fire] (default 0): ").strip()
+            d64_color = int(ans) if ans in ("0","1","2") else 0
         ok = save_to_d64(
             sid_path,
             args.save_d64,
             fps=args.d64_fps,
-            viz=args.d64_viz,
+            viz=d64_viz,
+            color_mode=d64_color,
             duration=args.d64_duration,
         )
         sys.exit(0 if ok else 1)

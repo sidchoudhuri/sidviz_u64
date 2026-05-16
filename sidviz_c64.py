@@ -162,7 +162,7 @@ CHARS_DEF = [               # showwaves  (least → most dense)
     (58,  12,  10),         # :          med gray    light red
     (42,  15,   8),         # *          light gray  orange
     (35,   1,   2),         # #          white       red
-    (102,  1,   2),         # ▒          white       red
+    (160,  1,   2),         # █ solid    white       red
 ]
 CHARS_FREQ_DEF = [          # showfreqs  (least → most dense)
     (32,   0,   0),         # space      black       black
@@ -205,7 +205,7 @@ CHARS_CAMERA_DEF = [        # camera — 10 density levels for photo-like detail
     (42,   1,   2),         # *          white       red
     (37,   1,   2),         # %          white       red
     (35,   1,   2),         # #          white       red
-    (102,  1,   2),         # ▒          white       red
+    (160,  1,   2),         # █ solid    white       red
 ]
 CHARS      = [t[0] for t in CHARS_DEF]
 CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]
@@ -1306,7 +1306,7 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", duration=None):
         # ── generate waveform frames via ffmpeg ──────────────────────────────
         viz_filters = {
             "showwaves":
-                f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
+                f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=line:scale=sqrt"
                 f":rate={actual_fps}:colors=#ffffff,format=gray",
             "showfreqs":
                 f"[0:a]showfreqs=s={WIDTH}x{HEIGHT}:mode=bar"

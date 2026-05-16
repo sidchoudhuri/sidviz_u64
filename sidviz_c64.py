@@ -1521,7 +1521,7 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", duration=None):
         build_d64(
             output_d64,
             [
-                ("*",        prg_data),   # autostart: LOAD"*",8,1
+                ("SIDVIZ",   prg_data),   # autostart: LOAD"*",8,1
                 ("SIDDATA",  sid_prg),    # SID binary with embedded load addr
             ],
             disk_name=sid_base,

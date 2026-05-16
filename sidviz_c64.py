@@ -214,8 +214,9 @@ SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
 VIZ_MODE     = "showwaves"
-VIZ_ORDER    = ["showwaves", "showfreqs", "avectorscope", "showspectrum", "ahistogram"]
+VIZ_ORDER    = ["none", "showwaves", "showfreqs", "avectorscope", "showspectrum", "ahistogram"]
 VIZ_LABELS   = {
+    "none":         "off",
     "showwaves":    "waveform",
     "showfreqs":    "spectrum",
     "avectorscope": "scope",
@@ -1035,8 +1036,12 @@ def make_keypress_listener(state):
                     state["viz_pending"] = new_mode
                     sys.stdout.write(f"\r\n[*] Viz -> {VIZ_LABELS.get(new_mode, new_mode)}\r\n")
                     sys.stdout.flush()
+                elif ch == "0":
+                    state["viz_pending"] = "none"
+                    sys.stdout.write(f"\r\n[*] Viz -> off\r\n")
+                    sys.stdout.flush()
                 elif ch in ("1", "2", "3", "4", "5"):
-                    new_mode = VIZ_ORDER[int(ch) - 1]
+                    new_mode = VIZ_ORDER[int(ch)]  # VIZ_ORDER[0]="none", so 1→showwaves, etc.
                     state["viz_pending"] = new_mode
                     sys.stdout.write(f"\r\n[*] Viz -> {VIZ_LABELS.get(new_mode, new_mode)}\r\n")
                     sys.stdout.flush()
@@ -1675,6 +1680,9 @@ def main():
                 except Exception:
                     break
 
+        _blend_capable = blend_viz_mode is not None  # True if started with blend; never changes
+        VIZ_MODE = blend_viz_mode if blend_viz_mode else "none"  # sync for w-key cycling
+
         state   = {
             "cam_color":     color_mode_init,
             "viz_color":     viz_color_mode_init,
@@ -1695,7 +1703,7 @@ def main():
         frame_num = 0
         blend_tag = f"+{blend_viz_mode}" if blend_viz_mode else ""
         if blend_viz_mode:
-            controls = "[c] cam-color, [v] viz-color, [w] viz, [1-5] viz direct, [q] quit"
+            controls = "[c] cam-color, [v] viz-color, [w/0-5] viz, [q] quit"
         else:
             controls = "[c] color, [q] quit"
         print(f"[*] Camera{blend_tag} streaming to C64 at {FPS}fps\n    {controls}\n")
@@ -1764,58 +1772,70 @@ def main():
                         if cam_ext_rows:
                             write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
 
-                if state["viz_pending"] is not None and viz_ffmpeg_proc is not None:
+                if state["viz_pending"] is not None and _blend_capable:
                     new_viz = state["viz_pending"]
                     state["viz_pending"] = None
-                    if new_viz != blend_viz_mode:
+                    _cur_blend = blend_viz_mode or "none"
+                    if new_viz != _cur_blend:
                         sys.stdout.write(
-                            f"\r\n[*] Switching viz: {VIZ_LABELS.get(blend_viz_mode, blend_viz_mode)}"
+                            f"\r\n[*] Switching viz: {VIZ_LABELS.get(_cur_blend, _cur_blend)}"
                             f" -> {VIZ_LABELS.get(new_viz, new_viz)}\r\n")
                         sys.stdout.flush()
 
-                        _old_viz = viz_ffmpeg_proc
-                        _kill_proc(_old_viz)
-                        try: _old_viz.stdout.close()
-                        except: pass
-                        time.sleep(0.1)  # let _read_viz thread see EOF and exit
+                        if viz_ffmpeg_proc is not None:
+                            _old_viz = viz_ffmpeg_proc
+                            _kill_proc(_old_viz)
+                            try: _old_viz.stdout.close()
+                            except: pass
+                            time.sleep(0.1)  # let _read_viz thread see EOF and exit
 
-                        blend_viz_mode = new_viz
-                        VIZ_MODE = new_viz
-                        _viz_chars_def = {
-                            "showwaves":    CHARS_DEF,
-                            "showfreqs":    CHARS_FREQ_DEF,
-                            "avectorscope": CHARS_SCOPE_DEF,
-                            "showspectrum": CHARS_SPECTRUM_DEF,
-                        }.get(blend_viz_mode, CHARS_HIST_DEF)
-                        _viz_chars = [t[0] for t in _viz_chars_def]
-                        _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
-
-                        if audio_mode == "sid":
-                            _kill_proc(sid_fifo_proc)
-                            make_fifo(FIFO_PATH)
-                            viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(realtime=True, height=cam_height)
-                            VIZ_MODE = "camera"
-                            time.sleep(0.3)
-                            sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
-                        elif audio_mode == "stream":
-                            _kill_proc(yt_viz_proc)
-                            yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(
-                                stream_url, height=cam_height)
-                            VIZ_MODE = "camera"
+                        if new_viz == "none":
+                            viz_ffmpeg_proc = None
+                            blend_viz_mode  = None
+                            VIZ_MODE        = "none"
+                            write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                            if cam_ext_rows:
+                                write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
                         else:
-                            viz_ffmpeg_proc = start_ffmpeg_waveform_file(filepath, height=cam_height)
-                            VIZ_MODE = "camera"
+                            blend_viz_mode = new_viz
+                            VIZ_MODE = new_viz  # _build_viz_filter() reads this; stays set
+                            _viz_chars_def = {
+                                "showwaves":    CHARS_DEF,
+                                "showfreqs":    CHARS_FREQ_DEF,
+                                "avectorscope": CHARS_SCOPE_DEF,
+                                "showspectrum": CHARS_SPECTRUM_DEF,
+                            }.get(blend_viz_mode, CHARS_HIST_DEF)
+                            _viz_chars = [t[0] for t in _viz_chars_def]
+                            _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
 
-                        threading.Thread(target=_read_viz, daemon=True).start()
+                            if audio_mode == "sid":
+                                _kill_proc(sid_fifo_proc)
+                                make_fifo(FIFO_PATH)
+                                viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(
+                                    realtime=True, height=cam_height)
+                                time.sleep(0.3)
+                                sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
+                            elif audio_mode == "stream":
+                                _kill_proc(yt_viz_proc)
+                                yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(
+                                    stream_url, height=cam_height)
+                            else:
+                                viz_ffmpeg_proc = start_ffmpeg_waveform_file(
+                                    filepath, height=cam_height)
 
-                        time.sleep(0.1)
-                        if viz_ffmpeg_proc.poll() is not None:
-                            try:
-                                err = viz_ffmpeg_proc.stderr.read(512).decode(errors="replace").strip()
-                            except Exception:
-                                err = ""
-                            sys.stdout.write(f"\r\n[!] New viz ffmpeg exited immediately: {err}\r\n")
-                            sys.stdout.flush()
+                            write_byte(COLOR_FLAG, 5)  # re-enable per-pixel color mode
+                            threading.Thread(target=_read_viz, daemon=True).start()
+
+                            time.sleep(0.1)
+                            if viz_ffmpeg_proc.poll() is not None:
+                                try:
+                                    err = viz_ffmpeg_proc.stderr.read(512).decode(
+                                        errors="replace").strip()
+                                except Exception:
+                                    err = ""
+                                sys.stdout.write(
+                                    f"\r\n[!] New viz ffmpeg exited immediately: {err}\r\n")
+                                sys.stdout.flush()
 
                 with cam_frame_lock:
                     raw = latest_cam_frame[0]
@@ -2291,6 +2311,9 @@ def main():
         threading.Thread(target=_read_vid, daemon=True).start()
 
         # --- State + keypress ---
+        _blend_capable = blend_viz_mode is not None  # True if started with blend; never changes
+        VIZ_MODE = blend_viz_mode if blend_viz_mode else "none"  # sync for w-key cycling
+
         state = {
             "cam_color":     color_mode_init,
             "viz_color":     viz_color_mode_init,
@@ -2303,7 +2326,7 @@ def main():
 
         frame_num = 0
         blend_tag = f"+{blend_viz_mode}" if blend_viz_mode else ""
-        controls  = "[c] vid-color, [v] viz-color, [w] viz, [1-5] viz direct, [q] quit" if blend_viz_mode else "[c] color, [q] quit"
+        controls  = "[c] vid-color, [v] viz-color, [w/0-5] viz, [q] quit" if blend_viz_mode else "[c] color, [q] quit"
         print(f"[*] Video{blend_tag} streaming to C64 at {FPS}fps\n    {controls}\n")
 
         try:
@@ -2330,50 +2353,62 @@ def main():
                         write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
                         write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
 
-                if state["viz_pending"] is not None and viz_ffmpeg_proc is not None:
+                if state["viz_pending"] is not None and _blend_capable:
                     new_viz = state["viz_pending"]
                     state["viz_pending"] = None
-                    if new_viz != blend_viz_mode:
+                    _cur_blend = blend_viz_mode or "none"
+                    if new_viz != _cur_blend:
                         sys.stdout.write(
-                            f"\r\n[*] Switching viz: {VIZ_LABELS.get(blend_viz_mode, blend_viz_mode)}"
+                            f"\r\n[*] Switching viz: {VIZ_LABELS.get(_cur_blend, _cur_blend)}"
                             f" -> {VIZ_LABELS.get(new_viz, new_viz)}\r\n")
                         sys.stdout.flush()
 
-                        _old_viz = viz_ffmpeg_proc
-                        _kill_proc(_old_viz)
-                        try: _old_viz.stdout.close()
-                        except: pass
-                        time.sleep(0.1)  # let _read_viz thread see EOF and exit
+                        if viz_ffmpeg_proc is not None:
+                            _old_viz = viz_ffmpeg_proc
+                            _kill_proc(_old_viz)
+                            try: _old_viz.stdout.close()
+                            except: pass
+                            time.sleep(0.1)  # let _read_viz thread see EOF and exit
 
-                        blend_viz_mode = new_viz
-                        VIZ_MODE = new_viz
-                        _viz_chars_def = {
-                            "showwaves":    CHARS_DEF,
-                            "showfreqs":    CHARS_FREQ_DEF,
-                            "avectorscope": CHARS_SCOPE_DEF,
-                            "showspectrum": CHARS_SPECTRUM_DEF,
-                        }.get(blend_viz_mode, CHARS_HIST_DEF)
-                        _viz_chars = [t[0] for t in _viz_chars_def]
-                        _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
-
-                        if is_url(filepath):
-                            _kill_proc(yt_viz_proc)
-                            yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(
-                                stream_url, height=cam_height)
+                        if new_viz == "none":
+                            viz_ffmpeg_proc = None
+                            blend_viz_mode  = None
+                            VIZ_MODE        = "none"
+                            write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                            write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
                         else:
-                            viz_ffmpeg_proc = start_ffmpeg_waveform_file(filepath, height=cam_height)
-                        VIZ_MODE = "camera"
+                            blend_viz_mode = new_viz
+                            VIZ_MODE = new_viz  # _build_viz_filter() reads this; stays set
+                            _viz_chars_def = {
+                                "showwaves":    CHARS_DEF,
+                                "showfreqs":    CHARS_FREQ_DEF,
+                                "avectorscope": CHARS_SCOPE_DEF,
+                                "showspectrum": CHARS_SPECTRUM_DEF,
+                            }.get(blend_viz_mode, CHARS_HIST_DEF)
+                            _viz_chars = [t[0] for t in _viz_chars_def]
+                            _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
 
-                        threading.Thread(target=_read_viz, daemon=True).start()
+                            if is_url(filepath):
+                                _kill_proc(yt_viz_proc)
+                                yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(
+                                    stream_url, height=cam_height)
+                            else:
+                                viz_ffmpeg_proc = start_ffmpeg_waveform_file(
+                                    filepath, height=cam_height)
 
-                        time.sleep(0.1)
-                        if viz_ffmpeg_proc.poll() is not None:
-                            try:
-                                err = viz_ffmpeg_proc.stderr.read(512).decode(errors="replace").strip()
-                            except Exception:
-                                err = ""
-                            sys.stdout.write(f"\r\n[!] New viz ffmpeg exited immediately: {err}\r\n")
-                            sys.stdout.flush()
+                            write_byte(COLOR_FLAG, 5)  # re-enable per-pixel color mode
+                            threading.Thread(target=_read_viz, daemon=True).start()
+
+                            time.sleep(0.1)
+                            if viz_ffmpeg_proc.poll() is not None:
+                                try:
+                                    err = viz_ffmpeg_proc.stderr.read(512).decode(
+                                        errors="replace").strip()
+                                except Exception:
+                                    err = ""
+                                sys.stdout.write(
+                                    f"\r\n[!] New viz ffmpeg exited immediately: {err}\r\n")
+                                sys.stdout.flush()
 
                 with vid_frame_lock:
                     raw = latest_vid_frame[0]
@@ -2768,7 +2803,7 @@ def main():
     kthread.start()
 
     frame_num = 0
-    print(f"[*] Streaming to C64 at {FPS}fps -- [c] color, [w] viz, [1-5] viz direct, [q] quit\n")
+    print(f"[*] Streaming to C64 at {FPS}fps -- [c] color, [w/0-5] viz (0=off), [q] quit\n")
 
     try:
         while not state["quit"]:
@@ -2795,54 +2830,74 @@ def main():
                         f" -> {VIZ_LABELS.get(new_viz, new_viz)}\r\n")
                     sys.stdout.flush()
 
-                    # Kill old waveform ffmpeg immediately and wait for fd release
                     _old_ffmpeg = ffmpeg_proc
                     _kill_proc(_old_ffmpeg)
-                    try: _old_ffmpeg.stdout.close()
-                    except: pass
+                    if _old_ffmpeg is not None:
+                        try: _old_ffmpeg.stdout.close()
+                        except: pass
 
                     VIZ_MODE = new_viz
 
-                    # Rebuild LUTs for the new mode
-                    _ext_defs = {
-                        "showwaves":    CHARS_DEF,
-                        "showfreqs":    CHARS_FREQ_DEF,
-                        "avectorscope": CHARS_SCOPE_DEF,
-                        "showspectrum": CHARS_SPECTRUM_DEF,
-                    }.get(VIZ_MODE, CHARS_HIST_DEF)
-                    _ext_wlut, _ext_flut = _build_color_luts(_ext_defs)
-
-                    if mode == "sid":
-                        # FIFO is 1:1 — kill sidplayfp writer, recreate FIFO, restart both
-                        _old_sid = sid_fifo_proc
-                        _kill_proc(_old_sid)
-                        make_fifo(FIFO_PATH)
-                        ffmpeg_proc   = start_ffmpeg_waveform_fifo(realtime=True, height=_DISP_HEIGHT)
-                        time.sleep(0.3)
-                        sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
-                        procs = [p for p in procs
-                                 if p not in (_old_ffmpeg, _old_sid)] + [ffmpeg_proc, sid_fifo_proc]
-                    elif mode == "stream":
-                        _old_yt = yt_viz_proc
-                        _kill_proc(_old_yt)
-                        yt_viz_proc, ffmpeg_proc = start_ffmpeg_waveform_stream(
-                            stream_url, height=_DISP_HEIGHT)
-                        procs = [p for p in procs
-                                 if p not in (_old_ffmpeg, _old_yt)] + [yt_viz_proc, ffmpeg_proc]
+                    if new_viz == "none":
+                        if mode == "sid":
+                            _old_sid = sid_fifo_proc
+                            _kill_proc(_old_sid)
+                            sid_fifo_proc = None
+                            procs = [p for p in procs if p not in (_old_ffmpeg, _old_sid)]
+                        elif mode == "stream":
+                            _old_yt = yt_viz_proc
+                            _kill_proc(_old_yt)
+                            yt_viz_proc = None
+                            procs = [p for p in procs if p not in (_old_ffmpeg, _old_yt)]
+                        else:
+                            procs = [p for p in procs if p is not _old_ffmpeg]
+                        ffmpeg_proc = None
+                        write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
+                        write_mem(_ext_scr,  [0x20] * (_EXT_ROWS * WIDTH))
+                        write_byte(FRAME_FLAG, 1)
                     else:
-                        # File/MP3: seek to approximate playback position
-                        _elapsed = time.time() - playback_start
-                        ffmpeg_proc = start_ffmpeg_waveform_file(
-                            filepath, height=_DISP_HEIGHT, seek_secs=_elapsed)
-                        procs = [p for p in procs
-                                 if p is not _old_ffmpeg] + [ffmpeg_proc]
+                        # Rebuild LUTs for the new mode
+                        _ext_defs = {
+                            "showwaves":    CHARS_DEF,
+                            "showfreqs":    CHARS_FREQ_DEF,
+                            "avectorscope": CHARS_SCOPE_DEF,
+                            "showspectrum": CHARS_SPECTRUM_DEF,
+                        }.get(VIZ_MODE, CHARS_HIST_DEF)
+                        _ext_wlut, _ext_flut = _build_color_luts(_ext_defs)
 
-                    # Verify new ffmpeg started (give it a moment)
-                    time.sleep(0.1)
-                    if ffmpeg_proc.poll() is not None:
-                        err = ffmpeg_proc.stderr.read(512).decode(errors="replace").strip()
-                        sys.stdout.write(f"\r\n[!] New ffmpeg exited immediately: {err}\r\n")
-                        sys.stdout.flush()
+                        if mode == "sid":
+                            _old_sid = sid_fifo_proc
+                            _kill_proc(_old_sid)
+                            make_fifo(FIFO_PATH)
+                            ffmpeg_proc   = start_ffmpeg_waveform_fifo(
+                                realtime=True, height=_DISP_HEIGHT)
+                            time.sleep(0.3)
+                            sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
+                            procs = [p for p in procs
+                                     if p not in (_old_ffmpeg, _old_sid)] + [ffmpeg_proc, sid_fifo_proc]
+                        elif mode == "stream":
+                            _old_yt = yt_viz_proc
+                            _kill_proc(_old_yt)
+                            yt_viz_proc, ffmpeg_proc = start_ffmpeg_waveform_stream(
+                                stream_url, height=_DISP_HEIGHT)
+                            procs = [p for p in procs
+                                     if p not in (_old_ffmpeg, _old_yt)] + [yt_viz_proc, ffmpeg_proc]
+                        else:
+                            _elapsed = time.time() - playback_start
+                            ffmpeg_proc = start_ffmpeg_waveform_file(
+                                filepath, height=_DISP_HEIGHT, seek_secs=_elapsed)
+                            procs = [p for p in procs if p is not _old_ffmpeg] + [ffmpeg_proc]
+
+                        time.sleep(0.1)
+                        if ffmpeg_proc.poll() is not None:
+                            err = ffmpeg_proc.stderr.read(512).decode(errors="replace").strip()
+                            sys.stdout.write(f"\r\n[!] New ffmpeg exited immediately: {err}\r\n")
+                            sys.stdout.flush()
+
+            # Viz is off — idle until user switches back
+            if ffmpeg_proc is None:
+                time.sleep(0.05)
+                continue
 
             # Check if data available before blocking read (allows q to work)
             ready, _, _ = _select.select([ffmpeg_proc.stdout], [], [], 0.5)

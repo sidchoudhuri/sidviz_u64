@@ -1184,6 +1184,18 @@ def _apply_freq_gradient(raw, color_mode, height=HEIGHT):
 def main():
     global U64, FPS, VIZ_MODE, _YTDLP_COOKIE_ARGS  # noqa: PLW0603
 
+    def _kill_proc(p):
+        if p is None:
+            return
+        try:
+            p.kill()
+        except Exception:
+            pass
+        try:
+            p.wait(timeout=2.0)
+        except Exception:
+            pass
+
     args = parse_args()
 
     if args.cookies_from_browser:
@@ -1419,6 +1431,8 @@ def main():
         ffplay_proc    = None
         yt_audio_proc  = None
         viz_ffmpeg_proc = None
+        sid_fifo_proc  = None
+        yt_viz_proc    = None
         sid_end_time   = (time.time() + sid_duration_secs) if sid_duration_secs else None
 
         if audio_mode == "sid":
@@ -1665,6 +1679,7 @@ def main():
             "cam_color":     color_mode_init,
             "viz_color":     viz_color_mode_init,
             "color_pending": False,
+            "viz_pending":   None,
             "quit":          False,
         }
         kthread = make_keypress_listener(state)
@@ -1680,7 +1695,7 @@ def main():
         frame_num = 0
         blend_tag = f"+{blend_viz_mode}" if blend_viz_mode else ""
         if blend_viz_mode:
-            controls = "[c] cam-color, [v] viz-color, [q] quit"
+            controls = "[c] cam-color, [v] viz-color, [w] viz, [1-5] viz direct, [q] quit"
         else:
             controls = "[c] color, [q] quit"
         print(f"[*] Camera{blend_tag} streaming to C64 at {FPS}fps\n    {controls}\n")
@@ -1748,6 +1763,59 @@ def main():
                         write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
                         if cam_ext_rows:
                             write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+
+                if state["viz_pending"] is not None and viz_ffmpeg_proc is not None:
+                    new_viz = state["viz_pending"]
+                    state["viz_pending"] = None
+                    if new_viz != blend_viz_mode:
+                        sys.stdout.write(
+                            f"\r\n[*] Switching viz: {VIZ_LABELS.get(blend_viz_mode, blend_viz_mode)}"
+                            f" -> {VIZ_LABELS.get(new_viz, new_viz)}\r\n")
+                        sys.stdout.flush()
+
+                        _old_viz = viz_ffmpeg_proc
+                        _kill_proc(_old_viz)
+                        try: _old_viz.stdout.close()
+                        except: pass
+                        time.sleep(0.1)  # let _read_viz thread see EOF and exit
+
+                        blend_viz_mode = new_viz
+                        VIZ_MODE = new_viz
+                        _viz_chars_def = {
+                            "showwaves":    CHARS_DEF,
+                            "showfreqs":    CHARS_FREQ_DEF,
+                            "avectorscope": CHARS_SCOPE_DEF,
+                            "showspectrum": CHARS_SPECTRUM_DEF,
+                        }.get(blend_viz_mode, CHARS_HIST_DEF)
+                        _viz_chars = [t[0] for t in _viz_chars_def]
+                        _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
+
+                        if audio_mode == "sid":
+                            _kill_proc(sid_fifo_proc)
+                            make_fifo(FIFO_PATH)
+                            viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(realtime=True, height=cam_height)
+                            VIZ_MODE = "camera"
+                            time.sleep(0.3)
+                            sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
+                        elif audio_mode == "stream":
+                            _kill_proc(yt_viz_proc)
+                            yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(
+                                stream_url, height=cam_height)
+                            VIZ_MODE = "camera"
+                        else:
+                            viz_ffmpeg_proc = start_ffmpeg_waveform_file(filepath, height=cam_height)
+                            VIZ_MODE = "camera"
+
+                        threading.Thread(target=_read_viz, daemon=True).start()
+
+                        time.sleep(0.1)
+                        if viz_ffmpeg_proc.poll() is not None:
+                            try:
+                                err = viz_ffmpeg_proc.stderr.read(512).decode(errors="replace").strip()
+                            except Exception:
+                                err = ""
+                            sys.stdout.write(f"\r\n[!] New viz ffmpeg exited immediately: {err}\r\n")
+                            sys.stdout.flush()
 
                 with cam_frame_lock:
                     raw = latest_cam_frame[0]
@@ -2227,6 +2295,7 @@ def main():
             "cam_color":     color_mode_init,
             "viz_color":     viz_color_mode_init,
             "color_pending": False,
+            "viz_pending":   None,
             "quit":          False,
         }
         kthread = make_keypress_listener(state)
@@ -2234,7 +2303,7 @@ def main():
 
         frame_num = 0
         blend_tag = f"+{blend_viz_mode}" if blend_viz_mode else ""
-        controls  = "[c] vid-color, [v] viz-color, [q] quit" if blend_viz_mode else "[c] color, [q] quit"
+        controls  = "[c] vid-color, [v] viz-color, [w] viz, [1-5] viz direct, [q] quit" if blend_viz_mode else "[c] color, [q] quit"
         print(f"[*] Video{blend_tag} streaming to C64 at {FPS}fps\n    {controls}\n")
 
         try:
@@ -2260,6 +2329,51 @@ def main():
                     if not viz_ffmpeg_proc:
                         write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
                         write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+
+                if state["viz_pending"] is not None and viz_ffmpeg_proc is not None:
+                    new_viz = state["viz_pending"]
+                    state["viz_pending"] = None
+                    if new_viz != blend_viz_mode:
+                        sys.stdout.write(
+                            f"\r\n[*] Switching viz: {VIZ_LABELS.get(blend_viz_mode, blend_viz_mode)}"
+                            f" -> {VIZ_LABELS.get(new_viz, new_viz)}\r\n")
+                        sys.stdout.flush()
+
+                        _old_viz = viz_ffmpeg_proc
+                        _kill_proc(_old_viz)
+                        try: _old_viz.stdout.close()
+                        except: pass
+                        time.sleep(0.1)  # let _read_viz thread see EOF and exit
+
+                        blend_viz_mode = new_viz
+                        VIZ_MODE = new_viz
+                        _viz_chars_def = {
+                            "showwaves":    CHARS_DEF,
+                            "showfreqs":    CHARS_FREQ_DEF,
+                            "avectorscope": CHARS_SCOPE_DEF,
+                            "showspectrum": CHARS_SPECTRUM_DEF,
+                        }.get(blend_viz_mode, CHARS_HIST_DEF)
+                        _viz_chars = [t[0] for t in _viz_chars_def]
+                        _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
+
+                        if is_url(filepath):
+                            _kill_proc(yt_viz_proc)
+                            yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(
+                                stream_url, height=cam_height)
+                        else:
+                            viz_ffmpeg_proc = start_ffmpeg_waveform_file(filepath, height=cam_height)
+                        VIZ_MODE = "camera"
+
+                        threading.Thread(target=_read_viz, daemon=True).start()
+
+                        time.sleep(0.1)
+                        if viz_ffmpeg_proc.poll() is not None:
+                            try:
+                                err = viz_ffmpeg_proc.stderr.read(512).decode(errors="replace").strip()
+                            except Exception:
+                                err = ""
+                            sys.stdout.write(f"\r\n[!] New viz ffmpeg exited immediately: {err}\r\n")
+                            sys.stdout.flush()
 
                 with vid_frame_lock:
                     raw = latest_vid_frame[0]
@@ -2645,19 +2759,6 @@ def main():
         procs = [ffplay_proc, ffmpeg_proc]
 
     playback_start = time.time()
-
-    def _kill_proc(p):
-        """SIGKILL a process immediately and reap it so fds are released."""
-        if p is None:
-            return
-        try:
-            p.kill()
-        except Exception:
-            pass
-        try:
-            p.wait(timeout=2.0)
-        except Exception:
-            pass
 
     frame_size     = WIDTH * _DISP_HEIGHT
     sid_end_time   = (time.time() + sid_duration_secs) if mode == "sid" and sid_duration_secs else None

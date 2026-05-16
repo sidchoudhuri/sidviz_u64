@@ -265,6 +265,15 @@ def parse_args():
                    help="Camera device: index (0,1,…) or path (/dev/video0). Default: 0")
     p.add_argument("--list-cameras",  action="store_true", help="List available camera devices and exit")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
+    p.add_argument("--save-d64",     metavar="FILE.d64",
+                   help="Save SID + pre-rendered frames to a bootable D64 disk image")
+    p.add_argument("--d64-fps",      type=int, default=10,
+                   help="Frame rate for D64 recording (default 10; 50 must be divisible)")
+    p.add_argument("--d64-duration", type=int, default=None, metavar="SECS",
+                   help="Capture duration in seconds for D64 (default: auto from SID length)")
+    p.add_argument("--d64-viz",      default="showwaves",
+                   choices=["showwaves","showfreqs","avectorscope","showspectrum","ahistogram"],
+                   help="Visualization type for D64 frames (default: showwaves)")
     return p.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -1186,6 +1195,323 @@ def _apply_freq_gradient(raw, color_mode, height=HEIGHT):
     return bytes(buf)
 
 # ---------------------------------------------------------------------------
+# D64 save — pack SID + pre-rendered frames onto a bootable D64 disk image
+# ---------------------------------------------------------------------------
+
+def _rle_compress(data: bytes) -> bytes:
+    """RLE compress a frame for the D64 player.
+
+    Token format:
+      $00-$7F  count byte — the next (count+1) bytes are literals (1..128)
+      $80-$FF  run marker — repeat the next byte (value-$7E) times (2..129)
+    """
+    out = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        b = data[i]
+        run = 1
+        while i + run < n and data[i + run] == b and run < 129:
+            run += 1
+
+        if run >= 3:
+            consumed = 0
+            while consumed < run:
+                chunk = min(run - consumed, 129)
+                out.append(0x7e + chunk)   # $80=2 reps ... $FF=129 reps
+                out.append(b)
+                consumed += chunk
+            i += run
+        else:
+            # Gather consecutive non-run bytes as a literal batch (up to 128)
+            lits = bytearray()
+            while i < n and len(lits) < 128:
+                c = data[i]
+                rlen = 1
+                while i + rlen < n and data[i + rlen] == c and rlen < 3:
+                    rlen += 1
+                if rlen >= 3:
+                    break
+                lits.append(c)
+                i += 1
+            if lits:
+                out.append(len(lits) - 1)   # $00=1 literal, $7F=128 literals
+                out.extend(lits)
+    return bytes(out)
+
+
+def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", duration=None):
+    """
+    Generate a bootable D64 disk image from a SID file.
+
+    The image contains two files:
+      "*"       — autostart player PRG (pre-rendered PETSCII frames + player code)
+      "SIDDATA" — raw SID binary (player loads this at boot via KERNAL LOAD)
+
+    sid_file   : path to a .sid / .psid file
+    output_d64 : output path for the .d64 image
+    fps        : visualization frame rate (default 10; must divide 50 evenly)
+    viz        : ffmpeg viz filter: "showwaves" | "showfreqs" | "avectorscope" |
+                 "showspectrum" | "ahistogram"
+    duration   : capture duration in seconds (None = auto from SID length)
+    """
+    import tempfile, struct as _struct
+    from d64 import build_d64
+
+    # ── locate player binary ────────────────────────────────────────────────
+    player_prg = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "sidviz_d64.prg")
+    if not os.path.isfile(player_prg):
+        print(f"[!] player binary not found: {player_prg}")
+        print("[!] Run:  64tass -a -B -o sidviz_d64.prg sidviz_d64.asm")
+        return False
+
+    # ── parse SID ────────────────────────────────────────────────────────────
+    psid = parse_psid(sid_file)
+    if psid is None:
+        return False
+
+    # ── determine capture duration ───────────────────────────────────────────
+    if duration is None:
+        info = get_sid_info(sid_file)
+        raw_len = info.get("Song Length", "")
+        if raw_len:
+            try:
+                parts = raw_len.split(".")[0].split(":")
+                duration = int(parts[0]) * 60 + int(parts[1])
+            except Exception:
+                pass
+        if duration is None:
+            duration = 180  # default 3 minutes
+
+    fps_div = max(1, 50 // fps)
+    actual_fps = 50 // fps_div
+    frame_size = WIDTH * HEIGHT  # 40 × 17 = 680 bytes per frame
+
+    print(f"[d64] SID: {os.path.basename(sid_file)}")
+    print(f"[d64] Duration: {duration}s  FPS: {actual_fps}  "
+          f"Viz: {viz}  Est frames: {duration * actual_fps}")
+
+    # ── generate audio WAV via sidplayfp ─────────────────────────────────────
+    wav_fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="sidviz_d64_")
+    os.close(wav_fd)
+    try:
+        sid_cmd = ["sidplayfp", f"-t{duration}", f"-w{wav_path}", sid_file]
+        print(f"[d64] Rendering audio: {' '.join(sid_cmd)}")
+        r = subprocess.run(sid_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not os.path.isfile(wav_path) or os.path.getsize(wav_path) == 0:
+            print("[!] sidplayfp failed to produce WAV")
+            return False
+
+        # ── generate waveform frames via ffmpeg ──────────────────────────────
+        viz_filters = {
+            "showwaves":
+                f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
+                f":rate={actual_fps}:colors=#ffffff,format=gray",
+            "showfreqs":
+                f"[0:a]showfreqs=s={WIDTH}x{HEIGHT}:mode=bar"
+                f":ascale=log:fscale=log:colors=#ffffff,format=gray",
+            "avectorscope":
+                (f"[0:a]aformat=channel_layouts=mono,asplit=2[La][Ra];"
+                 f"[Ra]adelay=2[Rd];[La][Rd]amerge=inputs=2[S];"
+                 f"[S]avectorscope=s={WIDTH}x{HEIGHT}:zoom=1.8:draw=dot"
+                 f":scale=log,format=gray"),
+            "showspectrum":
+                f"[0:a]showspectrum=s={WIDTH}x{HEIGHT}:slide=scroll"
+                f":scale=log:color=intensity,format=gray",
+            "ahistogram":
+                f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=log:slide=scroll"
+                f",format=gray",
+        }
+        filt = viz_filters.get(viz, viz_filters["showwaves"])
+        chars_map = {
+            "showwaves": CHARS, "showfreqs": CHARS_FREQ,
+            "avectorscope": CHARS_SCOPE, "showspectrum": CHARS_SPECTRUM,
+            "ahistogram": CHARS_HIST,
+        }
+        chars = chars_map.get(viz, CHARS)
+
+        ff_cmd = [
+            "ffmpeg", "-loglevel", "quiet",
+            "-i", wav_path,
+            "-filter_complex", filt,
+            "-f", "rawvideo", "-pix_fmt", "gray",
+            "-r", str(actual_fps), "pipe:1",
+        ]
+        print("[d64] Generating frames (this may take a while)...")
+        ff = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE,
+                              stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # ── read + compress frames ────────────────────────────────────────────
+        compressed_frames = []
+        frame_num = 0
+        while True:
+            raw = ff.stdout.read(frame_size)
+            if len(raw) < frame_size:
+                break
+            screen_codes = bytes(pixel_to_char(p, chars) for p in raw)
+            compressed_frames.append(_rle_compress(screen_codes))
+            frame_num += 1
+            if frame_num % 50 == 0:
+                ratio = sum(len(f) for f in compressed_frames) / (frame_num * frame_size)
+                print(f"\r[d64] Frames: {frame_num}  "
+                      f"Compressed: {sum(len(f) for f in compressed_frames)//1024}KB  "
+                      f"Ratio: {ratio:.0%}", end="", flush=True)
+        ff.stdout.close()
+        ff.wait()
+        print()
+
+        if not compressed_frames:
+            print("[!] No frames generated — check sidplayfp and ffmpeg are installed")
+            return False
+
+        frame_count = len(compressed_frames)
+        total_compressed = sum(len(f) for f in compressed_frames)
+        avg_frame = total_compressed // frame_count
+        print(f"[d64] Captured {frame_count} frames  "
+              f"Total: {total_compressed//1024}KB  "
+              f"Avg/frame: {avg_frame}B  "
+              f"(uncompressed: {frame_count*frame_size//1024}KB)")
+
+        # ── build player PRG ─────────────────────────────────────────────────
+        #
+        # Layout:
+        #   [player binary  433 bytes  $0801-$09AF]
+        #   [metadata       16 bytes   $09B0-$09BF]
+        #   [TRAM_INIT       3 bytes   $09C0-$09C2]
+        #   [TRAM_PLAY       3 bytes   $09C3-$09C5]
+        #   [fdat_page       1 byte    $09C6      ]
+        #   [frame index  2*N bytes   $09C7-...  ]
+        #   [pad to page boundary                ]
+        #   [compressed frames                   ]
+        #
+        # fdat_page: high byte of frame-data base C64 address.
+        # Frame data must start on a page boundary (base low = $00).
+        # Python pads the frame-index area with zeros to reach the next page.
+
+        player_bin = bytearray(open(player_prg, "rb").read())
+        # player_bin is 433 bytes (2-byte load-addr header + 431 bytes code)
+
+        # SIDDATA filename on disk (must match what player loads)
+        sid_disk_name = "SIDDATA"
+        sid_name_petscii = sid_disk_name.upper().encode("ascii")[:8]
+        sid_name_petscii = sid_name_petscii + b"\xa0" * (8 - len(sid_name_petscii))
+
+        init_addr = psid["init_addr"]
+        play_addr = psid["play_addr"]
+
+        # Metadata (16 bytes at file offset 433 → C64 addr $09B0)
+        meta = bytearray(16)
+        meta[0] = init_addr & 0xFF
+        meta[1] = (init_addr >> 8) & 0xFF
+        meta[2] = play_addr & 0xFF
+        meta[3] = (play_addr >> 8) & 0xFF
+        meta[4] = frame_count & 0xFF
+        meta[5] = (frame_count >> 8) & 0xFF
+        meta[6] = fps_div
+        meta[7] = len(sid_disk_name)
+        meta[8:16] = sid_name_petscii
+
+        # Trampolines (6 bytes at $09C0-$09C5)
+        tram_init = bytes([0x4C, init_addr & 0xFF, (init_addr >> 8) & 0xFF])
+        tram_play = bytes([0x4C, play_addr & 0xFF, (play_addr >> 8) & 0xFF])
+
+        # Frame index (2 bytes per frame: LE byte-offset from frame-data base)
+        # We'll compute offsets after determining frame-data base addr.
+        # First, figure out where frame data will start in the C64 addr space.
+        #
+        # File structure so far:
+        #   433 + 16 + 3 + 3 + 1 = 456 bytes before frame index
+        # Frame index: 2 * frame_count bytes
+        # Frame data start file offset = 456 + 2*frame_count + padding
+        # C64 addr of that file offset = 0x0801 + (file_offset - 2)
+        # Pad until C64 addr is a multiple of 256 (page boundary).
+
+        IDX_FILE_OFFSET = 456  # file byte where frame index starts
+        idx_size = 2 * frame_count
+        raw_fdat_file = IDX_FILE_OFFSET + idx_size
+        # C64 addr of raw_fdat_file:
+        raw_fdat_c64 = 0x0801 + (raw_fdat_file - 2)
+        # Padding to next page boundary:
+        pad = (256 - raw_fdat_c64 % 256) % 256
+        fdat_file_offset = raw_fdat_file + pad
+        fdat_c64_addr = raw_fdat_c64 + pad
+        assert fdat_c64_addr % 256 == 0, "frame data not page-aligned!"
+        fdat_page_val = fdat_c64_addr >> 8
+
+        # Frame index: compute cumulative offsets
+        frame_index = bytearray()
+        offset = 0
+        for f in compressed_frames:
+            frame_index += _struct.pack("<H", offset)
+            offset += len(f)
+
+        # Padding bytes (zeros, part of unused frame index area)
+        index_padding = bytes(pad)
+
+        # Compressed frame data (concatenated)
+        frame_data = b"".join(compressed_frames)
+
+        # Assemble final player PRG
+        prg_data = (
+            player_bin          # 433 bytes: 2-byte header + code
+            + meta              # 16 bytes
+            + tram_init         # 3 bytes
+            + tram_play         # 3 bytes
+            + bytes([fdat_page_val])  # 1 byte ($09C6)
+            + frame_index       # 2 * frame_count bytes
+            + index_padding     # pad to page boundary
+            + frame_data        # compressed frames
+        )
+
+        player_kb = len(prg_data) / 1024
+        print(f"[d64] Player PRG: {len(prg_data)} bytes ({player_kb:.1f} KB)  "
+              f"Frame data at C64 ${fdat_c64_addr:04X}  page ${fdat_page_val:02X}")
+
+        # ── build SIDDATA PRG ─────────────────────────────────────────────────
+        # Format: 2-byte LE load address + SID binary
+        sid_prg = (
+            _struct.pack("<H", psid["load_addr"])
+            + psid["data"]
+        )
+        print(f"[d64] SIDDATA: {len(sid_prg)} bytes  "
+              f"(load ${psid['load_addr']:04X}  "
+              f"init ${psid['init_addr']:04X}  "
+              f"play ${psid['play_addr']:04X})")
+
+        # ── capacity check ────────────────────────────────────────────────────
+        total_bytes = len(prg_data) + len(sid_prg)
+        D64_CAPACITY = 664 * 254  # 664 usable sectors × 254 bytes each
+        if total_bytes > D64_CAPACITY:
+            overage = total_bytes - D64_CAPACITY
+            print(f"[!] Data too large for D64: {total_bytes//1024}KB "
+                  f"({overage//1024}KB over {D64_CAPACITY//1024}KB capacity)")
+            print(f"[!] Try: --d64-fps 5  or  --d64-duration <shorter>")
+            return False
+
+        # ── create D64 image ──────────────────────────────────────────────────
+        sid_base = os.path.splitext(os.path.basename(sid_file))[0].upper()[:8]
+        build_d64(
+            output_d64,
+            [
+                ("*",        prg_data),   # autostart: LOAD"*",8,1
+                ("SIDDATA",  sid_prg),    # SID binary with embedded load addr
+            ],
+            disk_name=sid_base,
+            disk_id="SV",
+        )
+        print(f"[d64] Done → {output_d64}")
+        print(f"[d64] On C64: LOAD\"*\",8,1  then  RUN")
+        return True
+
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1214,6 +1540,23 @@ def main():
     if args.version:
         print(f"sidviz_u64  v{VERSION}  build {BUILD}")
         sys.exit(0)
+
+    if args.save_d64:
+        if not args.file:
+            print("[!] --save-d64 requires a .sid file argument")
+            sys.exit(1)
+        sid_path = os.path.expanduser(args.file)
+        if not os.path.isfile(sid_path):
+            print(f"[!] File not found: {sid_path}")
+            sys.exit(1)
+        ok = save_to_d64(
+            sid_path,
+            args.save_d64,
+            fps=args.d64_fps,
+            viz=args.d64_viz,
+            duration=args.d64_duration,
+        )
+        sys.exit(0 if ok else 1)
 
     if args.list_cameras:
         if sys.platform == "darwin":

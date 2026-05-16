@@ -66,6 +66,9 @@ C64_PALETTE_RGB = [    # standard C64 VICE palette (R, G, B)
     (119,119,119), (170,255,102), (  0,136,255), (187,187,187),
 ]
 SCROLL_RATE = 6   # IRQ ticks per ticker scroll step (matches sidviz.asm)
+RAINBOW_TAB = [2,2,8,8,7,7,7,7,5,5,5,5,13,13,14,14,
+               6,6,6,6,4,4,4,4,10,10,2,2,8,8,7,7,
+               5,5,13,13,14,14,6,6]
 
 # ---------------------------------------------------------------------------
 # C64 character ROM — load from VICE install if present, else use fallback.
@@ -1468,14 +1471,10 @@ def main():
         # --- Camera display area ---
         _cam_ext_scr  = 0x0400 + 2 * WIDTH                     # $0450 (row 2)
         _cam_ext_col  = 0xD800 + 2 * WIDTH                     # $D850 (row 2 color RAM)
-        _CAM_RTAB     = [2,2,8,8,7,7,7,7,5,5,5,5,13,13,14,14,
-                         6,6,6,6,4,4,4,4,10,10,2,2,8,8,7,7,
-                         5,5,13,13,14,14,6,6]
-
         def _top_colors(cmode):
             """6-row rainbow/density color stripe for rows 2-7."""
             if cmode == 0:
-                return bytes(_CAM_RTAB[col] for _ in range(6) for col in range(WIDTH))
+                return bytes(RAINBOW_TAB[col] for _ in range(6) for col in range(WIDTH))
             elif cmode == 1:
                 return bytes([1] * 6 * WIDTH)   # all white
             else:
@@ -1762,20 +1761,20 @@ def main():
                             cp, vp = top_raw[i], vz_top[i]
                             if cp >= vp:
                                 color_top[i] = _pixel_color(cp, CHARS_CAMERA, cam_cmode, col_x,
-                                                            _cam_wlut, _cam_flut, _CAM_RTAB)
+                                                            _cam_wlut, _cam_flut, RAINBOW_TAB)
                             else:
                                 color_top[i] = _pixel_color(vp, _viz_chars, viz_cmode, col_x,
-                                                            _viz_wlut, _viz_flut, _CAM_RTAB)
+                                                            _viz_wlut, _viz_flut, RAINBOW_TAB)
                     color_bot = bytearray(HEIGHT * WIDTH)
                     for i in range(HEIGHT * WIDTH):
                         col_x = i % WIDTH
                         cp, vp = bot_raw[i], vz_bot[i]
                         if cp >= vp:
                             color_bot[i] = _pixel_color(cp, CHARS_CAMERA, cam_cmode, col_x,
-                                                        _cam_wlut, _cam_flut, _CAM_RTAB)
+                                                        _cam_wlut, _cam_flut, RAINBOW_TAB)
                         else:
                             color_bot[i] = _pixel_color(vp, _viz_chars, viz_cmode, col_x,
-                                                        _viz_wlut, _viz_flut, _CAM_RTAB)
+                                                        _viz_wlut, _viz_flut, RAINBOW_TAB)
                 else:
                     blended_top = top_raw
                     blended_bot = bot_raw
@@ -1808,9 +1807,9 @@ def main():
                     else:
                         cmode = state["cam_color"]
                         col_top = bytes(_screen_code_color(sc_top[i], cmode, i % WIDTH,
-                                        _cam_wlut, _cam_flut, _CAM_RTAB) for i in range(len(sc_top)))
+                                        _cam_wlut, _cam_flut, RAINBOW_TAB) for i in range(len(sc_top)))
                         col_bot = bytes(_screen_code_color(sc_bot[i], cmode, i % WIDTH,
-                                        _cam_wlut, _cam_flut, _CAM_RTAB) for i in range(len(sc_bot)))
+                                        _cam_wlut, _cam_flut, RAINBOW_TAB) for i in range(len(sc_bot)))
                     # Ticker simulation: advance at 50Hz / SCROLL_RATE chars per second
                     _tlen = len(_prec_ticker_petscii)
                     _tpos = int((time.time() - _prec_ticker_t0) * 50.0 / SCROLL_RATE) % _tlen
@@ -2038,13 +2037,9 @@ def main():
 
         _cam_ext_scr = 0x0400 + 2 * WIDTH       # $0450 row 2 screen RAM
         _cam_ext_col = 0xD800 + 2 * WIDTH       # $D850 row 2 color RAM
-        _CAM_RTAB    = [2,2,8,8,7,7,7,7,5,5,5,5,13,13,14,14,
-                        6,6,6,6,4,4,4,4,10,10,2,2,8,8,7,7,
-                        5,5,13,13,14,14,6,6]
-
         def _top_colors(cmode):
             if cmode == 0:
-                return bytes(_CAM_RTAB[col] for _ in range(6) for col in range(WIDTH))
+                return bytes(RAINBOW_TAB[col] for _ in range(6) for col in range(WIDTH))
             elif cmode == 1:
                 return bytes([1] * 6 * WIDTH)
             else:
@@ -2269,20 +2264,20 @@ def main():
                         cp, vp = top_raw[i], vz_top[i]
                         if cp >= vp:
                             color_top[i] = _pixel_color(cp, CHARS_CAMERA, cam_cmode, col_x,
-                                                        _cam_wlut, _cam_flut, _CAM_RTAB)
+                                                        _cam_wlut, _cam_flut, RAINBOW_TAB)
                         else:
                             color_top[i] = _pixel_color(vp, _viz_chars, viz_cmode, col_x,
-                                                        _viz_wlut, _viz_flut, _CAM_RTAB)
+                                                        _viz_wlut, _viz_flut, RAINBOW_TAB)
                     color_bot = bytearray(HEIGHT * WIDTH)
                     for i in range(HEIGHT * WIDTH):
                         col_x = i % WIDTH
                         cp, vp = bot_raw[i], vz_bot[i]
                         if cp >= vp:
                             color_bot[i] = _pixel_color(cp, CHARS_CAMERA, cam_cmode, col_x,
-                                                        _cam_wlut, _cam_flut, _CAM_RTAB)
+                                                        _cam_wlut, _cam_flut, RAINBOW_TAB)
                         else:
                             color_bot[i] = _pixel_color(vp, _viz_chars, viz_cmode, col_x,
-                                                        _viz_wlut, _viz_flut, _CAM_RTAB)
+                                                        _viz_wlut, _viz_flut, RAINBOW_TAB)
                 else:
                     blended_top = top_raw
                     blended_bot = bot_raw
@@ -2308,9 +2303,9 @@ def main():
                     else:
                         cmode = state["cam_color"]
                         col_top = bytes(_screen_code_color(sc_top[i], cmode, i % WIDTH,
-                                        _cam_wlut, _cam_flut, _CAM_RTAB) for i in range(len(sc_top)))
+                                        _cam_wlut, _cam_flut, RAINBOW_TAB) for i in range(len(sc_top)))
                         col_bot = bytes(_screen_code_color(sc_bot[i], cmode, i % WIDTH,
-                                        _cam_wlut, _cam_flut, _CAM_RTAB) for i in range(len(sc_bot)))
+                                        _cam_wlut, _cam_flut, RAINBOW_TAB) for i in range(len(sc_bot)))
                     _tlen = len(_prec_ticker_petscii)
                     _tpos = int((time.time() - _prec_ticker_t0) * 50.0 / SCROLL_RATE) % _tlen
                     ticker_sc  = bytes(_prec_ticker_petscii[(_tpos + i) % _tlen] for i in range(WIDTH))
@@ -2572,8 +2567,9 @@ def main():
     _ext_col     = 0xD850               # color RAM rows 2-7
 
     def _ext_top_colors(cmode):
-        col = [1, 2, 8][cmode]          # white / rainbow→red / fire→orange
-        return [col] * (_EXT_ROWS * WIDTH)
+        if cmode == 0:
+            return bytes(RAINBOW_TAB[col] for _ in range(_EXT_ROWS) for col in range(WIDTH))
+        return [1 if cmode == 1 else 8] * (_EXT_ROWS * WIDTH)
 
     # Initialize rows 2-7 with spaces and set color RAM (3× for SRAM reliability)
     write_mem(_ext_scr, [0x20] * (_EXT_ROWS * WIDTH))

@@ -1,7 +1,7 @@
 ; sidviz_d64.asm — standalone D64 player
 ; 64tass assembler  —  autostart: SYS 2064
 ;
-; v1.9.6 (2026-05-16)
+; v1.9.7 (2026-05-16)
 ;
 ; PRG layout (Python assembles final file by appending after $09D0):
 ;   $0801-$080C  BASIC stub (SYS 2064)
@@ -110,25 +110,20 @@ init:
         sta border
         sta bgcol
 
-        ; clear screen RAM $0400-$07E7 (3 full pages + 232 bytes)
-        lda #<screen
-        sta dst_lo
-        lda #>screen
+        ; clear screen RAM $0400-$07FF (4 full pages — 24 extra bytes past $07E7 are harmless)
+        lda #$04
         sta dst_hi
+        lda #$00
+        sta dst_lo
         lda #$20
-        ldx #$03
-cls_pg: ldy #$00
+        ldy #$00
 cls_lp: sta (dst_lo),y
         iny
         bne cls_lp
         inc dst_hi
-        dex
-        bne cls_pg
-        ldy #$00
-cls_rm: sta (dst_lo),y
-        iny
-        cpy #232
-        bne cls_rm
+        lda dst_hi
+        cmp #$08
+        bcc cls_lp
 
         ; init ZP vars before KERNAL calls clobber $B7-$BC
         lda #$00
@@ -240,9 +235,13 @@ irq_handler:
         pha
         lda $b3
         pha
+        lda $b4
+        pha
 
         jsr TRAM_PLAY
 
+        pla
+        sta $b4
         pla
         sta $b3
         pla

@@ -1307,10 +1307,9 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, dur
 
         # ── generate waveform frames via ffmpeg ──────────────────────────────
         viz_filters = {
-            # mode=fill draws from zero to the waveform tip (bar style) — far
-            # more pixels lit than mode=line's single-pixel trace.
+            # mode=cline fills from center to waveform (bar-like but bidirectional)
             "showwaves":
-                f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=fill"
+                f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
                 f":rate={actual_fps}:colors=#ffffff,format=gray",
             "showfreqs":
                 f"[0:a]showfreqs=s={WIDTH}x{HEIGHT}:mode=bar"
@@ -1319,12 +1318,12 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, dur
                 (f"[0:a]aformat=channel_layouts=mono,asplit=2[La][Ra];"
                  f"[Ra]adelay=50[Rd];[La][Rd]amerge=inputs=2[S];"
                  f"[S]avectorscope=s={WIDTH}x{HEIGHT}:zoom=1.5:draw=line"
-                 f":scale=sqrt,format=gray"),
+                 f":scale=lin,format=gray"),
             "showspectrum":
                 f"[0:a]showspectrum=s={WIDTH}x{HEIGHT}:slide=scroll"
-                f":scale=sqrt:color=intensity,format=gray",
+                f":scale=log:color=intensity,format=gray",
             "ahistogram":
-                f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=sqrt:slide=scroll"
+                f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=log:slide=scroll"
                 f",format=gray",
         }
         filt = viz_filters.get(viz, viz_filters["showwaves"])

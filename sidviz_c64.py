@@ -1471,14 +1471,14 @@ def main():
         # --- Camera display area ---
         _cam_ext_scr  = 0x0400 + 2 * WIDTH                     # $0450 (row 2)
         _cam_ext_col  = 0xD800 + 2 * WIDTH                     # $D850 (row 2 color RAM)
-        def _top_colors(cmode):
+        def _top_colors(cmode, screen=None):
             """6-row rainbow/density color stripe for rows 2-7."""
             if cmode == 0:
                 return bytes(RAINBOW_TAB[col] for _ in range(6) for col in range(WIDTH))
-            elif cmode == 1:
-                return bytes([1] * 6 * WIDTH)   # all white
-            else:
-                return bytes([8] * 6 * WIDTH)   # all orange (fire mid-tone)
+            lut, default = (_cam_wlut, 1) if cmode == 1 else (_cam_flut, 8)
+            if screen is None:
+                return [default] * (6 * WIDTH)
+            return bytes(lut.get(sc, default) for sc in screen)
 
         # --- Start camera ---
         cam_proc = start_ffmpeg_camera(camera_device, height=cam_height)
@@ -1791,7 +1791,7 @@ def main():
                     if viz_ffmpeg_proc:
                         write_mem(_cam_ext_col, color_top)
                     else:
-                        write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+                        write_mem(_cam_ext_col, _top_colors(state["cam_color"], top_screen))
 
                 # Bottom rows color RAM: Python writes directly in blend mode
                 if viz_ffmpeg_proc:
@@ -2037,13 +2037,13 @@ def main():
 
         _cam_ext_scr = 0x0400 + 2 * WIDTH       # $0450 row 2 screen RAM
         _cam_ext_col = 0xD800 + 2 * WIDTH       # $D850 row 2 color RAM
-        def _top_colors(cmode):
+        def _top_colors(cmode, screen=None):
             if cmode == 0:
                 return bytes(RAINBOW_TAB[col] for _ in range(6) for col in range(WIDTH))
-            elif cmode == 1:
-                return bytes([1] * 6 * WIDTH)
-            else:
-                return bytes([8] * 6 * WIDTH)
+            lut, default = (_cam_wlut, 1) if cmode == 1 else (_cam_flut, 8)
+            if screen is None:
+                return [default] * (6 * WIDTH)
+            return bytes(lut.get(sc, default) for sc in screen)
 
         # --- Clear display area ---
         write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
@@ -2292,7 +2292,7 @@ def main():
                     write_mem(_cam_ext_col, color_top)
                     write_mem(WAVE_COL_ADDR, color_bot)
                 else:
-                    write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+                    write_mem(_cam_ext_col, _top_colors(state["cam_color"], top_screen))
 
                 if petscii_queue is not None:
                     sc_top = top_screen

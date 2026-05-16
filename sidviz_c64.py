@@ -1273,9 +1273,9 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, dur
     if psid is None:
         return False
 
-    # ── determine capture duration ───────────────────────────────────────────
+    # ── SID metadata (used for duration and ticker) ──────────────────────────
+    info = get_sid_info(sid_file)
     if duration is None:
-        info = get_sid_info(sid_file)
         raw_len = info.get("Song Length", "")
         if raw_len:
             try:
@@ -1357,8 +1357,9 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, dur
         #   [pad to page boundary                ]
         #   [compressed frames  (must end < $D000)]
 
-        FRAME_IDX_C64  = 0x09E7   # C64 addr where frame index starts
-        IDX_FILE_OFF   = 488      # same expressed as file byte offset
+        # $09E7 = ticker_len (1 byte), $09E8-$0AE4 = ticker_buf (253 bytes)
+        FRAME_IDX_C64  = 0x0AE5   # C64 addr where frame index starts
+        IDX_FILE_OFF   = 742      # same as file byte offset (2 + FRAME_IDX_C64 - 0x0801)
         MAX_C64_END    = 0xD000   # exclusive — stop before I/O at $D000
 
         sid_load  = psid["load_addr"]
@@ -1480,7 +1481,14 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, dur
         init_addr = psid["init_addr"]
         play_addr = psid["play_addr"]
 
-        # Metadata (16 bytes → $09C0-$09CF)
+        # Ticker string — same build_ticker_string + ascii_to_petscii used in live mode
+        ticker_str     = build_ticker_string(info, "sid")
+        ticker_petscii = bytes(ascii_to_petscii(ticker_str))
+        ticker_petscii = (ticker_petscii + b'\x20' * 253)[:253]  # fixed 253-byte buffer
+        ticker_len_val = min(len(bytes(ascii_to_petscii(ticker_str))), 253)
+        print(f"[d64] Ticker ({ticker_len_val}): {ticker_str[:60].rstrip()}")
+
+        # Metadata (16 bytes → $09D0-$09DF)
         meta = bytearray(16)
         meta[0]  = init_addr & 0xFF
         meta[1]  = (init_addr >> 8) & 0xFF
@@ -1504,8 +1512,7 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, dur
         pad = fdat_c64_addr - idx_end_c64
         assert pad >= 0 and fdat_c64_addr % 256 == 0
 
-        # Frame index: 2-byte LE offsets from fdat_c64_addr (all fit in uint16
-        # because total_compressed ≤ MAX_C64_END − fdat_c64_addr < 53248 < 65536)
+        # Frame index: 2-byte LE offsets from fdat_c64_addr
         frame_index = bytearray()
         offset = 0
         for f in compressed_frames:
@@ -1520,9 +1527,11 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, dur
             + tram_init              # 3 bytes   ($09E0-$09E2)
             + tram_play              # 3 bytes   ($09E3-$09E5)
             + bytes([fdat_page_val]) # 1 byte    ($09E6)
-            + frame_index            # 2*N bytes ($09E7-...)
+            + bytes([ticker_len_val])# 1 byte    ($09E7)
+            + ticker_petscii         # 253 bytes ($09E8-$0AE4)
+            + frame_index            # 2*N bytes ($0AE5-...)
             + bytes(pad)             # pad to page boundary
-            + frame_data             # compressed frames (each: 1-byte color + RLE screen)
+            + frame_data             # color byte + RLE per frame
         )
 
         prg_end_c64 = 0x0801 + len(prg_data) - 2

@@ -1,22 +1,24 @@
 ; sidviz_d64.asm — standalone D64 player
 ; 64tass assembler  —  autostart: SYS 2064
 ;
-; v1.9.5 (2026-05-16)
+; v1.9.6 (2026-05-16)
 ;
-; PRG layout (Python assembles final file by appending after $09AF):
+; PRG layout (Python assembles final file by appending after $09D0):
 ;   $0801-$080C  BASIC stub (SYS 2064)
-;   $0810-$09AF  Player code  (this file, exactly 416 bytes)
-;   $09B0-$09BF  Metadata (16 bytes, Python fills in):
+;   $0810-$09CF  Player code  (this file, padded to $09D0 with .fill)
+;   $09D0-$09DF  Metadata (16 bytes, Python fills):
 ;                  [0-1]  SID init address (LE)
 ;                  [2-3]  SID play address (LE; $0000 = self-installs via IRQ)
 ;                  [4-5]  frame count (LE)
 ;                  [6]    fps_divisor = 50/fps  (e.g. 5 for 10fps)
 ;                  [7]    SIDDATA filename length
 ;                  [8-15] SIDDATA filename (PETSCII, $A0-padded, 8 bytes)
-;   $09C0-$09C2  Init trampoline  JMP initAddr  (Python fills)
-;   $09C3-$09C5  Play trampoline  JMP playAddr  (Python fills)
-;   $09C6        Frame-data base page (high byte of base addr; low byte always $00)
-;   $09C7-...    Frame index: 2 bytes/frame (LE byte-offset from fdat base)
+;   $09E0-$09E2  Init trampoline  JMP initAddr  (Python fills)
+;   $09E3-$09E5  Play trampoline  JMP playAddr  (Python fills)
+;   $09E6        Frame-data base page (high byte of base addr; low = $00)
+;   $09E7        Ticker string length (1 byte, Python fills)
+;   $09E8-$0AE4  Ticker string (253 bytes PETSCII, Python fills, $20-padded)
+;   $0AE5-...    Frame index: 2 bytes/frame (LE byte-offset from fdat base)
 ;                Python appends frame_count*2 bytes, then pads to next page boundary
 ;   ...          Compressed frame data (Python appends)
 ;
@@ -27,19 +29,19 @@
 ;   $00-$7F  count byte — the next (count+1) bytes are literals (1..128 bytes)
 ;   $80-$FF  run marker — repeat the next byte  (value - $7E) times  (2..129 reps)
 ;
-; ZP $B0-$BD (unused by sidviz.prg which only runs in live mode):
+; ZP $B0-$BD:
 ;   $B0/$B1  src_lo/src_hi   read pointer (compressed data)
 ;   $B2/$B3  dst_lo/dst_hi   write pointer (screen RAM)
 ;   $B4      frame_tick      IRQ countdown until next frame
 ;   $B5      new_frame       1 = advance + display next frame (set by IRQ)
 ;   $B6/$B7  cur_lo/cur_hi   current frame number
+;   $B8      ticker_pos      current read position in ticker string
 ;   $BD      fdat_page       high byte of frame-data base addr (low = $00)
 ;
-; NOTE: orig_irq is stored inline in irq_chain (self-patched by init) so
-; that a SID play routine using $B8/$B9 cannot corrupt the IRQ chain target.
-; fidx is inlined as immediate values (#<FRAME_IDX / #>FRAME_IDX) and
-; fdat_page is reloaded from FDAT_PAGE_ADDR each frame — both safe from SID
-; ZP collisions.
+; irq_chain ($08FD in code RAM) is self-patched by init with the KERNAL IRQ
+; vector so a SID using ZP $B8/$B9 cannot corrupt the IRQ chain target.
+; FRAME_IDX is an inline immediate; fdat_page is reloaded from FDAT_PAGE_ADDR
+; each frame — both safe from SID ZP collisions.
 
 src_lo      = $b0
 src_hi      = $b1
@@ -49,6 +51,7 @@ frame_tick  = $b4
 new_frame   = $b5
 cur_lo      = $b6
 cur_hi      = $b7
+ticker_pos  = $b8
 fdat_page   = $bd
 
 screen      = $0400
@@ -59,22 +62,23 @@ irq_vec_lo  = $0314
 irq_vec_hi  = $0315
 
 wave_scr    = $0540     ; screen row 8 — waveform area start
-; End of waveform area: $0540 + 680 = $07E8
 
 SETNAM      = $ffbd
 SETLFS      = $ffba
 KLOAD       = $ffd5
 
-META_INIT   = $09d0
-META_PLAY   = $09d2
-META_FCOUNT = $09d4
-META_FPSDIV = $09d6
-META_NAMLEN = $09d7
-META_NAME   = $09d8     ; 8 bytes PETSCII filename
-TRAM_INIT   = $09e0     ; Python writes: $4C lo hi
-TRAM_PLAY   = $09e3     ; Python writes: $4C lo hi
+META_INIT      = $09d0
+META_PLAY      = $09d2
+META_FCOUNT    = $09d4
+META_FPSDIV    = $09d6
+META_NAMLEN    = $09d7
+META_NAME      = $09d8  ; 8 bytes PETSCII filename
+TRAM_INIT      = $09e0  ; Python writes: $4C lo hi
+TRAM_PLAY      = $09e3  ; Python writes: $4C lo hi
 FDAT_PAGE_ADDR = $09e6
-FRAME_IDX   = $09e7
+TICKER_LEN     = $09e7  ; 1 byte: actual ticker string length (≤253)
+TICKER_BUF     = $09e8  ; 253 bytes: PETSCII ticker string, $20-padded
+FRAME_IDX      = $0ae5  ; 2 bytes/frame LE offsets from fdat base
 
 ; ---------------------------------------------------------------------------
 ; BASIC stub: 10 SYS 2064
@@ -97,8 +101,8 @@ next_line
 init:
         sei
 
-        ; disable BASIC ROM ($A000-$BFFF → RAM) while keeping KERNAL+I/O
-        ; $01 bits: 0=LORAM 1=HIRAM 2=CHAREN  ($36 = LORAM off, HIRAM+CHAREN on)
+        ; disable BASIC ROM ($A000-$BFFF → RAM) keeping KERNAL+I/O
+        ; $01 bits: LORAM off, HIRAM+CHAREN on ($36)
         lda #$36
         sta $01
 
@@ -121,19 +125,18 @@ cls_lp: sta (dst_lo),y
         dex
         bne cls_pg
         ldy #$00
-cls_rm: sta (dst_lo),y  ; last 232 bytes of page $07
+cls_rm: sta (dst_lo),y
         iny
         cpy #232
         bne cls_rm
 
-        ; init new_frame only (other ZP vars clobbered by KERNAL below; re-init after KLOAD)
+        ; init ZP vars before KERNAL calls clobber $B7-$BC
         lda #$00
         sta new_frame
+        sta ticker_pos
 
-        ; KERNAL LOAD: SIDDATA from disk (SA=1 → loads to file's embedded address)
-        ; NOTE: SETNAM clobbers $B7(FNLEN)=cur_hi, $BB/$BC(FNADR)
-        ;       SETLFS clobbers $B8(LA), $B9(SA)
-        ;       All are re-initialised after KLOAD below.
+        ; KERNAL LOAD: SIDDATA from disk (SA=1 → loads to embedded address)
+        ; SETNAM clobbers $B7/$BB/$BC; SETLFS clobbers $B8/$B9 — all re-inited below
         lda META_NAMLEN
         ldx #<META_NAME
         ldy #>META_NAME
@@ -154,11 +157,8 @@ cls_rm: sta (dst_lo),y  ; last 232 bytes of page $07
         sta cur_lo
         sta cur_hi
 
-        lda FDAT_PAGE_ADDR
-        sta fdat_page
-
         ; patch IRQ chain with KERNAL's original IRQ vector (before SID init
-        ; changes $0314/$0315).  Stored in code RAM so SID ZP use can't corrupt it.
+        ; changes $0314/$0315) — stored in code RAM, safe from SID ZP use
         lda irq_vec_lo
         sta irq_chain+1
         lda irq_vec_hi
@@ -201,6 +201,7 @@ main:
         lda #$00
         sta new_frame
 
+        jsr scroll_ticker
         jsr decomp_frame
 
         inc cur_lo
@@ -265,25 +266,20 @@ irq_done:
         pla
         tax
         pla
-; irq_chain is patched by init to: JMP <KERNAL IRQ vector>
-; Stored here in code RAM so that a SID using ZP $B8/$B9 cannot corrupt it.
+; irq_chain: self-patched by init to JMP <KERNAL IRQ vector>
 irq_chain:
         .byte $4c, $00, $00
 
 ; ---------------------------------------------------------------------------
-; decomp_frame
-;   Reads cur_lo/cur_hi, looks up byte-offset in FRAME_IDX,
-;   then RLE-decompresses frame into screen RAM $0540-$07E7.
+; decomp_frame — look up frame in FRAME_IDX, RLE-decomp to $0540-$07E7
 ; ---------------------------------------------------------------------------
 
 decomp_frame:
-        ; Reload fdat_page from its fixed PRG location each frame so that SID
-        ; play routines that use ZP $BD cannot permanently corrupt it.
+        ; Reload fdat_page each frame (safe if SID corrupts ZP $BD)
         lda FDAT_PAGE_ADDR
         sta fdat_page
 
-        ; address of index entry = FRAME_IDX + cur*2
-        ; FRAME_IDX is $09E7 — used as immediate so ZP $BB/$BC are not needed
+        ; index entry address = FRAME_IDX + cur*2  (FRAME_IDX as immediate)
         lda cur_lo
         asl
         pha                 ; save low byte of cur*2
@@ -294,7 +290,7 @@ decomp_frame:
         adc #>FRAME_IDX
         sta src_hi
 
-        pla                 ; A = low byte of cur*2
+        pla
         clc
         adc #<FRAME_IDX
         sta src_lo
@@ -302,50 +298,45 @@ decomp_frame:
         inc src_hi
 no_idx_carry:
 
-        ; read 2-byte frame offset from index
+        ; read 2-byte LE frame offset from index
         ldy #$00
         lda (src_lo),y      ; offset_lo
         pha
         ldy #$01
-        lda (src_lo),y      ; offset_hi — use X as scratch (IRQ saves/restores X)
+        lda (src_lo),y      ; offset_hi — use X (IRQ saves/restores X)
         tax
 
         ; frame data ptr = fdat_page:$00 + offset
-        ; (Python ensures frame data starts on a page boundary, so base_lo=$00)
         pla
-        sta src_lo          ; src_lo = offset_lo  (adds to $00, no carry)
-        txa                 ; A = offset_hi
+        sta src_lo
+        txa
         clc
         adc fdat_page
         sta src_hi
 
-        ; first byte of frame data = C64 color for the waveform area
+        ; first byte = C64 color for waveform rows 8-24
         ldy #$00
-        lda (src_lo),y      ; color byte
+        lda (src_lo),y
         jsr inc_src
-        ; A = color, Y=0; fill color RAM $D940-$DBE7 (680 bytes) for rows 8-24
-        ; Three contiguous segments using ABS,Y — no per-byte boundary check
-        ldy #191            ; $D940+191 = $D9FF (192 bytes: $D940-$D9FF)
+        ldy #191
 cfill1: sta $d940,y
         dey
         bpl cfill1
-        ldy #255            ; $DA00+255 = $DAFF (256 bytes: $DA00-$DAFF)
+        ldy #255
 cfill2: sta $da00,y
         dey
         bpl cfill2
-        ldy #231            ; $DB00+231 = $DBE7 (232 bytes: $DB00-$DBE7)
+        ldy #231
 cfill3: sta $db00,y
         dey
         bpl cfill3
-        ldy #$00            ; restore Y=0 for decompressor
+        ldy #$00
 
-        ; destination = wave_scr ($0540)
         lda #<wave_scr
         sta dst_lo
         lda #>wave_scr
         sta dst_hi
 
-; ── RLE loop ─────────────────────────────────────────────────────────────────
 decomp_lp:
         lda dst_hi
         cmp #$07
@@ -357,15 +348,14 @@ decomp_lp:
 
 decomp_body:
         ldy #$00
-        lda (src_lo),y      ; token byte
+        lda (src_lo),y
         jsr inc_src
         bmi do_run
 
-        ; $00-$7F: count byte — next (A+1) bytes are literals
         tax
-        inx                 ; X = literal count (1..128)
+        inx
 lit_lp:
-        lda (src_lo),y      ; literal byte (y=0)
+        lda (src_lo),y
         sta (dst_lo),y
         jsr inc_src
         jsr inc_dst
@@ -374,11 +364,10 @@ lit_lp:
         jmp decomp_lp
 
 do_run:
-        ; $80-$FF: run — repeat next byte (A - $7E) times
         sec
         sbc #$7e
         tax
-        lda (src_lo),y      ; run value (y=0)
+        lda (src_lo),y
         jsr inc_src
 run_lp:
         sta (dst_lo),y
@@ -388,6 +377,29 @@ run_lp:
         jmp decomp_lp
 
 decomp_done:
+        rts
+
+; ---------------------------------------------------------------------------
+; scroll_ticker — shift row 0 left one char, append next ticker char
+; ---------------------------------------------------------------------------
+
+scroll_ticker:
+        ldx #0
+stk_lp:
+        lda screen+1,x      ; copy char x+1 → x  (shift left)
+        sta screen,x
+        inx
+        cpx #39
+        bne stk_lp
+        ldy ticker_pos
+        lda TICKER_BUF,y    ; next char from ticker string
+        iny
+        cpy TICKER_LEN      ; wrap at end of string
+        bcc stk_ok
+        ldy #0
+stk_ok:
+        sty ticker_pos
+        sta screen+39       ; write to rightmost position
         rts
 
 ; ---------------------------------------------------------------------------
@@ -409,7 +421,7 @@ inc_dst_rts:
         rts
 
 ; ---------------------------------------------------------------------------
-; Pad so that metadata lands at $09B0
+; Pad so that metadata lands at $09D0
 ; ---------------------------------------------------------------------------
 
         .fill $09d0 - *, $00

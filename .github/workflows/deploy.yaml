@@ -38,10 +38,10 @@ jobs:
           BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
         run: |
           # Push Windows Executable
-          butler push ./dist/sidviz_u64-Windows.exe sidchoudhuri/sidviz:windows-64 --userversion ${{ github.event.release.tag_name }}
+          butler push ./dist/sidviz_u64-Windows.exe sidchoudhuri/sidviz:windows-64 --userversion "${{ github.event.release.tag_name }}"
           
           # Push Linux Binary
-          butler push ./dist/sidviz_u64-Linux sidchoudhuri/sidviz:linux-64 --userversion ${{ github.event.release.tag_name }}
+          butler push ./dist/sidviz_u64-Linux sidchoudhuri/sidviz:linux-64 --userversion "${{ github.event.release.tag_name }}"
           
           # Push macOS Binary
-          butler push ./dist/sidviz_u64-macOS sidchoudhuri/sidviz:osx-64 --userversion ${{ github.event.release.tag_name }}
+          butler push ./dist/sidviz_u64-macOS sidchoudhuri/sidviz:osx-64 --userversion "${{ github.event.release.tag_name }}"

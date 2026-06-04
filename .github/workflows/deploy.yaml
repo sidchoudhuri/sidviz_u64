@@ -4,6 +4,11 @@ on:
   release:
     types: [published] # Triggers on GitHub Release
   workflow_dispatch: # Manual trigger
+    inputs:
+      reason:
+        description: 'Latest Release'
+        required: false
+        default: 'Manually deployed'
 
 jobs:
   deploy:

@@ -17,21 +17,24 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      # 1. Download binaries
-      - name: Set Release Tag Env
-        run: |
-          if [ -n "${{ github.event.release.tag_name }}" ]; then
-            echo "RELEASE_TAG=${{ github.event.release.tag_name }}" >> $GITHUB_ENV
-          else
-            echo "RELEASE_TAG=latest" >> $GITHUB_ENV
-          fi
-          
-      - name: Download Release Assets
+      # 1a. Download assets when triggered automatically by a published Release
+      - name: Download Release Assets (Automatic)
+        if: github.event_name == 'release'
         uses: robinraju/release-downloader@v1.11
         with:
           repository: "${{ github.repository }}"
-          tag: "${{ env.RELEASE_TAG }}"
-          fileName: "*" # Downloads all assets (Linux, macOS, Windows exe)
+          tag: "${{ github.event.release.tag_name }}"
+          fileName: "*"
+          out-file-path: "./dist"
+
+      # 1b. Download assets when triggered manually via workflow_dispatch
+      - name: Download Release Assets (Manual Fallback)
+        if: github.event_name == 'workflow_dispatch'
+        uses: robinraju/release-downloader@v1.11
+        with:
+          repository: "${{ github.repository }}"
+          tag: "latest"
+          fileName: "*"
           out-file-path: "./dist"
 
       # 2. Install Butler (Kept your efficient manual installation script)

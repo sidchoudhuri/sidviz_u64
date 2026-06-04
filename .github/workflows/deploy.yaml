@@ -2,7 +2,8 @@ name: Deploy to itch.io
 
 on:
   release:
-    types: [published] # Triggers only when a GitHub Release is officially published
+    types: [published] # Triggers on GitHub Release
+  workflow_dispatch: # Manual trigger
 
 jobs:
   deploy:

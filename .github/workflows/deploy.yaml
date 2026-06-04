@@ -30,7 +30,7 @@ jobs:
             TARGET_TAG="${{ github.event.release.tag_name }}"
           else
             echo "Manual run detected. Finding the latest available release tag..."
-            TARGET_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
+            TARGET_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 | awk -F'\t' '{print $3}')
           fi
           
           if [ -z "$TARGET_TAG" ] || [ "$TARGET_TAG" = "null" ]; then
@@ -57,12 +57,13 @@ jobs:
       - name: Push Build to itch.io
         env:
           BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # If triggered manually, evaluate the actual downloaded tag version for butler
           if [ -n "${{ github.event.release.tag_name }}" ]; then
             VERSION_TAG="${{ github.event.release.tag_name }}"
           else
-            VERSION_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
+            VERSION_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 | awk -F'\t' '{print $3}')
           fi
 
           # Push Windows Executable

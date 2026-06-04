@@ -2,13 +2,8 @@ name: Deploy to itch.io
 
 on:
   release:
-    types: [published] # Triggers on GitHub Release
-  workflow_dispatch: # Manual trigger
-    inputs:
-      reason:
-        description: 'Latest Release'
-        required: false
-        default: 'Manually deployed'
+    types: [published]
+  workflow_dispatch: # Clean manual trigger with no unneeded inputs
 
 jobs:
   deploy:
@@ -17,29 +12,12 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      # 1. Download Release Assets
-      - name: Download Release Assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p ./dist
-          
-          # If triggered by a release event, use that specific tag.
-          # If triggered manually, query GitHub for the absolute newest release tag.
-          if [ -n "${{ github.event.release.tag_name }}" ]; then
-            TARGET_TAG="${{ github.event.release.tag_name }}"
-          else
-            echo "Manual run detected. Finding the latest available release tag..."
-            TARGET_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
-          fi
-          
-          if [ -z "$TARGET_TAG" ] || [ "$TARGET_TAG" = "null" ]; then
-            echo "Error: No releases found in this repository."
-            exit 1
-          fi
-          
-          echo "Downloading assets for tag: $TARGET_TAG"
-          gh release download "$TARGET_TAG" --repo "${{ github.repository }}" --dir ./dist --pattern "*"
+      # 1. Grab your build binaries directly from the workflow artifacts
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./dist
+          merge-multiple: true
 
       # 2. Install Butler
       - name: Install butler
@@ -50,31 +28,19 @@ jobs:
           chmod +x ~/bin/butler
           echo "$HOME/bin" >> $GITHUB_PATH
 
-      # 3. Push each platform binary to its respective itch.io channel
+      # 3. Push to itch.io
       - name: Push Build to itch.io
         env:
           BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # If triggered manually, evaluate the actual downloaded tag version for butler
-          if [ -n "${{ github.event.release.tag_name }}" ]; then
-            VERSION_TAG="${{ github.event.release.tag_name }}"
-          else
-            VERSION_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
-          fi
-
-          if [ -z "$VERSION_TAG" ] || [ "$VERSION_TAG" = "null" ]; then
-            echo "Error: Could not determine version tag for Butler."
-            exit 1
-          fi
-
-          echo "Pushing version: $VERSION_TAG"
+          # Use a simple fallback for the version name string
+          VERSION="${{ github.event.release.tag_name || github.sha }}"
 
           # Push Windows Executable
-          butler push ./dist/sidviz_u64-Windows.exe sidchoudhuri/sidviz:windows-64 --userversion "$VERSION_TAG"
+          butler push ./dist/sidviz_u64-Windows.exe sidchoudhuri/sidviz:windows-64 --userversion "$VERSION"
           
           # Push Linux Binary
-          butler push ./dist/sidviz_u64-Linux sidchoudhuri/sidviz:linux-64 --userversion "$VERSION_TAG"
+          butler push ./dist/sidviz_u64-Linux sidchoudhuri/sidviz:linux-64 --userversion "$VERSION"
           
           # Push macOS Binary
-          butler push ./dist/sidviz_u64-macOS sidchoudhuri/sidviz:osx-64 --userversion "$VERSION_TAG"
+          butler push ./dist/sidviz_u64-macOS sidchoudhuri/sidviz:osx-64 --userversion "$VERSION"

@@ -1,0 +1,37 @@
+name: Deploy to itch.io
+
+on:
+  push:
+    branches:
+      - main  # Triggers the workflow when you push to the main branch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install butler
+        run: |
+          # Create a directory for butler
+          mkdir -p ~/bin
+          # Download the latest stable Linux build via the broth URL
+          curl -L -o butler.zip https://broth.itch.zone/butler/linux-amd64/LATEST/archive/default
+          # Unzip and make it executable
+          unzip butler.zip -d ~/bin
+          chmod +x ~/bin/butler
+          # Add butler to the GitHub Actions PATH environment
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Verify butler installation
+        run: butler version
+
+      - name: Push build to itch.io
+        env:
+          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+        run: |
+          # Replace 'username', 'game-slug', and 'channel' with your details
+          # e.g., username/my-awesome-game:windows-beta
+          butler push ./your-build-folder username/game-slug:channel

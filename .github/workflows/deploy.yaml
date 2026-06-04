@@ -30,7 +30,7 @@ jobs:
             TARGET_TAG="${{ github.event.release.tag_name }}"
           else
             echo "Manual run detected. Finding the latest available release tag..."
-            TARGET_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 | awk -F'\t' '{print $3}')
+            TARGET_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
           fi
           
           if [ -z "$TARGET_TAG" ] || [ "$TARGET_TAG" = "null" ]; then
@@ -50,9 +50,6 @@ jobs:
           chmod +x ~/bin/butler
           echo "$HOME/bin" >> $GITHUB_PATH
 
-      - name: Verify butler installation
-        run: butler version
-
       # 3. Push each platform binary to its respective itch.io channel
       - name: Push Build to itch.io
         env:
@@ -63,8 +60,15 @@ jobs:
           if [ -n "${{ github.event.release.tag_name }}" ]; then
             VERSION_TAG="${{ github.event.release.tag_name }}"
           else
-            VERSION_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 | awk -F'\t' '{print $3}')
+            VERSION_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
           fi
+
+          if [ -z "$VERSION_TAG" ] || [ "$VERSION_TAG" = "null" ]; then
+            echo "Error: Could not determine version tag for Butler."
+            exit 1
+          fi
+
+          echo "Pushing version: $VERSION_TAG"
 
           # Push Windows Executable
           butler push ./dist/sidviz_u64-Windows.exe sidchoudhuri/sidviz:windows-64 --userversion "$VERSION_TAG"

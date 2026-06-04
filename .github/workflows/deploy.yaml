@@ -17,25 +17,29 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      # 1a. Download assets when triggered automatically by a published Release
-      - name: Download Release Assets (Automatic)
-        if: github.event_name == 'release'
-        uses: robinraju/release-downloader@v1.11
-        with:
-          repository: "${{ github.repository }}"
-          tag: "${{ github.event.release.tag_name }}"
-          fileName: "*"
-          out-file-path: "./dist"
-
-      # 1b. Download assets when triggered manually via workflow_dispatch
-      - name: Download Release Assets (Manual Fallback)
-        if: github.event_name == 'workflow_dispatch'
-        uses: robinraju/release-downloader@v1.11
-        with:
-          repository: "${{ github.repository }}"
-          tag: "latest"
-          fileName: "*"
-          out-file-path: "./dist"
+      # 1. Download Release Assets
+      - name: Download Release Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ./dist
+          
+          # If triggered by a release event, use that specific tag.
+          # If triggered manually, query GitHub for the absolute newest release tag.
+          if [ -n "${{ github.event.release.tag_name }}" ]; then
+            TARGET_TAG="${{ github.event.release.tag_name }}"
+          else
+            echo "Manual run detected. Finding the latest available release tag..."
+            TARGET_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
+          fi
+          
+          if [ -z "$TARGET_TAG" ] || [ "$TARGET_TAG" = "null" ]; then
+            echo "Error: No releases found in this repository."
+            exit 1
+          fi
+          
+          echo "Downloading assets for tag: $TARGET_TAG"
+          gh release download "$TARGET_TAG" --repo "${{ github.repository }}" --dir ./dist --pattern "*"
 
       # 2. Install Butler (Kept your efficient manual installation script)
       - name: Install butler

@@ -41,7 +41,7 @@ jobs:
           echo "Downloading assets for tag: $TARGET_TAG"
           gh release download "$TARGET_TAG" --repo "${{ github.repository }}" --dir ./dist --pattern "*"
 
-      # 2. Install Butler (Kept your efficient manual installation script)
+      # 2. Install Butler
       - name: Install butler
         run: |
           mkdir -p ~/bin
@@ -58,11 +58,18 @@ jobs:
         env:
           BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
         run: |
+          # If triggered manually, evaluate the actual downloaded tag version for butler
+          if [ -n "${{ github.event.release.tag_name }}" ]; then
+            VERSION_TAG="${{ github.event.release.tag_name }}"
+          else
+            VERSION_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
+          fi
+
           # Push Windows Executable
-          butler push ./dist/sidviz_u64-Windows.exe sidchoudhuri/sidviz:windows-64 --userversion "${{ github.event.release.tag_name }}"
+          butler push ./dist/sidviz_u64-Windows.exe sidchoudhuri/sidviz:windows-64 --userversion "$VERSION_TAG"
           
           # Push Linux Binary
-          butler push ./dist/sidviz_u64-Linux sidchoudhuri/sidviz:linux-64 --userversion "${{ github.event.release.tag_name }}"
+          butler push ./dist/sidviz_u64-Linux sidchoudhuri/sidviz:linux-64 --userversion "$VERSION_TAG"
           
           # Push macOS Binary
-          butler push ./dist/sidviz_u64-macOS sidchoudhuri/sidviz:osx-64 --userversion "${{ github.event.release.tag_name }}"
+          butler push ./dist/sidviz_u64-macOS sidchoudhuri/sidviz:osx-64 --userversion "$VERSION_TAG"

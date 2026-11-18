@@ -121,8 +121,8 @@ cls_lp: sta (dst_lo),y
         iny
         bne cls_lp
         inc dst_hi
-        lda dst_hi
-        cmp #$08
+        ldx dst_hi          ; X, so A keeps the space for pages $05-$07
+        cpx #$08
         bcc cls_lp
 
         ; init ZP vars before KERNAL calls clobber $B7-$BC
@@ -317,18 +317,18 @@ no_idx_carry:
         ldy #$00
         lda (src_lo),y
         jsr inc_src
-        ldy #191
-cfill1: sta $d940,y
-        dey
-        bpl cfill1
-        ldy #255
-cfill2: sta $da00,y
-        dey
-        bpl cfill2
-        ldy #231
-cfill3: sta $db00,y
-        dey
-        bpl cfill3
+        ldy #192            ; fills Y-1 down to 0 (bpl can't count down from 128+)
+cfill1: dey
+        sta $d940,y
+        bne cfill1
+        ldy #0              ; 256 bytes
+cfill2: dey
+        sta $da00,y
+        bne cfill2
+        ldy #232
+cfill3: dey
+        sta $db00,y
+        bne cfill3
         ldy #$00
 
         lda #<wave_scr
@@ -348,7 +348,9 @@ decomp_lp:
 decomp_body:
         ldy #$00
         lda (src_lo),y
+        pha
         jsr inc_src
+        pla                 ; flags from the token again (inc_src changes N)
         bmi do_run
 
         tax

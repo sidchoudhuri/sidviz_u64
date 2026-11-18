@@ -11,6 +11,11 @@ Memory protocol:
   $C001     = color flag  (2=rainbow, 1=white density, 3=fire density)
   $C002     = sid_ready   (Python sets 1 after uploading SID code)
   $C003     = quit_flag   (Python writes 1 to stop SID and return C64 to BASIC)
+  $C004     = bg_flag     (Python writes 1 once a background picture is uploaded)
+  $C005     = bg_wcol     (0=visualizer keeps the colour mode, 1=takes the picture's colour)
+  $C700     = background picture, 680 screen codes (rows 8-24)
+  $CA00     = background picture, 680 colours      (rows 8-24)
+  $C007-$C020 = bitmap background settings; $8000-$BFFF + $E000 = bitmap background (see sidviz.asm)
   $C620/$C621 = SID play vector saved post-init (play_addr=0 SIDs)
   $C100     = frame buffer, 680 bytes PETSCII (rows 8-24, $C100-$C3A7)
   $C3A8     = white density color table, 128 bytes (screen_code → C64 color)
@@ -28,8 +33,8 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.9.5"
-BUILD   = "2026-05-16"
+VERSION = "1.9.7"
+BUILD   = "2026-11-18"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, termios, tty, re, json, select as _select, struct, queue
@@ -264,6 +269,20 @@ def parse_args():
     p.add_argument("--camera-device", default="0",         metavar="DEV",
                    help="Camera device: index (0,1,…) or path (/dev/video0). Default: 0")
     p.add_argument("--list-cameras",  action="store_true", help="List available camera devices and exit")
+    p.add_argument("--background", "--bkgd", dest="background", metavar="FILE",
+                   help="Background picture behind the visualizer (JPEG, PNG..., or a Koala .kla / Art Studio .art file)")
+    p.add_argument("--no-background", "--no-bkgd", dest="no_background", action="store_true",
+                   help="No background picture, and do not ask for one")
+    p.add_argument("--bkgd-type",      choices=["petscii", "koala", "hires"], help="Background: PETSCII characters, Koala (multicolour) or hires bitmap")
+    p.add_argument("--bkgd-layout",    choices=["behind", "split"], help="Bitmap background: behind the visualizer, or split screen")
+    p.add_argument("--bkgd-split",     choices=["top", "bottom", "left", "right"], help="Split screen: where the picture goes")
+    p.add_argument("--bkgd-size",      type=int, metavar="N", help="Split screen: picture rows (top/bottom) or columns (left/right)")
+    p.add_argument("--bkgd-scale",     choices=["crop", "rescale"], help="A .kla/.art file: crop to fit (pixels unchanged) or rescale")
+    p.add_argument("--bkgd-fit",       choices=["fill", "fit", "stretch"], help="Background: fill the screen, fit with black bars, or stretch")
+    p.add_argument("--bkgd-dither",    choices=["none", "2x2", "4x4", "8x8"], help="Background: Bayer dither pattern")
+    p.add_argument("--bkgd-strength",  type=int, metavar="0-100", help="Background: dither strength (default 50)")
+    p.add_argument("--bkgd-palette",   type=str.lower, choices=["palette", "colodore", "pepto", "deekay"], help="Background: which C64 palette to match")
+    p.add_argument("--bkgd-wavecolor", choices=["mode", "picture"], help="Visualizer colours over the picture: the colour mode, or the picture's colours")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
     p.add_argument("--save-d64",     metavar="FILE.d64",
                    help="Save SID + pre-rendered frames to a bootable D64 disk image")
@@ -578,7 +597,8 @@ def start_ffmpeg_waveform_stream(url, height=HEIGHT):
     cmd = ["ffmpeg", "-loglevel", "quiet", "-re", "-i", "pipe:0",
            "-filter_complex", _build_viz_filter(height),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
-    p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.Popen(_leds_cmd(cmd), pass_fds=LED_FDS, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _leds_started()
     yt_proc.stdout.close()  # let ffmpeg own the pipe; yt_proc gets SIGPIPE if ffmpeg exits early
     print("[*] ffmpeg waveform (stream) started.")
     return yt_proc, p
@@ -765,9 +785,46 @@ def make_fifo(path):
     os.mkfifo(path)
     print(f"[*] FIFO created: {path}")
 
+VIZ_W = 40     # visualizer width in cells (narrower beside a left/right picture)
+
+class LatestFrame:
+    """Reads visualizer frames from ffmpeg as they come and keeps only the newest, so the
+    C64 always gets the frame that goes with the music now (older ones are dropped)."""
+    def __init__(self, pipe, frame_size):
+        self.pipe, self.size = pipe, frame_size
+        self.frame, self.eof, self.dropped = None, False, 0
+        self.cv = threading.Condition()
+        threading.Thread(target=self._run, daemon=True).start()
+    def _run(self):
+        while True:
+            data = b""
+            while len(data) < self.size:
+                try:
+                    chunk = self.pipe.read(self.size - len(data))
+                except (ValueError, OSError):
+                    chunk = b""
+                if not chunk:
+                    with self.cv:
+                        self.eof = True
+                        self.cv.notify_all()
+                    return
+                data += chunk
+            with self.cv:
+                if self.frame is not None:
+                    self.dropped += 1
+                self.frame = data
+                self.cv.notify_all()
+    def get(self, timeout):
+        """The newest unsent frame, or None if none arrived within timeout."""
+        with self.cv:
+            if self.frame is None and not self.eof:
+                self.cv.wait(timeout)
+            data, self.frame = self.frame, None
+            return data
+
 def _build_viz_filter(height=HEIGHT):
     if VIZ_MODE == "showfreqs":
-        return (f"[0:a]showfreqs=s={WIDTH}x{height}:mode=bar"
+        return (f"[0:a]showfreqs=s={VIZ_W}x{height}:mode=bar"
                 f":ascale=log:fscale=log:colors=#ffffff,format=gray")
     if VIZ_MODE == "avectorscope":
         # avectorscope lissajous mode: X=L, Y=R.  SID is mono so L=R → diagonal.
@@ -776,17 +833,17 @@ def _build_viz_filter(height=HEIGHT):
         filt = (f"[0:a]aformat=channel_layouts=mono,asplit=2[La][Ra];"
                 f"[Ra]adelay=2[Rd];"
                 f"[La][Rd]amerge=inputs=2[S];"
-                f"[S]avectorscope=s={WIDTH}x{height}:zoom=1.8:draw=dot:scale=log"
+                f"[S]avectorscope=s={VIZ_W}x{height}:zoom=1.8:draw=dot:scale=log"
                 f",format=gray")
         print(f"[*] avectorscope filter: {filt}")
         return filt
     if VIZ_MODE == "showspectrum":
-        return (f"[0:a]showspectrum=s={WIDTH}x{height}:slide=scroll"
+        return (f"[0:a]showspectrum=s={VIZ_W}x{height}:slide=scroll"
                 f":scale=log:color=intensity,format=gray")
     if VIZ_MODE == "ahistogram":
-        return (f"[0:a]ahistogram=s={WIDTH}x{height}:scale=log:slide=scroll"
+        return (f"[0:a]ahistogram=s={VIZ_W}x{height}:scale=log:slide=scroll"
                 f",format=gray")
-    return (f"[0:a]showwaves=s={WIDTH}x{height}:mode=cline"
+    return (f"[0:a]showwaves=s={VIZ_W}x{height}:mode=cline"
             f":rate={FPS}:colors=#ffffff,format=gray")
 
 def start_ffmpeg_waveform_fifo(realtime=False, height=HEIGHT):
@@ -795,7 +852,8 @@ def start_ffmpeg_waveform_fifo(realtime=False, height=HEIGHT):
     cmd = ["ffmpeg", "-loglevel", "quiet"] + re_flag + ["-f", "wav", "-i", FIFO_PATH,
            "-filter_complex", _build_viz_filter(height),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.Popen(_leds_cmd(cmd), pass_fds=LED_FDS, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _leds_started()
     print("[*] ffmpeg waveform (FIFO) started."); return p
 
 def start_ffmpeg_waveform_file(filepath, height=HEIGHT, seek_secs=0.0):
@@ -808,7 +866,8 @@ def start_ffmpeg_waveform_file(filepath, height=HEIGHT, seek_secs=0.0):
            "-i", filepath,
            "-filter_complex", _build_viz_filter(height),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.Popen(_leds_cmd(cmd), pass_fds=LED_FDS, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _leds_started()
     print("[*] ffmpeg waveform (file) started."); return p
 
 def start_ffmpeg_camera(device="0", height=HEIGHT):
@@ -1019,6 +1078,89 @@ def upload_sid_to_c64(psid):
         else:
             print(f"[!] Could not read $C620 — play may not work")
 
+
+# ---------------------------------------------------------------------------
+# C64U LEDs: the LEDs follow the SID at $D400's registers, so a silent fake
+# SID (volume 0) driven by the music makes them flash with an MP3 or stream.
+# The visualizer's ffmpeg also outputs the audio as three bands (bass, mid,
+# treble) on a second pipe; each band drives one SID voice's gate.
+# ---------------------------------------------------------------------------
+
+LEDS      = False      # set in main() when the user says yes
+LED_FDS   = ()         # the write end of the band pipe, passed to ffmpeg
+LED_SID   = 0xD400
+LED_RATE  = 8000       # band audio sample rate
+LED_HZ    = 15         # LED updates a second
+_led_state = {"avg": [0.0, 0.0, 0.0], "on": [0, 0, 0], "rfd": None, "stop": False}
+_led_lock = threading.Lock()
+
+def _leds_cmd(cmd):
+    """Add the band-audio output to a visualizer ffmpeg command (when the LEDs are on)."""
+    global LED_FDS
+    if not LEDS:
+        return cmd
+    i = cmd.index("-filter_complex")
+    viz = cmd[i + 1].replace("[0:a]", "[vz]", 1) + "[v]"
+    bands = ("[ld]aformat=channel_layouts=mono,asplit=3[l1][l2][l3];"
+             "[l1]lowpass=f=200[b1];[l2]bandpass=f=1000:width_type=o:w=2[b2];[l3]highpass=f=4000[b3];"
+             f"[b1][b2][b3]amerge=inputs=3,aresample={LED_RATE}[ab]")
+    r, w = os.pipe()
+    _led_state["rfd"] = r
+    LED_FDS = (w,)
+    return (cmd[:i] + ["-filter_complex", "[0:a]asplit=2[vz][ld];" + viz + ";" + bands,
+                       "-map", "[v]", "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1",
+                       "-map", "[ab]", "-f", "s16le", "-ac", "3", f"pipe:{w}"])
+
+def _leds_started():
+    """After ffmpeg has started: close our copy of the write end, start reading the bands."""
+    global LED_FDS
+    if not LEDS or _led_state["rfd"] is None:
+        return
+    for fd in LED_FDS:
+        os.close(fd)
+    LED_FDS = ()
+    threading.Thread(target=_leds_reader, args=(_led_state["rfd"],), daemon=True).start()
+
+def _leds_reader(rfd):
+    """Measure each band about 15 times a second and update the fake SID straight from here,
+    so the LEDs don't wait for the (slower) frame loop."""
+    per = max(1, LED_RATE // LED_HZ) * 6        # bytes per tick: 3 channels x 2 bytes
+    buf, last = b"", 0.0
+    with os.fdopen(rfd, "rb", buffering=0) as f:
+        while not _led_state["stop"]:
+            d = f.read(65536)
+            if not d:
+                return
+            buf += d
+            while len(buf) >= per:
+                blk, buf = buf[:per], buf[per:]
+                vals = struct.unpack(f"<{per // 2}h", blk)
+                lv = [sum(abs(v) for v in vals[c::3]) / (per // 6) for c in range(3)]
+                regs = leds_tick(lv)
+                now = time.time()
+                if now - last >= 0.5 / LED_HZ and not _led_state["stop"]:   # skip writes if blocks arrive in a burst
+                    last = now
+                    write_mem(LED_SID, regs)
+
+def leds_tick(lv):
+    """The 21 SID voice registers for this tick. A band with sound in it blinks its voice's gate:
+    loud = every tick, medium = every 2 ticks, quiet = every 4; a jump restarts the blink."""
+    regs = []
+    for c in range(3):
+        avg = _led_state["avg"][c] = _led_state["avg"][c] * 0.95 + lv[c] * 0.05
+        cnt = _led_state["on"][c] + 1
+        if lv[c] > avg * 1.4:
+            cnt = 0                                 # a hit: light up now
+        _led_state["on"][c] = cnt
+        if lv[c] < 25:
+            on = False                              # silence in this band
+        else:
+            period = 1 if lv[c] >= avg * 1.1 else 2 if lv[c] >= avg * 0.6 else 4
+            on = (cnt // period) % 2 == 0
+        freq = (0x0800, 0x1800, 0x3000)[c]
+        regs += [freq & 0xFF, freq >> 8, 0x00, 0x08, 0x10 | (1 if on else 0), 0x00, 0xF0]
+    return regs
+
 # ---------------------------------------------------------------------------
 # Keypress toggle
 # ---------------------------------------------------------------------------
@@ -1192,8 +1334,9 @@ def _apply_freq_gradient(raw, color_mode, height=HEIGHT):
                 scale = 1.0 - (row - (height - 3)) / 2 * 0.5
             else:                    # tip→body: 0.2 at row 0, 1.0 at row height-3
                 scale = 0.2 + row / (height - 3) * 0.8
-        start = row * WIDTH
-        for i in range(start, start + WIDTH):
+        width = len(buf) // height
+        start = row * width
+        for i in range(start, start + width):
             if buf[i] > 0:
                 buf[i] = max(1, int(buf[i] * scale))
     return bytes(buf)
@@ -1582,8 +1725,592 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, dur
 # Main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Background picture (--background / --bkgd)
+#
+# The picture is turned into PETSCII block characters over rows 2-24: each cell
+# is one colour on the black background, as quarter blocks (80 x 46 of them) or
+# as a half-tone checker for a darker shade. Rows 8-24 are
+# uploaded to the PRG ($C700 screen codes, $CA00 colours), which shows them
+# wherever the waveform frame has a space; rows 2-7 are mixed in here, since
+# Python writes those rows itself.
+# ---------------------------------------------------------------------------
+
+import zlib
+
+BKGD_FLAG   = 0xC004   # Python writes 1 once the picture is uploaded
+BKGD_WCOL   = 0xC005   # 0 = waveform keeps the colour mode, 1 = takes the picture's colour
+BKGD_CHARS  = 0xC700   # 680 screen codes, rows 8-24
+BKGD_COLS   = 0xCA00   # 680 colours,      rows 8-24
+BKGD_ROWS   = 23       # rows 2-24
+BKGD_TOP    = 6 * WIDTH            # cells in rows 2-7
+BKGD_PW     = WIDTH * 2            # 80 blocks across
+BKGD_PH     = BKGD_ROWS * 2        # 46 blocks down
+BKGD_PAR    = 0.936                # width of a C64 pixel on a PAL screen (height = 1)
+
+# The C64's 16 colours as measured four ways (the same sets as retropixels / SIDlab's Picture maker)
+BKGD_PALETTES = {
+    "palette":  [(0x00,0x00,0x00),(0xff,0xff,0xff),(0x8c,0x32,0x3d),(0x66,0xbf,0xb3),(0x8e,0x36,0xa1),(0x4a,0xa6,0x48),(0x32,0x2d,0xab),(0xcd,0xd2,0x56),
+                 (0x8f,0x50,0x1a),(0x53,0x3d,0x01),(0xbd,0x63,0x6e),(0x4e,0x4e,0x4e),(0x76,0x76,0x76),(0x8c,0xe9,0x8b),(0x6b,0x66,0xe4),(0xa3,0xa3,0xa3)],
+    "colodore": [(0x00,0x00,0x00),(0xff,0xff,0xff),(0x81,0x33,0x38),(0x75,0xce,0xc8),(0x8e,0x3c,0x97),(0x56,0xac,0x4d),(0x2e,0x2c,0x9b),(0xed,0xf0,0x71),
+                 (0x8e,0x50,0x29),(0x55,0x38,0x00),(0xc4,0x6c,0x71),(0x4a,0x4a,0x4a),(0x7b,0x7b,0x7b),(0xa9,0xff,0x9f),(0x70,0x6e,0xeb),(0xb2,0xb2,0xb2)],
+    "pepto":    [(0x00,0x00,0x00),(0xff,0xff,0xff),(0x68,0x37,0x2b),(0x70,0xa4,0xb2),(0x6f,0x3d,0x86),(0x58,0x8d,0x43),(0x35,0x28,0x79),(0xb8,0xc7,0x6f),
+                 (0x6f,0x4f,0x25),(0x43,0x39,0x00),(0x9a,0x67,0x59),(0x44,0x44,0x44),(0x6c,0x6c,0x6c),(0x9a,0xd2,0x84),(0x6c,0x5e,0xb5),(0x95,0x95,0x95)],
+    "deekay":   [(0x00,0x00,0x00),(0xff,0xff,0xff),(0x88,0x20,0x00),(0x68,0xd0,0xa8),(0xa8,0x38,0xa0),(0x50,0xb8,0x43),(0x18,0x10,0x90),(0xf0,0xe8,0x58),
+                 (0xa0,0x48,0x00),(0x47,0x2b,0x1b),(0xc8,0x78,0x70),(0x48,0x48,0x48),(0x80,0x80,0x80),(0x98,0xff,0x98),(0x50,0x90,0xd0),(0xb8,0xb8,0xb8)],
+}
+
+# Screen code for each mix of quarter blocks: bit 0 = upper left, 1 = upper right, 2 = lower left, 3 = lower right
+BKGD_QUAD = [0x20, 0x7E, 0x7C, 0xE2, 0x7B, 0x61, 0xFF, 0xEC, 0x6C, 0x7F, 0xE1, 0xFB, 0x62, 0xFC, 0xFE, 0xA0]
+BKGD_CHECKER = 0x66    # the fine checker: half the cell lit, read as a darker shade of its colour
+BKGD_HALF    = 0.73    # how bright that half-lit cell looks next to a solid one
+
+BKGD_BAYER = {
+    "2x2": [[0, 2], [3, 1]],
+    "4x4": [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]],
+    "8x8": [[ 0, 32,  8, 40,  2, 34, 10, 42], [48, 16, 56, 24, 50, 18, 58, 26],
+            [12, 44,  4, 36, 14, 46,  6, 38], [60, 28, 52, 20, 62, 30, 54, 22],
+            [ 3, 35, 11, 43,  1, 33,  9, 41], [51, 19, 59, 27, 49, 17, 57, 25],
+            [15, 47,  7, 39, 13, 45,  5, 37], [63, 31, 55, 23, 61, 29, 53, 21]],
+}
+
+def _bkgd_clean_path(s):
+    """A typed or dragged-in path: no quotes, no backslashes before spaces."""
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        s = s[1:-1]
+    return s.replace("\\ ", " ")
+
+def bkgd_decode_c64(path, palette):
+    """A Koala Painter (.kla/.koa, 10003 bytes) or Art Studio hires (.art, 9009 bytes) file
+    as 320x200 RGB bytes, or None if the file is neither."""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        with open(path, "rb") as f:
+            d = f.read(10004)
+    except OSError:
+        return None
+    koala = ext in (".kla", ".koa") and len(d) == 10003
+    hires = ext in (".art", ".aas") and len(d) == 9009
+    if not (koala or hires):
+        return None
+    bitmap, scr = d[2:8002], d[8002:9002]
+    colram = d[9002:10002] if koala else None
+    bg = (d[10002] & 15) if koala else 0
+    out = bytearray(320 * 200 * 3)
+    for cell in range(1000):
+        cx, cy = cell % 40, cell // 40
+        hi, lo = scr[cell] >> 4, scr[cell] & 15
+        for r in range(8):
+            b = bitmap[cell * 8 + r]
+            o = ((cy * 8 + r) * 320 + cx * 8) * 3
+            for x in range(8):
+                if koala:
+                    v = (b >> (6 - (x & 6))) & 3
+                    c = (bg, hi, lo, colram[cell] & 15)[v]
+                else:
+                    c = hi if (b >> (7 - x)) & 1 else lo
+                out[o + x * 3: o + x * 3 + 3] = bytes(palette[c])
+    return bytes(out)
+
+def bkgd_fetch_rgb(path, w, h, fit, palette, par=BKGD_PAR):
+    """The picture as w x h RGB bytes, scaled by ffmpeg. fit = fit / fill / stretch."""
+    vw, vh = round(w * par * 8), h * 8               # the target area in square pixels, 8x oversized
+    if fit == "stretch":
+        chain = f"scale={w}:{h}:flags=area"
+    elif fit == "fit":
+        chain = (f"scale={vw}:{vh}:force_original_aspect_ratio=decrease:flags=lanczos,"
+                 f"pad={vw}:{vh}:(ow-iw)/2:(oh-ih)/2:black,scale={w}:{h}:flags=area")
+    else:
+        chain = (f"scale={vw}:{vh}:force_original_aspect_ratio=increase:flags=lanczos,"
+                 f"crop={vw}:{vh},scale={w}:{h}:flags=area")
+    c64 = bkgd_decode_c64(path, palette)
+    if c64 is not None:
+        src = ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "320x200", "-i", "pipe:0"]
+        chain = "scale=300:200:flags=area," + chain  # C64 pixels to square pixels first
+    else:
+        src = ["-i", path]
+    cmd = ["ffmpeg", "-v", "error"] + src + ["-vf", "format=rgb24," + chain,
+           "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    try:
+        r = subprocess.run(cmd, input=c64, stdin=None if c64 is not None else subprocess.DEVNULL,
+                           capture_output=True, timeout=60)
+    except Exception as e:
+        print(f"[!] ffmpeg could not read the picture: {e}")
+        return None
+    if len(r.stdout) != w * h * 3:
+        print(f"[!] ffmpeg could not read the picture: {r.stderr.decode(errors='replace').strip() or 'no picture data'}")
+        return None
+    return r.stdout
+
+def bkgd_convert(rgb, palette, dither, strength):
+    """80 x 46 RGB bytes -> (920 screen codes, 920 colours) for rows 2-24.
+    Each cell gets the one colour, and the mix of quarter blocks or the half-tone checker,
+    closest to its four pixels. The dither works cell by cell (a cell has only one colour)."""
+    bayer = BKGD_BAYER.get(dither)
+    n = len(bayer) if bayer else 1
+    amp = 128.0 * max(0, min(100, strength)) / 100.0   # the dither's reach, in colour levels
+
+    def dist(p, c):
+        return 3 * (p[0] - c[0]) ** 2 + 6 * (p[1] - c[1]) ** 2 + (p[2] - c[2]) ** 2
+
+    chars, cols = bytearray(WIDTH * BKGD_ROWS), bytearray(WIDTH * BKGD_ROWS)
+    for cy in range(BKGD_ROWS):
+        for cx in range(WIDTH):
+            px = []
+            for q in range(4):                                  # UL, UR, LL, LR
+                x, y = cx * 2 + (q & 1), cy * 2 + (q >> 1)
+                o = (y * BKGD_PW + x) * 3
+                d = ((bayer[cy % n][cx % n] + 0.5) / (n * n) - 0.5) * amp if bayer else 0.0
+                px.append((rgb[o] + d, rgb[o + 1] + d, rgb[o + 2] + d))
+            black = [dist(p, palette[0]) for p in px]
+            best = None
+            for c in range(1, 16):
+                err, bits = 0.0, 0
+                for q in range(4):
+                    e = dist(px[q], palette[c])
+                    if e < black[q]:
+                        err += e; bits |= 1 << q
+                    else:
+                        err += black[q]
+                if best is None or err < best[0]:
+                    best = (err, BKGD_QUAD[bits], c if bits else 0)
+                half = [v * BKGD_HALF for v in palette[c]]
+                err = sum(dist(p, half) for p in px)
+                if err < best[0]:
+                    best = (err, BKGD_CHECKER, c)
+            i = cy * WIDTH + cx
+            chars[i] = best[1]
+            cols[i] = best[2]
+    return bytes(chars), bytes(cols)
+
+def bkgd_write_preview(path, chars, cols, palette):
+    """Save how the picture will look on the C64 as a PNG (640 x 368)."""
+    w, h, s = WIDTH * 8, BKGD_ROWS * 8, 2          # C64 pixels, each drawn 2 x 2
+    rows = []
+    for y in range(h):
+        line = bytearray()
+        for x in range(w):
+            i = (y // 8) * WIDTH + x // 8
+            if chars[i] == BKGD_CHECKER:
+                on = (((x & 7) >> 1) + ((y & 7) >> 1)) & 1 == 0
+            else:
+                on = (BKGD_QUAD.index(chars[i]) >> (((y & 7) >> 2) * 2 + ((x & 7) >> 2))) & 1
+            line += bytes(palette[cols[i]] if on else palette[0]) * s
+        rows.append(b"\x00" + bytes(line))
+    raw = b"".join(r for r in rows for _ in range(s))
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w * s, h * s, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+# ---------------------------------------------------------------------------
+# Bitmap backgrounds (Koala multicolour or hires): the PRG shows them in VIC
+# bank 2 with a raster split, so the ticker rows stay text.
+#   behind:            the picture fills rows 2-24; the C64 draws the visualizer into it
+#   split left/right:  the picture on one side; the visualizer drawn into the other side
+#   split top/bottom:  the picture in some rows; the visualizer in text mode in the others
+# ---------------------------------------------------------------------------
+
+BM_MODE    = 0xC007   # ASM: 0 text, 1 drawn into the bitmap, 2 top/bottom split, 3 stopped
+BM_CMD     = 0xC008   # Python writes 1 once the picture and settings are uploaded
+BM_STOP    = 0xC009   # Python writes 1 at the end (local audio): the picture stays on screen
+BM_LINE    = 0xC00A   # raster line where the bitmap starts
+TX_LINE    = 0xC00B   # raster line where text starts again
+BM_D016    = 0xC00C
+BM_KOALA   = 0xC00D
+BM_VR0     = 0xC00E   # visualizer area: first row, rows, first column, columns
+BM_BG      = 0xC012
+BM_KIND    = 0xC013
+BM_GLCOUNT = 0xC01E
+BM_FRAME   = 0xC700   # the visualizer frame (up to 920 bytes)
+BM_BITMAP  = 0xA000
+BM_MATRIX  = 0x8400
+BM_COLRAM  = 0xD800
+BM_GLMAP   = 0x9D00
+BM_GLCODES = 0x9E00
+BM_FIRST   = 2        # the picture area starts at row 2 (rows 0-1: ticker)
+# memory a C64-audio tune must stay out of
+BM_AREAS   = [(0x8000, 0xBFFF), (0xE000, 0xFFFF)]
+
+def bkgd_layout(layout, side, size):
+    """Where the picture and the visualizer go: rows and columns as (first, count)."""
+    full_r, full_c = (BM_FIRST, 25 - BM_FIRST), (0, WIDTH)
+    first_line = 51 + 8 * BM_FIRST - 1          # the bitmap starts on the last line of row 1 (kept black)
+    if layout == "behind":
+        return {"pic": full_r + full_c, "viz": full_r + full_c, "kind": 1, "bm": first_line, "tx": 251}
+    if side in ("left", "right"):
+        pc = size
+        pic_c = (0, pc) if side == "left" else (WIDTH - pc, pc)
+        viz_c = (pc, WIDTH - pc) if side == "left" else (0, WIDTH - pc)
+        return {"pic": full_r + pic_c, "viz": full_r + viz_c, "kind": 1, "bm": first_line, "tx": 251}
+    pr = size
+    if side == "top":
+        return {"pic": (BM_FIRST, pr) + full_c, "viz": (BM_FIRST + pr, 25 - BM_FIRST - pr) + full_c,
+                "kind": 2, "bm": first_line, "tx": 51 + 8 * (BM_FIRST + pr) - 1}
+    return {"pic": (25 - pr, pr) + full_c, "viz": (BM_FIRST, 25 - BM_FIRST - pr) + full_c,
+            "kind": 2, "bm": 51 + 8 * (25 - pr) - 1, "tx": 251}
+
+def _bm_dist(p, c):
+    return 3 * (p[0] - c[0]) ** 2 + 6 * (p[1] - c[1]) ** 2 + (p[2] - c[2]) ** 2
+
+def bkgd_conv_bitmap(rgb, w, h, palette, dither, strength, koala):
+    """w x h RGB bytes (Koala: w = 4 a cell, fat pixels; hires: w = 8 a cell) ->
+    (cells, bg): cells row by row, each (8 bitmap bytes, matrix byte, colour RAM byte)."""
+    bayer = BKGD_BAYER.get(dither)
+    n = len(bayer) if bayer else 1
+    amp = 96.0 * max(0, min(100, strength)) / 100.0
+    px, q = [], []
+    for y in range(h):
+        for x in range(w):
+            o = (y * w + x) * 3
+            d = ((bayer[y % n][x % n] + 0.5) / (n * n) - 0.5) * amp if bayer else 0.0
+            p = (rgb[o] + d, rgb[o + 1] + d, rgb[o + 2] + d)
+            px.append(p)
+            q.append(min(range(16), key=lambda c: _bm_dist(p, palette[c])))
+    cw = 4 if koala else 8
+    if koala:
+        counts = [0] * 16
+        for c in q: counts[c] += 1
+        bg = max(range(16), key=lambda c: counts[c])
+    else:
+        bg = 0
+    cells = []
+    for cy in range(h // 8):
+        for cx in range(w // cw):
+            idx = [(cy * 8 + r) * w + cx * cw + x for r in range(8) for x in range(cw)]
+            cnt = {}
+            for i in idx:
+                if not koala or q[i] != bg:
+                    cnt[q[i]] = cnt.get(q[i], 0) + 1
+            top = sorted(cnt, key=lambda c: -cnt[c])[:3 if koala else 2]
+            if koala:
+                # least used of the three on %11 (colour RAM): the visualizer recolours that one
+                c1, c2, c3 = (top + [0, 0, 0])[:3]
+                choice = [(bg, 0)] + [(c, b) for c, b in ((c1, 1), (c2, 2), (c3, 3)) if c in cnt]
+            else:
+                a = top[0] if top else 0
+                b = top[1] if len(top) > 1 else a
+                # the less used colour is the foreground (set bits): the visualizer recolours it
+                fg, bgc = (b, a) if len(top) > 1 else (0, a)
+                choice = [(bgc, 0)] + ([(fg, 1)] if len(top) > 1 else [])
+            exact = dict(choice)
+            data = bytearray(8)
+            for r in range(8):
+                v = 0
+                for x in range(cw):
+                    i = (cy * 8 + r) * w + cx * cw + x
+                    bits = exact.get(q[i])
+                    if bits is None:
+                        bits = min(choice, key=lambda cb: _bm_dist(px[i], palette[cb[0]]))[1]
+                    v = (v << (2 if koala else 1)) | bits
+                data[r] = v
+            if koala:
+                cells.append((bytes(data), (c1 << 4) | c2, c3))
+            else:
+                cells.append((bytes(data), (fg << 4) | bgc, 0))
+    return cells, bg
+
+def bkgd_crop_c64(path, rows, cols, koala):
+    """The middle rows x cols cells of a Koala or Art Studio file, unchanged: (cells, bg)."""
+    with open(path, "rb") as f:
+        d = f.read()
+    bitmap, scr = d[2:8002], d[8002:9002]
+    colram = d[9002:10002] if koala else None
+    bg = (d[10002] & 15) if koala else 0
+    r0, c0 = (25 - rows) // 2, (WIDTH - cols) // 2
+    cells = []
+    for r in range(r0, r0 + rows):
+        for c in range(c0, c0 + cols):
+            s = r * 40 + c
+            cells.append((bytes(bitmap[s * 8:s * 8 + 8]), scr[s], (colram[s] & 15) if koala else 0))
+    return cells, bg
+
+def bkgd_place(cells, bg, layout, koala):
+    """Put the picture's cells into whole-screen bitmap, matrix and colour RAM images."""
+    # outside the picture: black. Koala bits %00 would be the picture's background colour,
+    # so those cells use %01 (the matrix's high nibble, 0 = black); a Koala glyph ORs in as %11.
+    bitmap = bytearray([0x55 if koala else 0x00]) * 8000
+    matrix, colour = bytearray(1000), bytearray(1000)
+    r0, rn, c0, cn = layout["pic"]
+    for k, (data, mx, co) in enumerate(cells):
+        s = (r0 + k // cn) * 40 + c0 + k % cn
+        bitmap[s * 8:s * 8 + 8] = data
+        matrix[s] = mx
+        colour[s] = co
+    return bitmap, matrix, colour
+
+def bkgd_render(bitmap, matrix, colour, bg, koala, palette):
+    """How the whole screen's bitmap looks (ticker and visualizer areas black): 320 x 200 RGB."""
+    out = bytearray(320 * 200 * 3)
+    for s in range(1000):
+        cx, cy = s % 40, s // 40
+        hi, lo = matrix[s] >> 4, matrix[s] & 15
+        for r in range(8):
+            b = bitmap[s * 8 + r]
+            o = ((cy * 8 + r) * 320 + cx * 8) * 3
+            for x in range(8):
+                if koala:
+                    c = (bg, hi, lo, colour[s])[(b >> (6 - (x & 6))) & 3]
+                else:
+                    c = hi if (b >> (7 - x)) & 1 else lo
+                out[o + x * 3:o + x * 3 + 3] = bytes(palette[c])
+    return bytes(out)
+
+def _bkgd_png(path, w, h, rgb, scale=2):
+    rows = []
+    for y in range(h):
+        line = b"".join(bytes(rgb[(y * w + x) * 3:(y * w + x) * 3 + 3]) * scale for x in range(w))
+        rows.append(b"\x00" + line)
+    raw = b"".join(r for r in rows for _ in range(scale))
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w * scale, h * scale, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+def _psid_range(filepath):
+    """(first, last) address a PSID/RSID file loads into, or None."""
+    try:
+        with open(filepath, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    if raw[0:4] not in (b"PSID", b"RSID") or len(raw) < 0x7C:
+        return None
+    off  = struct.unpack_from(">H", raw, 6)[0]
+    load = struct.unpack_from(">H", raw, 8)[0]
+    data = raw[off:]
+    if load == 0 and len(data) >= 2:
+        load = struct.unpack_from("<H", data, 0)[0]
+        data = data[2:]
+    return load, load + len(data) - 1
+
+def bkgd_check_tune(bk, sidpath):
+    """C64-audio mode: warn if the tune loads where the bitmap background lives, and ask."""
+    rng = _psid_range(sidpath)
+    if not rng:
+        return bk
+    lo, hi = rng
+    hits = [f"${a:04X}-${b:04X}" for a, b in BM_AREAS if lo <= b and hi >= a]
+    if not hits:
+        return bk
+    print(f"\n[!] WARNING: the tune loads at ${lo:04X}-${hi:04X}, which overlaps the memory a")
+    print(f"[!] {bk['type']} background needs ({', '.join(hits)}). The picture would overwrite the tune.")
+    ans = input("Background? [0=PETSCII background instead (recommended), 1=keep the bitmap anyway, "
+                "2=no background] (default 0): ").strip()
+    if ans == "1":
+        return bk
+    if ans == "2":
+        print("[*] Continuing without a background.")
+        return None
+    print("[*] Switching to a PETSCII background.")
+    return bkgd_make_petscii(bk["src"])
+
+def bkgd_make_petscii(src):
+    """The stage 1 PETSCII background from the same picture and settings."""
+    palette = BKGD_PALETTES[src["palette"]]
+    rgb = bkgd_fetch_rgb(src["path"], BKGD_PW, BKGD_PH, src["fit"], palette)
+    if rgb is None:
+        sys.exit(1)
+    chars, cols = bkgd_convert(rgb, palette, src["dither"], src["strength"])
+    if src["wavecol"] == "picture":
+        cols = bytes(11 if ch == 0x20 else co for ch, co in zip(chars, cols))
+    preview = src["preview"]
+    try:
+        bkgd_write_preview(preview, chars, cols, palette)
+        print(f"[*] Background preview saved: {preview}")
+    except OSError as e:
+        print(f"[!] Could not save the background preview: {e}")
+    return {"type": "petscii", "chars": chars, "cols": cols,
+            "wavecol": 1 if src["wavecol"] == "picture" else 0, "src": src}
+
+def bkgd_viz_charset():
+    return {"showfreqs": CHARS_FREQ, "avectorscope": CHARS_SCOPE, "showspectrum": CHARS_SPECTRUM,
+            "ahistogram": CHARS_HIST}.get(VIZ_MODE, CHARS)
+
+def bkgd_viz_chars(raw, color_mode, height):
+    """A visualizer frame as screen codes (for the bitmap modes, which take it all at $C700)."""
+    if VIZ_MODE == "showfreqs":
+        raw = _apply_freq_gradient(raw, color_mode, height=height)
+    cs = bkgd_viz_charset()
+    return bytes(pixel_to_char(p, cs) for p in raw)
+
+def bkgd_upload_bitmap(bk):
+    """Send the bitmap picture and its settings to the PRG, then switch it on."""
+    L = bk["layout"]
+    print("[*] Uploading bitmap background ($A000, $8400, colour RAM)...")
+    write_mem(BM_BITMAP, bk["bitmap"])                   # all of it: rows 0-1 black (shown at the end)
+    write_mem(BM_MATRIX, bk["matrix"])
+    if L["kind"] == 1:
+        c_lo, c_hi = BM_FIRST * 40, 1000
+    else:
+        c_lo, c_hi = L["pic"][0] * 40, (L["pic"][0] + L["pic"][1]) * 40
+    for _ in range(3):                                   # colour RAM 3x, as the rows 2-7 code does
+        write_mem(BM_COLRAM + c_lo, bk["colour"][c_lo:c_hi])
+        time.sleep(0.05)
+    vr0, vrn, vc0, vcn = L["viz"]
+    write_mem(BM_LINE, [L["bm"], L["tx"], 0xD8 if bk["koala"] else 0xC8, 1 if bk["koala"] else 0,
+                        vr0, vrn, vc0, vcn, bk["bg"], L["kind"]])
+    write_byte(BKGD_WCOL, bk["wavecol"])
+    # glyphs for every visualizer, so switching with the keys still draws (8 codes in all)
+    codes = [c for c in dict.fromkeys(CHARS + CHARS_FREQ + CHARS_SCOPE + CHARS_SPECTRUM + CHARS_HIST)
+             if c != 0x20][:32]
+    glmap = bytearray(256)
+    for i, c in enumerate(codes):
+        glmap[c] = i * 8
+    write_mem(BM_GLCODES, bytes(codes) if codes else b"\x00")
+    write_mem(BM_GLMAP, glmap)
+    write_byte(BM_GLCOUNT, len(codes) if L["kind"] == 1 else 0)
+    write_byte(BM_CMD, 1)
+    time.sleep(0.5)                                      # the PRG copies the clean picture (~0.2 s)
+
+def bkgd_halt(bk):
+    """End of a local-audio run: clear the visualizer, then leave the whole picture on screen."""
+    vr0, vrn, vc0, vcn = bk["layout"]["viz"]
+    write_mem(BM_FRAME, [0x20] * (vrn * vcn))
+    write_byte(FRAME_FLAG, 1)
+    time.sleep(1.0)
+    write_byte(BM_STOP, 1)
+    time.sleep(0.2)
+
+def bkgd_setup(args):
+    """Ask about the background picture (anything not given as a flag), convert it and save a
+    preview. Returns a dict ("type" = petscii / koala / hires) or None for no background."""
+    asked = False
+    path = args.background
+    if not path:
+        if args.no_background:
+            return None
+        path = _bkgd_clean_path(input("Background picture? [file path, Enter=none]: "))
+        if not path:
+            return None
+        asked = True
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        print(f"[!] Background picture not found: {path}"); sys.exit(1)
+    ext = os.path.splitext(path)[1].lower()
+    c64file = "koala" if ext in (".kla", ".koa") else "hires" if ext in (".art", ".aas") else None
+    if c64file and bkgd_decode_c64(path, BKGD_PALETTES["palette"]) is None:
+        c64file = None                                   # wrong size: let ffmpeg try it
+
+    btype = args.bkgd_type
+    if not btype:
+        dflt = {"koala": "1", "hires": "2"}.get(c64file, "0")
+        ans = input(f"Background type? [0=PETSCII characters, 1=Koala (multicolour bitmap), 2=hires bitmap] (default {dflt}): ").strip() or dflt
+        btype = {"1": "koala", "2": "hires"}.get(ans, "petscii"); asked = True
+
+    layout, side, size = "behind", None, None
+    if btype != "petscii":
+        layout = args.bkgd_layout or ("split" if args.bkgd_split else None)
+        if not layout:
+            ans = input("Layout? [0=picture behind the visualizer, 1=split screen] (default 0): ").strip()
+            layout = "split" if ans == "1" else "behind"; asked = True
+        if layout == "split":
+            side = args.bkgd_split
+            if not side:
+                ans = input("Picture where? [0=top, 1=bottom, 2=left, 3=right] (default 0): ").strip()
+                side = {"1": "bottom", "2": "left", "3": "right"}.get(ans, "top"); asked = True
+            lr = side in ("left", "right")
+            lo, hi, dflt = (1, WIDTH - 1, 20) if lr else (1, 25 - BM_FIRST - 1, 12)
+            size = args.bkgd_size
+            if size is None:
+                ans = input(f"Picture {'columns' if lr else 'rows'}? [{lo}-{hi}] (default {dflt}): ").strip()
+                size = int(ans) if ans.isdigit() else dflt; asked = True
+            size = max(lo, min(hi, size))
+
+    scale = "rescale"
+    if c64file and c64file == btype:
+        scale = args.bkgd_scale
+        if not scale:
+            ans = input("The picture is a C64 file: [0=crop to fit (pixels unchanged), 1=rescale to fit] (default 0): ").strip()
+            scale = "rescale" if ans == "1" else "crop"; asked = True
+
+    fit, dither, strength, pal_name = "fill", "4x4", 50, "palette"
+    if scale == "rescale":
+        fit = args.bkgd_fit
+        if not fit:
+            ans = input("Background fit? [0=fill (edges cut off), 1=fit (black bars), 2=stretch] (default 0): ").strip()
+            fit = {"1": "fit", "2": "stretch"}.get(ans, "fill"); asked = True
+        dither = args.bkgd_dither
+        if not dither:
+            ans = input("Background dither? [0=none, 1=Bayer 2x2, 2=Bayer 4x4, 3=Bayer 8x8] (default 2): ").strip()
+            dither = {"0": "none", "1": "2x2", "3": "8x8"}.get(ans, "4x4"); asked = True
+        strength = args.bkgd_strength
+        if strength is None:
+            strength = 50
+            if dither != "none":
+                ans = input("Dither strength? [0-100] (default 50): ").strip()
+                if ans.isdigit(): strength = int(ans)
+                asked = True
+        pal_name = args.bkgd_palette
+        if not pal_name:
+            ans = input("Background palette? [0=PALette, 1=Colodore, 2=Pepto, 3=DeeKay] (default 0): ").strip()
+            pal_name = {"1": "colodore", "2": "pepto", "3": "deekay"}.get(ans, "palette"); asked = True
+
+    wavecol = "mode"
+    if layout == "behind":
+        wavecol = args.bkgd_wavecolor
+        if not wavecol:
+            ans = input("Visualizer colours over the picture? [0=the colour mode, 1=the picture's colours] (default 0): ").strip()
+            wavecol = "picture" if ans == "1" else "mode"; asked = True
+
+    stem = re.sub(r"\s+", "-", os.path.splitext(os.path.basename(path))[0])
+    preview = os.path.join(os.path.dirname(os.path.abspath(path)), stem + "-c64-preview.png")
+    src = {"path": path, "fit": fit if scale == "rescale" else "fit", "dither": dither, "strength": strength,
+           "palette": pal_name, "wavecol": wavecol, "preview": preview}
+    desc = (f"{btype}" + (f", {layout}" if btype != "petscii" else "")
+            + (f" ({side}, {size} {'columns' if side in ('left', 'right') else 'rows'})" if layout == "split" else "")
+            + (", cropped" if scale == "crop" else f", {fit}, dither {dither}{'' if dither == 'none' else ' ' + str(strength)}, {pal_name}")
+            + (f", visualizer colours: {wavecol}" if layout == "behind" else ""))
+    print(f"[*] Background: {os.path.basename(path)}  ({desc})")
+
+    if btype == "petscii":
+        bk = bkgd_make_petscii(src)
+    else:
+        koala = btype == "koala"
+        palette = BKGD_PALETTES[pal_name]
+        L = bkgd_layout(layout, side, size)
+        r0, rn, c0, cn = L["pic"]
+        if scale == "crop":
+            cells, bg = bkgd_crop_c64(path, rn, cn, koala)
+        else:
+            w, h = (4 if koala else 8) * cn, 8 * rn
+            rgb = bkgd_fetch_rgb(path, w, h, fit, palette, par=BKGD_PAR * (2 if koala else 1))
+            if rgb is None:
+                sys.exit(1)
+            print("[*] Converting the picture...")
+            cells, bg = bkgd_conv_bitmap(rgb, w, h, palette, dither, strength, koala)
+        bitmap, matrix, colour = bkgd_place(cells, bg, L, koala)
+        bk = {"type": btype, "koala": koala, "bitmap": bytes(bitmap), "matrix": bytes(matrix),
+              "colour": bytes(colour), "bg": bg, "layout": L,
+              "wavecol": 1 if wavecol == "picture" else 0, "src": src}
+        try:
+            _bkgd_png(preview, 320, 200, bkgd_render(bitmap, matrix, colour, bg, koala, palette))
+            print(f"[*] Background preview saved: {preview}")
+        except OSError as e:
+            print(f"[!] Could not save the background preview: {e}")
+    if asked:
+        ans = input("Use this background? [Y/n]: ").strip().lower()
+        if ans in ("n", "no"):
+            print("[*] Continuing without a background.")
+            return None
+    return bk
+
+def bkgd_top(bk, top_screen, mode_col):
+    """Rows 2-7 with the picture behind: (screen codes, colours)."""
+    chars, cols = bytearray(top_screen), bytearray(len(top_screen))
+    for i, c in enumerate(top_screen):
+        if c == 0x20:
+            chars[i] = bk["chars"][i]; cols[i] = bk["cols"][i]
+        else:
+            cols[i] = bk["cols"][i] if bk["wavecol"] else mode_col
+    return bytes(chars), bytes(cols)
+
 def main():
-    global U64, FPS, VIZ_MODE, _YTDLP_COOKIE_ARGS  # noqa: PLW0603
+    global U64, FPS, VIZ_MODE, VIZ_W, LEDS, _YTDLP_COOKIE_ARGS  # noqa: PLW0603
 
     def _kill_proc(p):
         if p is None:
@@ -1598,6 +2325,9 @@ def main():
             pass
 
     args = parse_args()
+
+    if args.camera and args.background:
+        print("[!] --background is not used in camera mode; ignoring it.")
 
     if args.cookies_from_browser:
         _YTDLP_COOKIE_ARGS = ["--cookies-from-browser", args.cookies_from_browser]
@@ -3045,6 +3775,19 @@ def main():
             c64_audio = ans in ("c", "c64")
         print(f"[*] SID audio: {'C64 hardware (PSID player)' if c64_audio else 'local (sidplayfp)'}")
 
+    # C64U LEDs: asked for anything that isn't a .sid
+    if mode != "sid":
+        ans = input("Flash the C64U's LEDs with the music? [y/N]: ").strip().lower()
+        LEDS = ans in ("y", "yes")
+        if LEDS:
+            print("[*] LEDs: a silent fake SID at $D400 follows the music.")
+
+    # Background picture (--background / --bkgd): asked, converted and previewed before the C64 reboots
+    bkgd = bkgd_setup(args)
+    if bkgd and bkgd["type"] != "petscii" and mode == "sid" and c64_audio:
+        bkgd = bkgd_check_tune(bkgd, filepath)
+    bm = bkgd if (bkgd and bkgd["type"] != "petscii") else None
+
     # Get and display metadata
     if mode == "sid":
         info = get_sid_info(filepath)
@@ -3151,6 +3894,8 @@ def main():
     _cflag_map = {0: 2, 1: 1, 2: 3}
     write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
     send_ticker(ticker_str)
+    if LEDS:
+        write_mem(LED_SID, [0] * 0x19)   # SID silent (volume 0), all voices off
 
     # Rows 2-7: always extend the visualizer to fill the full screen.
     _EXT_ROWS    = 6
@@ -3178,6 +3923,24 @@ def main():
     for _ in range(3):
         write_mem(_ext_col, _ext_top_colors(color_mode_init))
         time.sleep(0.05)
+
+    # Background picture: rows 8-24 go to the PRG, rows 2-7 straight to the screen
+    if bm:
+        _DISP_HEIGHT = bm["layout"]["viz"][1]
+        VIZ_W        = bm["layout"]["viz"][3]
+        bkgd_upload_bitmap(bm)
+    elif bkgd:
+        print("[*] Uploading background picture ($C700/$CA00)...")
+        write_mem(BKGD_CHARS, bkgd["chars"][BKGD_TOP:])
+        write_mem(BKGD_COLS,  bkgd["cols"][BKGD_TOP:])
+        write_byte(BKGD_WCOL, bkgd["wavecol"])
+        write_mem(_ext_scr, bkgd["chars"][:BKGD_TOP])
+        for _ in range(3):
+            write_mem(_ext_col, bkgd["cols"][:BKGD_TOP])
+            time.sleep(0.05)
+        write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))   # an empty frame shows the picture at once
+        write_byte(BKGD_FLAG, 1)
+        write_byte(FRAME_FLAG, 1)
 
     # Start audio/waveform processes
     sid_fifo_proc = None
@@ -3217,13 +3980,15 @@ def main():
 
     playback_start = time.time()
 
-    frame_size     = WIDTH * _DISP_HEIGHT
+    frame_size     = VIZ_W * _DISP_HEIGHT
     sid_end_time   = (time.time() + sid_duration_secs) if mode == "sid" and sid_duration_secs else None
     state          = {"cam_color": color_mode_init, "viz_color": 2,
                       "color_pending": False, "viz_pending": None, "quit": False}
     kthread        = make_keypress_listener(state)
     kthread.start()
 
+    frame_src = LatestFrame(ffmpeg_proc.stdout, frame_size)
+    t_first   = None
     frame_num = 0
     print(f"[*] Streaming to C64 at {FPS}fps -- [c] color, [w/0-5] viz (0=off), [q] quit\n")
 
@@ -3241,7 +4006,8 @@ def main():
             if state["color_pending"]:
                 state["color_pending"] = False
                 write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
-                write_mem(_ext_col, _ext_top_colors(state["cam_color"]))
+                if not bkgd:
+                    write_mem(_ext_col, _ext_top_colors(state["cam_color"]))
 
             if state["viz_pending"] is not None:
                 new_viz = state["viz_pending"]
@@ -3274,8 +4040,15 @@ def main():
                         else:
                             procs = [p for p in procs if p is not _old_ffmpeg]
                         ffmpeg_proc = None
-                        write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
-                        write_mem(_ext_scr,  [0x20] * (_EXT_ROWS * WIDTH))
+                        if bm:
+                            write_mem(BM_FRAME, [0x20] * (VIZ_W * _DISP_HEIGHT))
+                        else:
+                            write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
+                            if bkgd:   # the picture shows again where the viz was
+                                write_mem(_ext_scr, bkgd["chars"][:BKGD_TOP])
+                                write_mem(_ext_col, bkgd["cols"][:BKGD_TOP])
+                            else:
+                                write_mem(_ext_scr,  [0x20] * (_EXT_ROWS * WIDTH))
                         write_byte(FRAME_FLAG, 1)
                     else:
                         # Rebuild LUTs for the new mode
@@ -3310,6 +4083,7 @@ def main():
                                 filepath, height=_DISP_HEIGHT, seek_secs=_elapsed)
                             procs = [p for p in procs if p is not _old_ffmpeg] + [ffmpeg_proc]
 
+                        frame_src = LatestFrame(ffmpeg_proc.stdout, frame_size)
                         time.sleep(0.1)
                         if ffmpeg_proc.poll() is not None:
                             err = ffmpeg_proc.stderr.read(512).decode(errors="replace").strip()
@@ -3321,15 +4095,26 @@ def main():
                 time.sleep(0.05)
                 continue
 
-            # Check if data available before blocking read (allows q to work)
-            ready, _, _ = _select.select([ffmpeg_proc.stdout], [], [], 0.5)
-            if not ready:
+            # The newest frame only: frames the C64 was too slow for are dropped, so the
+            # picture stays with the music (waits up to 0.5 s, which also lets q work)
+            raw = frame_src.get(0.5)
+            if raw is None:
+                if frame_src.eof:
+                    print("\r\n[*] Stream ended."); break
                 continue
+            if t_first is None:
+                t_first = time.time()
+            _el  = time.time() - t_first
+            fsuf = f"  {frame_num / _el:4.1f} fps sent, {frame_src.dropped} dropped" if _el > 1 else ""
 
-            # Blocking read — ffmpeg throttles to FPS naturally via FIFO or file rate
-            raw = ffmpeg_proc.stdout.read(frame_size)
-            if len(raw) < frame_size:
-                print("\r\n[*] Stream ended."); break
+            if bm:
+                # bitmap background: the whole frame goes to $C700, the PRG draws it
+                write_mem(BM_FRAME, bkgd_viz_chars(raw, state["cam_color"], _DISP_HEIGHT))
+                write_byte(FRAME_FLAG, 1)
+                frame_num += 1
+                ind = ["R","W","F"][state["cam_color"]]
+                print(f"\r[*] Frame {frame_num:05d} [{ind}]{fsuf}", end="", flush=True)
+                continue
 
             top_raw = raw[:_EXT_ROWS * WIDTH]
             bot_raw = raw[_EXT_ROWS * WIDTH:]
@@ -3353,20 +4138,26 @@ def main():
                 top_screen = bytes(pixel_to_char(p) for p in top_raw)
                 bot_screen = bytes(pixel_to_char(p) for p in bot_raw)
 
-            write_mem(_ext_scr, top_screen)
-            write_mem(_ext_col, _ext_top_colors(state["cam_color"], top_screen))
+            if bkgd:
+                top_screen, top_cols = bkgd_top(bkgd, top_screen, _ext_top_colors(state["cam_color"])[0])
+                write_mem(_ext_scr, top_screen)
+                write_mem(_ext_col, top_cols)
+            else:
+                write_mem(_ext_scr, top_screen)
+                write_mem(_ext_col, _ext_top_colors(state["cam_color"], top_screen))
             write_mem(FRAME_BUF, bot_screen)
             write_byte(FRAME_FLAG, 1)
 
             frame_num += 1
             ind  = ["R","W","F"][state["cam_color"]]
             vind = VIZ_LABELS.get(VIZ_MODE, VIZ_MODE)[:3].upper()
-            print(f"\r[*] Frame {frame_num:05d} [{ind}|{vind}]", end="", flush=True)
+            print(f"\r[*] Frame {frame_num:05d} [{ind}|{vind}]{fsuf}", end="", flush=True)
 
     except KeyboardInterrupt:
         print("\r\n[*] Interrupted.")
     finally:
         state["quit"] = True
+        _led_state["stop"] = True
         if c64_audio:
             print("\r\n[*] Stopping SID and returning C64 to BASIC...")
             # Step 1: clear c64_audio_flag so the IRQ stops calling the SID
@@ -3382,9 +4173,16 @@ def main():
         else:
             # Local/MP3 mode: silence any residual SID output on C64 display side
             write_mem(0xD400, [0] * 25)
+            if bm:
+                bkgd_halt(bm)            # raster split off, the picture stays
             write_byte(FRAME_FLAG, 0)
             write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
             write_mem(_ext_scr, [0x20] * (_EXT_ROWS * WIDTH))
+            if bkgd and not bm:
+                # leave the whole picture on the screen, without the last visualizer frame
+                write_mem(_ext_scr, bkgd["chars"][:BKGD_TOP])
+                write_mem(_ext_col, bkgd["cols"][:BKGD_TOP])
+                write_byte(FRAME_FLAG, 1)
             orig = u64_get("machine:readmem?address=F9&length=2")
             if orig and len(orig) == 2:
                 u64_put("machine:writemem", {"address": "314",

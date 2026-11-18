@@ -521,6 +521,7 @@ dc_rm:  lda (src_lo),y
 
 char_to_color:
         stx ctc_x
+        and #$7f            ; 128-byte table: codes 128+ share a slot (160 -> space's)
         tax
         lda white_ctable,x
         ldx ctc_x
@@ -563,6 +564,7 @@ df_rm:  lda (src_lo),y
 
 char_to_color_fire:
         stx ctc_x
+        and #$7f            ; 128-byte table: codes 128+ share a slot (160 -> space's)
         tax
         lda fire_ctable,x
         ldx ctc_x

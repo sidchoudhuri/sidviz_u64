@@ -187,8 +187,8 @@ class D64:
         entry[0x01] = first_t
         entry[0x02] = first_s
         entry[0x03:0x13] = fname_b
-        entry[0x1e] = nblocks & 0xFF
-        entry[0x1f] = (nblocks >> 8) & 0xFF
+        entry[0x1c] = nblocks & 0xFF          # slot $1E/$1F (entry starts at slot +2)
+        entry[0x1d] = (nblocks >> 8) & 0xFF
         self._dir_entries.append(entry)
 
         return nblocks
@@ -222,7 +222,7 @@ class D64:
                 #   bytes 34-65: entry 1
                 #   ... 8 entries per sector
                 off = 2 + j * 32
-                sector[off:off + 32] = entry
+                sector[off:off + 30] = entry[:30]
             self._write_sector(DIR_TRACK, DIR_SECTOR + i, sector)
 
     def save(self, path):

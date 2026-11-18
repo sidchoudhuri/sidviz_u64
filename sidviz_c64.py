@@ -51,7 +51,7 @@ QUIT_FLAG      = 0xC003  # Python writes 1 → C64 silences SID and JMPs to BASI
 TICKER_BUF   = 0xC500
 TICKER_LEN   = 0xC5FE
 TICKER_ROW   = 0x0428          # screen RAM row 1
-PRG_LOCAL    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidviz.prg")
+PRG_LOCAL    = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "sidviz.prg")
 PRG_REMOTE   = "sidviz.prg"
 TIMEOUT      = 5.0
 # C64 colors: 0=black 1=white 2=red 7=yellow 8=orange 9=brown 10=ltred 11=dkgray 12=mdgray 15=ltgray
@@ -77,7 +77,7 @@ RAINBOW_TAB = [2,2,8,8,7,7,7,7,5,5,5,5,13,13,14,14,
 
 def _load_c64_chargen():
     for p in [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "chargen"),
+        os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "chargen"),
         os.path.expanduser("~/Library/Application Support/VICE/C64/chargen"),
         "/opt/homebrew/share/vice/C64/chargen",
         "/usr/local/share/vice/C64/chargen",
@@ -692,9 +692,11 @@ def write_color_tables():
         defs = CHARS_CAMERA_DEF
     else:
         defs = CHARS_HIST_DEF
-    for code, wcol, fcol in defs:
-        white[code] = wcol
-        fire[code]  = fcol
+    # The C64 looks colours up by (code & $7F); codes 128+ (160 = solid block) go
+    # last so they take the slot they share with an invisible char (160 -> space)
+    for code, wcol, fcol in sorted(defs, key=lambda d: d[0] >= 128):
+        white[code & 0x7F] = wcol
+        fire[code & 0x7F]  = fcol
     write_mem(WHITE_CTABLE_ADDR, white)
     write_mem(FIRE_CTABLE_ADDR,  fire)
 
@@ -1261,7 +1263,7 @@ def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, dur
     from d64 import build_d64
 
     # ── locate player binary ────────────────────────────────────────────────
-    player_prg = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+    player_prg = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])),
                               "sidviz_d64.prg")
     if not os.path.isfile(player_prg):
         print(f"[!] player binary not found: {player_prg}")

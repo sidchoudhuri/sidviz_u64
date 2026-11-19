@@ -1,6 +1,7 @@
 ; reuload.asm - sidviz's REU loader for the Ultimate (64tass)
 ; sidviz sends a .reu in blocks into C64 RAM with the REST API (machine:writemem);
-; this copies each block into the REU, then starts the video player.
+; this copies each block into the REU, then starts the video player. (When the Ultimate has
+; loaded the .reu into the REU itself, from its REU preload setting, it only checks and starts.)
 ;
 ; Mailbox at $02A7 (sidviz writes it after the block):
 ;   +0  command: 1 = copy $2000.. into the REU, 2 = copy the REU into $2000.. (a check),
@@ -67,6 +68,8 @@ do:     sta reu+1
         beq wait
 go:     lda #0
         sta mbox
+        sta $f0                 ; the player plays what's in the REU when $f0 is 0 (else, on an
+                                ; Ultimate, it opens its file browser)
         cli
         jsr player              ; as SYS would; back to BASIC if it returns
         jmp $e37b

@@ -4,7 +4,7 @@ sidviz_u64.py -- SID/audio waveform + live camera visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 Camera mode: streams webcam footage as PETSCII character art on the C64 screen.
 
-version 2.0.2 (2026-11-19)
+version 2.0.3 (2026-11-19)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -33,7 +33,7 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 BUILD   = "2026-11-19"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
@@ -315,6 +315,8 @@ def parse_args():
     p.add_argument("--reu-scroll-speed", choices=["slow", "medium", "fast"], help="REU scroller: speed (default medium)")
     p.add_argument("--reu-info",     action="append", metavar="TEXT",
                    help="REU video: an info screen line (repeat; \"song\" = the song's details), shown before the video")
+    p.add_argument("--reu-folder",   metavar="PATH",
+                   help="Where --play-reu puts the .reu on the Ultimate (FTP) for it to load (default /SD/viz)")
     p.add_argument("--reu-leds",     action="store_true",
                    help="With --play-reu: the C64U's lights follow the video's sound (through UltiSID 2)")
     p.add_argument("--save-d64",     metavar="FILE.d64",
@@ -794,7 +796,7 @@ REU_MBOX    = 0x02A7          # reuload.asm's mailbox: command, REU address (3),
 REU_BUFFER  = 0x2000
 REU_BLOCK   = 0x8000
 # reuload.asm, assembled (64tass -a -B): copies blocks from $2000 into the REU, then starts the player
-REULOAD_PRG = bytes([0x01, 0x08, 0x0B, 0x08, 0xEA, 0x07, 0x9E, 0x32, 0x30, 0x36, 0x31, 0x00, 0x00, 0x00, 0xA2, 0x64, 0xBD, 0x1B, 0x08, 0x9D, 0x40, 0x03, 0xCA, 0x10, 0xF7, 0x4C, 0x40, 0x03, 0x78, 0xA9, 0x00, 0x8D, 0xA7, 0x02, 0x8D, 0x20, 0xD0, 0xAD, 0xA7, 0x02, 0xF0, 0xFB, 0xC9, 0x03, 0xF0, 0x47, 0xA9, 0x00, 0x8D, 0x02, 0xDF, 0xA9, 0x20, 0x8D, 0x03, 0xDF, 0xAD, 0xA8, 0x02, 0x8D, 0x04, 0xDF, 0xAD, 0xA9, 0x02, 0x8D, 0x05, 0xDF, 0xAD, 0xAA, 0x02, 0x8D, 0x06, 0xDF, 0xAD, 0xAB, 0x02, 0x8D, 0x07, 0xDF, 0xAD, 0xAC, 0x02, 0x8D, 0x08, 0xDF, 0xA9, 0x00, 0x8D, 0x0A, 0xDF, 0xAD, 0xA7, 0x02, 0xC9, 0x02, 0xF0, 0x04, 0xA9, 0x90, 0xD0, 0x02, 0xA9, 0x91, 0x8D, 0x01, 0xDF, 0xEE, 0x20, 0xD0, 0xA9, 0x00, 0x8D, 0xA7, 0x02, 0xF0, 0xB0, 0xA9, 0x00, 0x8D, 0xA7, 0x02, 0x58, 0x20, 0x0E, 0x08, 0x4C, 0x7B, 0xE3])
+REULOAD_PRG = bytes([0x01, 0x08, 0x0B, 0x08, 0xEA, 0x07, 0x9E, 0x32, 0x30, 0x36, 0x31, 0x00, 0x00, 0x00, 0xA2, 0x66, 0xBD, 0x1B, 0x08, 0x9D, 0x40, 0x03, 0xCA, 0x10, 0xF7, 0x4C, 0x40, 0x03, 0x78, 0xA9, 0x00, 0x8D, 0xA7, 0x02, 0x8D, 0x20, 0xD0, 0xAD, 0xA7, 0x02, 0xF0, 0xFB, 0xC9, 0x03, 0xF0, 0x47, 0xA9, 0x00, 0x8D, 0x02, 0xDF, 0xA9, 0x20, 0x8D, 0x03, 0xDF, 0xAD, 0xA8, 0x02, 0x8D, 0x04, 0xDF, 0xAD, 0xA9, 0x02, 0x8D, 0x05, 0xDF, 0xAD, 0xAA, 0x02, 0x8D, 0x06, 0xDF, 0xAD, 0xAB, 0x02, 0x8D, 0x07, 0xDF, 0xAD, 0xAC, 0x02, 0x8D, 0x08, 0xDF, 0xA9, 0x00, 0x8D, 0x0A, 0xDF, 0xAD, 0xA7, 0x02, 0xC9, 0x02, 0xF0, 0x04, 0xA9, 0x90, 0xD0, 0x02, 0xA9, 0x91, 0x8D, 0x01, 0xDF, 0xEE, 0x20, 0xD0, 0xA9, 0x00, 0x8D, 0xA7, 0x02, 0xF0, 0xB0, 0xA9, 0x00, 0x8D, 0xA7, 0x02, 0x85, 0xF0, 0x58, 0x20, 0x0E, 0x08, 0x4C, 0x7B, 0xE3])
 
 def u64_post_mem(addr, data):
     """machine:writemem with the data as a binary attachment (one request for a whole block)."""
@@ -962,6 +964,65 @@ def reu_lights(path, start):
         lights_off(saved)
         print("[*] Lights: back to the Ultimate's own settings")
 
+REU_FOLDER = "/SD/viz"       # where a .reu goes on the Ultimate (FTP), for it to load into the REU itself
+
+def ftp_put(data, folder, name):
+    """Upload data to the Ultimate by FTP as folder/name, making the folder if it isn't there."""
+    import ftplib, io
+    ip = U64.replace("http://", "")
+    try:
+        ftp = ftplib.FTP()
+        ftp.connect(ip, 21, timeout=30)
+        ftp.login()
+        ftp.set_pasv(False)                 # as the curl uploads do (--ftp-port -)
+        ftp.cwd("/")
+        for part in [p for p in folder.split("/") if p]:
+            try:
+                ftp.cwd(part)
+            except ftplib.error_perm:
+                ftp.mkd(part); ftp.cwd(part)
+        sent, t0, last = [0], time.time(), [0.0]
+        def step(block):
+            sent[0] += len(block)
+            if time.time() - last[0] > 0.25 or sent[0] == len(data):
+                last[0] = time.time()
+                rate = sent[0] / max(0.001, time.time() - t0) / 1024
+                print(f"\r[*] Uploading to the Ultimate: {sent[0] // 1024} / {len(data) // 1024} KB  ({rate:.0f} KB/s)",
+                      end="", flush=True)
+                emit("reu-send", done=sent[0], total=len(data))
+        ftp.storbinary(f"STOR {name}", io.BytesIO(data), blocksize=65536, callback=step)
+        ftp.quit()
+        print()
+        return True
+    except (OSError, EOFError, ftplib.Error) as e:
+        print(f"\n[!] FTP upload to {folder} failed: {e}")
+        return False
+
+def reu_preload(data):
+    """Upload the .reu to REU_FOLDER and point the Ultimate's REU preload at it, so it loads it into
+    the REU itself at the next reset (much faster than through the C64). For now only: returns
+    the settings to put back, or None when it can't."""
+    cat, name = "C64 and Cartridge Settings", "viz.reu"
+    items = _cfg(cat)
+    on = next((k for k in items if re.fullmatch(r"reu\s*preload", k, re.I)), None)
+    image = next((k for k in items if re.search(r"preload\s*image", k, re.I)), None)
+    offset = next((k for k in items if re.search(r"preload\s*offset", k, re.I)), None)
+    if not on or not image:
+        print("[*] This Ultimate has no REU preload setting: sending the video the slow way")
+        return None
+    if not ftp_put(data, REU_FOLDER, name):
+        return None
+    saved = []
+    for item, value in ((image, f"{REU_FOLDER.rstrip('/')}/{name}"), (on, "Enabled"),
+                        (offset, next((str(v) for v in _cfg(cat, offset) if str(v).strip().startswith("0")), "0 KB") if offset else None)):
+        if item and value and str(items[item]) != value:
+            if not _cfg_set(cat, item, value):
+                lights_off(saved)
+                print(f"[!] Couldn't set {item}: sending the video the slow way")
+                return None
+            saved.append((cat, item, str(items[item])))
+    return saved
+
 def send_reu(path, lights=False):
     """Put a Koalavideo .reu into the Ultimate's REU and start the player (no reset in between);
     lights: then flash the C64U's lights with its sound until it ends."""
@@ -977,7 +1038,8 @@ def send_reu(path, lights=False):
     if changed:
         print(f"[*] Turned on the Ultimate's REU for now ({'; '.join(changed)}); its saved settings are unchanged")
         emit("note", message="Turned on the Ultimate's REU at 16 MB for now")
-    print("[*] Rebooting C64...")
+    preload = reu_preload(data)
+    print("[*] Rebooting C64..." + (" (the Ultimate loads the video into the REU)" if preload is not None else ""))
     u64_put("machine:reboot")
     time.sleep(4.0)
     tmp = os.path.join(tempfile.gettempdir(), "sidviz-reuload.prg")
@@ -986,8 +1048,21 @@ def send_reu(path, lights=False):
         print("[!] Could not start the REU loader"); return False
     time.sleep(1.5)
     post_ok = True
+    last = (len(data) - 1) // REU_BLOCK * REU_BLOCK
+    loaded = False
+    if preload is not None:
+        mid = len(data) // 2 // 256 * 256
+        give_up = time.time() + 20                # a big file can still be loading
+        while True:
+            loaded = all(_reu_check(o, data[o:o + 16]) for o in (0, mid, last))
+            if loaded or time.time() > give_up:
+                break
+            time.sleep(1.0)
+        lights_off(preload)                 # the preload settings back as they were
+        print("[*] The Ultimate has the video in its REU" if loaded
+              else "[!] The Ultimate didn't preload the video: sending it the slow way")
     t0 = time.time()
-    for i, a in enumerate(range(0, len(data), REU_BLOCK)):
+    for i, a in enumerate(range(0, len(data) if not loaded else 0, REU_BLOCK)):
         block = data[a:a + REU_BLOCK]
         if post_ok:
             post_ok = u64_post_mem(REU_BUFFER, block)
@@ -1009,7 +1084,6 @@ def send_reu(path, lights=False):
         rate = done / max(0.001, time.time() - t0) / 1024
         print(f"\r[*] Sending to the REU: {done // 1024} / {len(data) // 1024} KB  ({rate:.0f} KB/s)", end="", flush=True)
         emit("reu-send", done=done, total=len(data))
-    last = (len(data) - 1) // REU_BLOCK * REU_BLOCK
     if not _reu_check(last, data[last:last + 16]):
         print("\n[!] The end of the video didn't stick: is the REU set to 16 MB?"); return False
     print("\n[*] REU loaded. Starting daddlerTL's Koalavideo player...")
@@ -2818,7 +2892,7 @@ def bkgd_top(bk, top_screen, mode_col):
     return bytes(chars), bytes(cols)
 
 def main():
-    global U64, FPS, VIZ_MODE, VIZ_W, LEDS, _YTDLP_COOKIE_ARGS, ENGINE, ENGINE_ANSWERS  # noqa: PLW0603
+    global U64, FPS, VIZ_MODE, VIZ_W, LEDS, _YTDLP_COOKIE_ARGS, ENGINE, ENGINE_ANSWERS, REU_FOLDER  # noqa: PLW0603
 
     def _kill_proc(p):
         if p is None:
@@ -2858,6 +2932,8 @@ def main():
 
     if args.save_reu or args.play_reu:
         U64 = f"http://{args.ip}"
+        if args.reu_folder:
+            REU_FOLDER = args.reu_folder
         if args.save_reu:
             ok = save_reu(args)
         elif args.file and args.file.lower().endswith(".reu"):

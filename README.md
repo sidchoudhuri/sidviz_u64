@@ -373,7 +373,9 @@ settings are unchanged). Ultimate Audio videos also need Ultimate Audio on. sidv
 .reu by FTP to `/SD/viz/viz.reu` (`--reu-folder` for another place; the folder is made if it isn't
 there) and points the Ultimate's REU preload at it, so the Ultimate loads it into the REU itself
 when the C64 resets; then it puts the preload settings back. A small loader (`reuload.asm`)
-checks the REU and starts the player. Without the preload setting, the loader copies the video
+checks the REU and starts the player. For the video, sidviz also takes out a cartridge (it would
+stop the REU) and maps Ultimate Audio for an Ultimate Audio video, for that session only.
+Without the preload setting, the loader copies the video
 into the REU through the REST API instead (much slower).
 
 **The song's details.** A scroller can be drawn into the pictures: `--reu-text` (twice for two
@@ -404,7 +406,10 @@ python3 sidviz_c64.py clip.reu --play-reu
 2022-2026, freeware and open source; as he asks, his name stays with it. The Mahoney sample
 tables are from his BREADAMP REUmaker. `koalavideo.prg` is his program, included unchanged and
 not covered by this repository's GPL; `koalavideo.py` writes the REU as his Koalavideo v06
-REUmaker does.
+REUmaker does. `koalavideo-reu-play.prg` is his player with only its start changed: its SYS line
+goes to 7 bytes added at the end that clear $F0 and start it, so on an Ultimate it plays the
+video already in the REU instead of opening its file browser. sidviz uses it; on its own, load a
+Koalavideo .reu into the REU (REU on at 16 MB), then run it.
 
 ---
 

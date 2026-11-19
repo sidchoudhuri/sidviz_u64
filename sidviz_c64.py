@@ -791,7 +791,7 @@ def send_ticker(ticker_str):
 
 import tempfile
 
-KV_PLAYER   = "koalavideo.prg"
+KV_PLAYER   = "koalavideo-reu-play.prg"   # daddlerTL's player, started so it plays the REU (no file browser)
 REU_MBOX    = 0x02A7          # reuload.asm's mailbox: command, REU address (3), length (2)
 REU_BUFFER  = 0x2000
 REU_BLOCK   = 0x8000
@@ -878,10 +878,21 @@ def lights_on():
         m = re.search(r"\$?(D[4-7][0-9A-F]{2})", str(v), re.I)
         if re.search(r"ultisid\s*2\b.*address", k, re.I) and m and m.group(1).upper() != "D400":
             addr = int(m.group(1), 16)
-    if addr is None:
-        print("[!] Lights: UltiSID 2 has no address of its own in the Ultimate's SID addressing, so they stay as they are")
-        return None, []
     saved = []
+    if addr is None:                         # give UltiSID 2 a free address, for now
+        sa = _cfg("SID Addressing")
+        item = next((k for k in sa if re.search(r"ultisid\s*2\b.*address", k, re.I)), None)
+        used = {m.group(1).upper() for v in sa.values() for m in [re.search(r"\$?(D[4-7][0-9A-F]{2})", str(v), re.I)] if m}
+        offered = [str(v) for v in _cfg("SID Addressing", item)] if item else []
+        for want in ("D4A0", "D4C0", "D4E0", "D480", "D600", "D700"):
+            value = next((v for v in offered if v.upper().lstrip("$") == want), None)
+            if value and want not in used and _cfg_set("SID Addressing", item, value):
+                saved.append(("SID Addressing", item, str(sa[item])))
+                addr = int(want, 16)
+                break
+    if addr is None:
+        print("[!] Lights: UltiSID 2 couldn't be given an address of its own, so they stay as they are")
+        return None, []
     for cat in ("LED Strip Settings", "Keyboard Lighting"):
         items = _cfg(cat)
         for key, want in ((r"sid\s*select", r"ultisid\s*2\W*a\b"), (r"auto\s*sid", r"^(disabled|off)$"),
@@ -1023,6 +1034,24 @@ def reu_preload(data):
             saved.append((cat, item, str(items[item])))
     return saved
 
+def play_settings(data):
+    """The rest of what a Koalavideo needs, set for now (not saved to flash): no cartridge (it
+    would stop the REU), and Ultimate Audio mapped for an Ultimate Audio video. Returns notes."""
+    cat, notes = "C64 and Cartridge Settings", []
+    items = _cfg(cat)
+    cart = next((k for k in items if re.fullmatch(r"cartridge", k, re.I)), None)
+    if cart and str(items[cart]).strip() not in ("", "None", "none"):
+        value = next((str(v) for v in _cfg(cat, cart) if str(v).strip() in ("", "None", "none")), "")
+        if _cfg_set(cat, cart, value):
+            notes.append(f"no cartridge (was {items[cart]})")
+    audio = next((data[16 * n + 7] for n in range(1, (data[15] + 1) if len(data) > 16 else 0)
+                  if data[16 * n:16 * n + 5] == b"AUDIO"), None)
+    if audio is not None and (audio - 32) // 4 == 3:            # Ultimate Audio sound
+        ua = next((k for k in items if re.search(r"ultimate\s*audio", k, re.I)), None)
+        if ua and not re.match(r"enabled|on", str(items[ua]), re.I) and _cfg_set(cat, ua, "Enabled"):
+            notes.append(f"{ua}: Enabled")
+    return notes
+
 def send_reu(path, lights=False):
     """Put a Koalavideo .reu into the Ultimate's REU and start the player (no reset in between);
     lights: then flash the C64U's lights with its sound until it ends."""
@@ -1038,6 +1067,8 @@ def send_reu(path, lights=False):
     if changed:
         print(f"[*] Turned on the Ultimate's REU for now ({'; '.join(changed)}); its saved settings are unchanged")
         emit("note", message="Turned on the Ultimate's REU at 16 MB for now")
+    for note in play_settings(data):
+        print(f"[*] For now: {note}")
     preload = reu_preload(data)
     print("[*] Rebooting C64..." + (" (the Ultimate loads the video into the REU)" if preload is not None else ""))
     u64_put("machine:reboot")
@@ -1263,7 +1294,7 @@ def save_reu(args):
         out = os.path.expanduser(args.save_reu)
         open(out, "wb").write(reu)
         print(f"[*] Saved {out}  ({used // 1024} KB of 16 MB used)")
-        print("[*] On the Ultimate: REU on at 16 MB, load the .reu into it, then run koalavideo.prg")
+        print("[*] On the Ultimate: REU on at 16 MB, load the .reu into it, then run koalavideo-reu-play.prg")
         if model == "ua":
             print("[*] Ultimate Audio sound: turn on Ultimate Audio in the Ultimate's settings")
         if args.play_reu or input("Send it to the Ultimate and play it now? [y/N]: ").strip().lower() in ("y", "yes"):

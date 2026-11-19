@@ -371,10 +371,11 @@ def _koala(q, w, c0, r0, cols, rows, dist, must=None):
     return bytes(kla)
 
 def reu_sound(data):
-    """A Koalavideo REU's sound back as 8-bit unsigned samples at RATE (128 = silence), and whether
-    it has an info screen (the player shows that first). For the C64U's lights; b"" when silent."""
+    """A Koalavideo REU's sound back as 8-bit unsigned samples at RATE (128 = silence), whether it
+    has an info screen (the player shows that first), and how it plays (1 / 2 = the SID at $D400,
+    6581 / 8580; 3 = Ultimate Audio; 0 = silent). For the C64U's lights; b"" when silent."""
     lines = data[15] + 1 if len(data) > 16 else 0
-    snd, info = b"", False
+    snd, info, kind = b"", False, 0
     for n in range(1, lines):
         ln = data[16 * n:16 * n + 16]
         a3 = lambda o: ln[o] << 16 | ln[o + 1] << 8 | ln[o + 2]
@@ -393,7 +394,7 @@ def reu_sound(data):
                     back.setdefault(v, []).append(i)
                 inv = bytes(sum(back[v]) // len(back[v]) if v in back else 128 for v in range(256))
                 snd = raw.translate(inv)
-    return snd, info
+    return snd, info, kind
 
 def sound(path, seconds):
     """8-bit unsigned mono samples at RATE (128 = silence), levelled so quiet parts still carry."""

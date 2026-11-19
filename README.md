@@ -390,10 +390,10 @@ shadow colour or none (`--reu-scroll-shadow 0-15|off`), slow, medium or fast
 screen, which it shows before the video until a key is pressed on the C64.
 
 **The C64U's lights.** With `--play-reu --reu-leds`, the case strip and keyboard lights flash with
-the video's sound while it plays. The player's sound uses UltiSID 1, so sidviz points both lights
-at UltiSID 2 (with auto SID mode off, in SID music mode) and drives a silent fake SID there, then
-puts the settings back at the end (nothing is saved to flash). UltiSID 2 needs an address of its
-own in the Ultimate's SID addressing.
+the video's sound while it plays, for a video with Ultimate Audio sound (`--reu-sound ua`). The
+lights follow the SID at $D400, so sidviz drives a silent fake SID there (in SID music mode), then
+puts the settings back at the end (nothing is saved to flash). With SID sound the player uses
+$D400 itself, so the lights can't follow it.
 
 ```bash
 python3 sidviz_c64.py clip.mp4 --save-reu clip.reu --replace-audio tune.sid --play-reu

@@ -318,7 +318,7 @@ def parse_args():
     p.add_argument("--reu-folder",   metavar="PATH",
                    help="Where --play-reu puts the .reu on the Ultimate (FTP) for it to load (default /SD/viz)")
     p.add_argument("--reu-leds",     action="store_true",
-                   help="With --play-reu: the C64U's lights follow the video's sound (through UltiSID 2)")
+                   help="With --play-reu: the C64U's lights follow the video's sound (Ultimate Audio videos)")
     p.add_argument("--save-d64",     metavar="FILE.d64",
                    help="Save SID + pre-rendered frames to a bootable D64 disk image")
     p.add_argument("--d64-fps",      type=int, default=10,
@@ -869,54 +869,41 @@ def _cfg_set(cat, item, value):
     return u64_put(f"configs/{q(cat)}/{q(item)}", {"value": value}) == 200
 
 def lights_on():
-    """C64U lights for a Koalavideo: the player's sound goes through UltiSID 1, so the case strip and
-    keyboard lights are switched to follow UltiSID 2 (auto SID mode off, SID music mode), where a
-    silent fake SID follows the video's sound. For now only (not saved to flash).
-    Returns (UltiSID 2's address, the settings to put back) or (None, [])."""
-    addr = None
-    for k, v in _cfg("SID Addressing").items():
-        m = re.search(r"\$?(D[4-7][0-9A-F]{2})", str(v), re.I)
-        if re.search(r"ultisid\s*2\b.*address", k, re.I) and m and m.group(1).upper() != "D400":
-            addr = int(m.group(1), 16)
-    saved = []
-    if addr is None:                         # give UltiSID 2 a free address, for now
-        sa = _cfg("SID Addressing")
-        item = next((k for k in sa if re.search(r"ultisid\s*2\b.*address", k, re.I)), None)
-        used = {m.group(1).upper() for v in sa.values() for m in [re.search(r"\$?(D[4-7][0-9A-F]{2})", str(v), re.I)] if m}
-        offered = [str(v) for v in _cfg("SID Addressing", item)] if item else []
-        for want in ("D4A0", "D4C0", "D4E0", "D480", "D600", "D700"):
-            value = next((v for v in offered if v.upper().lstrip("$") == want), None)
-            if value and want not in used and _cfg_set("SID Addressing", item, value):
-                saved.append(("SID Addressing", item, str(sa[item])))
-                addr = int(want, 16)
-                break
-    if addr is None:
-        print("[!] Lights: UltiSID 2 couldn't be given an address of its own, so they stay as they are")
-        return None, []
+    """C64U lights for a Koalavideo with Ultimate Audio (or no) sound: the lights follow the SID at
+    $D400, which the video doesn't use then, so a silent fake SID there follows its sound. The case
+    strip and keyboard lights are put in SID music mode, for now only (not saved to flash).
+    Returns ($D400, the settings to put back) or (None, [])."""
+    saved, found = [], False
     for cat in ("LED Strip Settings", "Keyboard Lighting"):
         items = _cfg(cat)
-        for key, want in ((r"sid\s*select", r"ultisid\s*2\W*a\b"), (r"auto\s*sid", r"^(disabled|off)$"),
-                          (r"^(?!.*(auto|sid select|pattern|color|colour|tint|intensity)).*mode", r"sid\s*music")):
-            item = next((k for k in items if re.search(key, k, re.I)), None)
-            if not item or re.search(want, str(items[item]), re.I):
-                continue
-            value = next((str(v) for v in _cfg(cat, item) if re.search(want, str(v), re.I)), None)
-            if value and _cfg_set(cat, item, value):
-                saved.append((cat, item, str(items[item])))
-    if not saved and not any(_cfg(c) for c in ("LED Strip Settings", "Keyboard Lighting")):
+        found = found or bool(items)
+        item = next((k for k in items if re.search(r"^(?!.*(auto|sid select|pattern|color|colour|tint|intensity)).*mode",
+                                                    k, re.I)), None)
+        if not item or re.search(r"sid\s*music", str(items[item]), re.I):
+            continue
+        value = next((str(v) for v in _cfg(cat, item) if re.search(r"sid\s*music", str(v), re.I)), None)
+        if value and _cfg_set(cat, item, value):
+            saved.append((cat, item, str(items[item])))
+    if not found:
         print("[!] Lights: no LED settings found (a C64U has them)")
         return None, []
-    return addr, saved
+    return 0xD400, saved
 
 def lights_off(saved):
     for cat, item, value in reversed(saved):
         _cfg_set(cat, item, value)
 
-def reu_lights(path, start):
+def reu_lights(path, start, before=None):
     """Flash the C64U's lights with a Koalavideo's sound while it plays (start: when the player
-    was started). Stops at the end, on Ctrl+C, or (Viz) on q."""
+    was started; before: the picture memory the video starts in, read just before). Stops at the
+    end, on Ctrl+C, or (Viz) on q."""
     import koalavideo as kv
-    snd, info = kv.reu_sound(open(path, "rb").read())
+    snd, info, kind = kv.reu_sound(open(path, "rb").read())
+    if kind in (1, 2):
+        print("[*] Lights: this video's sound plays on the SID at $D400, which is what the lights follow,")
+        print("    so they can't flash with it. Make the video with Ultimate Audio sound for the lights.")
+        emit("note", message="No lights with SID sound: make the video with Ultimate Audio sound")
+        return
     if not snd:
         print("[*] Lights: the video has no sound to follow"); return
     r = subprocess.run(["ffmpeg", "-v", "error", "-f", "u8", "-ar", str(kv.RATE), "-ac", "1", "-i", "pipe:0",
@@ -943,7 +930,7 @@ def reu_lights(path, start):
             stop.set()
         threading.Thread(target=keys, daemon=True).start()
     _led_state.update(avg=[0.0, 0.0, 0.0], on=[0, 0, 0])
-    print(f"[*] Lights: the C64U's lights follow the video through UltiSID 2 at ${addr:04X}"
+    print("[*] Lights: the C64U's lights follow the video's sound (a silent fake SID at $D400)"
           + ("" if ENGINE else "; Ctrl+C stops them"))
     if info:
         print("[*] The info screen stays until a key is pressed on the C64; the lights start with the video")
@@ -951,13 +938,14 @@ def reu_lights(path, start):
     emit("note", message="The C64U's lights follow the video's sound")
     try:
         write_mem(addr, [0] * 25)                       # silent: volume 0
-        # the video has started when the VIC is in bitmap mode (the info screen is text)
-        t0 = start + 0.7
-        while not stop.is_set():
-            r = u64_get("machine:readmem?address=D011&length=1")
+        # the video has started when its first picture lands in the C64's memory (screen RAM
+        # at $8400, the middle of the picture; the info screen uses $0400)
+        t0, first = start + 0.7, before
+        while first and not stop.is_set():
+            r = u64_get("machine:readmem?address=8590&length=64")
             if not r:
                 break
-            if r[0] & 0x20:
+            if r != first:
                 t0 = time.time()
                 break
             stop.wait(0.05)
@@ -1123,9 +1111,10 @@ def send_reu(path, lights=False):
         u64_post_mem(prg[0] | prg[1] << 8, prg[2:])
     else:
         write_mem(prg[0] | prg[1] << 8, prg[2:])
+    before = u64_get("machine:readmem?address=8590&length=64") if lights else None
     write_byte(REU_MBOX, 3)
     if lights:
-        reu_lights(path, time.time())
+        reu_lights(path, time.time(), before)
     return True
 
 def song_info(path, kind):

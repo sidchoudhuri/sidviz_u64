@@ -4,7 +4,7 @@ Real-time waveform visualizer for the Commodore 64, driven by a Mac or Linux mac
 
 ```
 +------------------------------------------------------+
-|  sidviz_u64  v2.0.1  build 2026-11-18                |
+|  sidviz_u64  v2.0.2  build 2026-11-19                |
 +------------------------------------------------------+
 |  File: Commando.sid                                  |
 |  Title        Commando                               |
@@ -372,8 +372,27 @@ file). It turns the Ultimate's REU on at 16 MB itself, for that session only (it
 settings are unchanged). Ultimate Audio videos also need Ultimate Audio on. sidviz starts a small loader (`reuload.asm`), copies the
 video into the REU through the REST API, then starts the player.
 
+**The song's details.** A scroller can be drawn into the pictures: `--reu-text` (twice for two
+rows; `song` takes the title, artist or author, album and year from the .sid or the audio file's
+tags, or the video's title), over the video or on a black strip of its own
+(`--reu-scroll overlay|strip`; the video shrinks to make room), at the top or bottom
+(`--reu-scroll-at`), normal or double size (`--reu-scroll-size 1|2`), in a C64 colour, rainbow,
+moving rainbow bands or cycling colours (`--reu-scroll-color 0-15|rainbow|bands|cycle`), with a
+shadow colour or none (`--reu-scroll-shadow 0-15|off`), slow, medium or fast
+(`--reu-scroll-speed`). A row that fits stays still in the middle; a longer one scrolls.
+`--reu-info` (repeat for more lines; `song` for the song's details) fills the player's info
+screen, which it shows before the video until a key is pressed on the C64.
+
+**The C64U's lights.** With `--play-reu --reu-leds`, the case strip and keyboard lights flash with
+the video's sound while it plays. The player's sound uses UltiSID 1, so sidviz points both lights
+at UltiSID 2 (with auto SID mode off, in SID music mode) and drives a silent fake SID there, then
+puts the settings back at the end (nothing is saved to flash). UltiSID 2 needs an address of its
+own in the Ultimate's SID addressing.
+
 ```bash
 python3 sidviz_c64.py clip.mp4 --save-reu clip.reu --replace-audio tune.sid --play-reu
+python3 sidviz_c64.py clip.mp4 --save-reu clip.reu --replace-audio song.mp3 --reu-text song \
+    --reu-scroll strip --reu-scroll-color rainbow --reu-info song --play-reu --reu-leds
 python3 sidviz_c64.py clip.reu --play-reu
 ```
 

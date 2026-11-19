@@ -4,7 +4,7 @@ sidviz_u64.py -- SID/audio waveform + live camera visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 Camera mode: streams webcam footage as PETSCII character art on the C64 screen.
 
-version 2.0.1 (2026-11-18)
+version 2.0.2 (2026-11-19)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -33,8 +33,8 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "2.0.1"
-BUILD   = "2026-11-18"
+VERSION = "2.0.2"
+BUILD   = "2026-11-19"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
 import argparse, threading, re, json, select as _select, struct, queue
@@ -304,6 +304,19 @@ def parse_args():
     p.add_argument("--reu-dither",   choices=["bayer", "none", "diffusion"], help="REU video: dithering")
     p.add_argument("--reu-viz",      choices=["showwaves", "showfreqs", "avectorscope", "showspectrum", "ahistogram"],
                    help="REU video: blend an audio visualizer into the picture")
+    p.add_argument("--reu-text",     action="append", metavar="TEXT",
+                   help="REU video: a scroller row (twice for 2 rows); \"song\" = the song's details")
+    p.add_argument("--reu-scroll",   choices=["overlay", "strip"], help="REU scroller: over the video, or on a black strip")
+    p.add_argument("--reu-scroll-at", choices=["top", "bottom"], help="REU scroller: top or bottom (default bottom)")
+    p.add_argument("--reu-scroll-size", type=int, choices=[1, 2], help="REU scroller: 1=normal, 2=double size")
+    p.add_argument("--reu-scroll-color", metavar="0-15|rainbow|bands|cycle",
+                   help="REU scroller: a C64 colour, rainbow (fixed), bands (moving rainbow) or cycle (default 1)")
+    p.add_argument("--reu-scroll-shadow", metavar="0-15|off", help="REU scroller: shadow colour, or off (default 11)")
+    p.add_argument("--reu-scroll-speed", choices=["slow", "medium", "fast"], help="REU scroller: speed (default medium)")
+    p.add_argument("--reu-info",     action="append", metavar="TEXT",
+                   help="REU video: an info screen line (repeat; \"song\" = the song's details), shown before the video")
+    p.add_argument("--reu-leds",     action="store_true",
+                   help="With --play-reu: the C64U's lights follow the video's sound (through UltiSID 2)")
     p.add_argument("--save-d64",     metavar="FILE.d64",
                    help="Save SID + pre-rendered frames to a bootable D64 disk image")
     p.add_argument("--d64-fps",      type=int, default=10,
@@ -842,8 +855,116 @@ def reu_settings():
         print(f"[!] No REU settings found in the Ultimate's {cat}: {', '.join(items) or 'nothing read'}")
     return reu, changed
 
-def send_reu(path):
-    """Put a Koalavideo .reu into the Ultimate's REU and start the player (no reset in between)."""
+def _cfg(cat, item=None):
+    q = lambda t: urllib.parse.quote(t, safe="")
+    if item is None:
+        return _u64_json(f"configs/{q(cat)}").get(cat, {})
+    info = _u64_json(f"configs/{q(cat)}/{q(item)}").get(cat, {}).get(item, {})
+    return (info.get("values") or info.get("presets") or []) if isinstance(info, dict) else []
+
+def _cfg_set(cat, item, value):
+    q = lambda t: urllib.parse.quote(t, safe="")
+    return u64_put(f"configs/{q(cat)}/{q(item)}", {"value": value}) == 200
+
+def lights_on():
+    """C64U lights for a Koalavideo: the player's sound goes through UltiSID 1, so the case strip and
+    keyboard lights are switched to follow UltiSID 2 (auto SID mode off, SID music mode), where a
+    silent fake SID follows the video's sound. For now only (not saved to flash).
+    Returns (UltiSID 2's address, the settings to put back) or (None, [])."""
+    addr = None
+    for k, v in _cfg("SID Addressing").items():
+        m = re.search(r"\$?(D[4-7][0-9A-F]{2})", str(v), re.I)
+        if re.search(r"ultisid\s*2\b.*address", k, re.I) and m and m.group(1).upper() != "D400":
+            addr = int(m.group(1), 16)
+    if addr is None:
+        print("[!] Lights: UltiSID 2 has no address of its own in the Ultimate's SID addressing, so they stay as they are")
+        return None, []
+    saved = []
+    for cat in ("LED Strip Settings", "Keyboard Lighting"):
+        items = _cfg(cat)
+        for key, want in ((r"sid\s*select", r"ultisid\s*2\W*a\b"), (r"auto\s*sid", r"^(disabled|off)$"),
+                          (r"^(?!.*(auto|sid select|pattern|color|colour|tint|intensity)).*mode", r"sid\s*music")):
+            item = next((k for k in items if re.search(key, k, re.I)), None)
+            if not item or re.search(want, str(items[item]), re.I):
+                continue
+            value = next((str(v) for v in _cfg(cat, item) if re.search(want, str(v), re.I)), None)
+            if value and _cfg_set(cat, item, value):
+                saved.append((cat, item, str(items[item])))
+    if not saved and not any(_cfg(c) for c in ("LED Strip Settings", "Keyboard Lighting")):
+        print("[!] Lights: no LED settings found (a C64U has them)")
+        return None, []
+    return addr, saved
+
+def lights_off(saved):
+    for cat, item, value in reversed(saved):
+        _cfg_set(cat, item, value)
+
+def reu_lights(path, start):
+    """Flash the C64U's lights with a Koalavideo's sound while it plays (start: when the player
+    was started). Stops at the end, on Ctrl+C, or (Viz) on q."""
+    import koalavideo as kv
+    snd, info = kv.reu_sound(open(path, "rb").read())
+    if not snd:
+        print("[*] Lights: the video has no sound to follow"); return
+    r = subprocess.run(["ffmpeg", "-v", "error", "-f", "u8", "-ar", str(kv.RATE), "-ac", "1", "-i", "pipe:0",
+                        "-filter_complex", "[0:a]asplit=3[l1][l2][l3];[l1]lowpass=f=200[b1];"
+                        "[l2]bandpass=f=1000:width_type=o:w=2[b2];[l3]highpass=f=4000[b3];"
+                        f"[b1][b2][b3]amerge=inputs=3,aresample={LED_RATE}[ab]",
+                        "-map", "[ab]", "-f", "s16le", "-ac", "3", "pipe:1"], input=snd, stdout=subprocess.PIPE)
+    per = max(1, LED_RATE // LED_HZ) * 6
+    ticks = []
+    for o in range(0, len(r.stdout) - per + 1, per):
+        vals = struct.unpack(f"<{per // 2}h", r.stdout[o:o + per])
+        ticks.append([sum(abs(v) for v in vals[c::3]) / (per // 6) for c in range(3)])
+    if not ticks:
+        print("[!] Lights: ffmpeg gave nothing"); return
+    addr, saved = lights_on()
+    if addr is None:
+        return
+    stop = threading.Event()
+    if ENGINE:
+        def keys():
+            for line in sys.stdin:
+                if line.strip().lower() == "q":
+                    break
+            stop.set()
+        threading.Thread(target=keys, daemon=True).start()
+    _led_state.update(avg=[0.0, 0.0, 0.0], on=[0, 0, 0])
+    print(f"[*] Lights: the C64U's lights follow the video through UltiSID 2 at ${addr:04X}"
+          + ("" if ENGINE else "; Ctrl+C stops them"))
+    if info:
+        print("[*] The info screen stays until a key is pressed on the C64; the lights start with the video")
+        emit("note", message="The info screen stays until you press a key on the C64")
+    emit("note", message="The C64U's lights follow the video's sound")
+    try:
+        write_mem(addr, [0] * 25)                       # silent: volume 0
+        # the video has started when the VIC is in bitmap mode (the info screen is text)
+        t0 = start + 0.7
+        while not stop.is_set():
+            r = u64_get("machine:readmem?address=D011&length=1")
+            if not r:
+                break
+            if r[0] & 0x20:
+                t0 = time.time()
+                break
+            stop.wait(0.05)
+        while not stop.is_set():
+            n = int((time.time() - t0) * LED_HZ)
+            if n >= len(ticks):
+                break
+            if n >= 0:
+                write_mem(addr, leds_tick(ticks[n]))
+            stop.wait(max(0.0, t0 + (n + 1) / LED_HZ - time.time()))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        write_mem(addr, [0] * 25)
+        lights_off(saved)
+        print("[*] Lights: back to the Ultimate's own settings")
+
+def send_reu(path, lights=False):
+    """Put a Koalavideo .reu into the Ultimate's REU and start the player (no reset in between);
+    lights: then flash the C64U's lights with its sound until it ends."""
     player = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), KV_PLAYER)
     if not os.path.isfile(player):
         print(f"[!] {KV_PLAYER} (daddlerTL's Koalavideo player) not found at {player}"); return False
@@ -898,7 +1019,33 @@ def send_reu(path):
     else:
         write_mem(prg[0] | prg[1] << 8, prg[2:])
     write_byte(REU_MBOX, 3)
+    if lights:
+        reu_lights(path, time.time())
     return True
+
+def song_info(path, kind):
+    """A song's details: a .sid's header (title, author, released), or a file's tags (title, artist,
+    album, year). kind "video": the video's own title."""
+    info = {}
+    try:
+        if kind == "sid":
+            h = open(path, "rb").read(0x76)
+            if h[:4] in (b"PSID", b"RSID"):
+                f = lambda o: h[o:o + 32].split(b"\0")[0].decode("latin-1").strip()
+                info = {"title": f(0x16), "author": f(0x36), "released": f(0x56)}
+        else:
+            r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json", path],
+                               capture_output=True, text=True)
+            tags = {k.lower(): v for k, v in json.loads(r.stdout or "{}").get("format", {}).get("tags", {}).items()}
+            info = {"title": tags.get("title", ""), "artist": tags.get("artist") or tags.get("album_artist", ""),
+                    "album": tags.get("album", ""), "year": (tags.get("date") or tags.get("year") or "")[:4]}
+            if kind == "video":
+                info = {"title": info["title"], "artist": info["artist"]}
+    except (OSError, ValueError):
+        pass
+    if not info.get("title"):
+        info["title"] = os.path.splitext(os.path.basename(path))[0]
+    return {k: v for k, v in info.items() if v}
 
 def _reu_ask(prompt, options, default, flag=None):
     if flag is not None:
@@ -919,11 +1066,16 @@ def save_reu(args):
         else:
             src = os.path.expanduser(args.file) if args.file else \
                   os.path.expanduser(input("Video file or URL: ").strip())
+        link_info = None
         if is_url(src):
             print("[*] Downloading the video (yt-dlp)...")
             dst = os.path.join(tmpdir, "video.mp4")
-            subprocess.run(["yt-dlp", "-q", "--no-playlist", "-f", "bv*[height<=480]+ba/b[height<=480]/b",
-                            "--merge-output-format", "mp4", "-o", dst] + _YTDLP_COOKIE_ARGS + [src])
+            r = subprocess.run(["yt-dlp", "-q", "--no-playlist", "-f", "bv*[height<=480]+ba/b[height<=480]/b",
+                                "--merge-output-format", "mp4", "-o", dst, "--print", "after_move:%(title)s\t%(channel)s"]
+                               + _YTDLP_COOKIE_ARGS + [src], stdout=subprocess.PIPE, text=True)
+            got = (r.stdout or "").strip().splitlines()
+            if got and "\t" in got[-1]:
+                link_info = dict(zip(("title", "artist"), got[-1].split("\t", 1)))
             if not os.path.isfile(dst):
                 print("[!] Download failed"); return False
             src = dst
@@ -953,6 +1105,10 @@ def save_reu(args):
                 audio, seconds = ra, kv.duration(ra) or vlen
             print(f"[*] Audio: {os.path.basename(ra)}  (the video loops until it ends)")
         has_sound = kv.has_audio(audio)
+        if ra:
+            song = song_info(ra, "sid" if os.path.splitext(ra)[1].lower() in SID_EXTS else "audio")
+        else:
+            song = {k: v for k, v in (link_info or {}).items() if v} or song_info(src, "video")
 
         shape = _reu_ask("Picture shape? [1=16:10 full screen, 2=16:9, 3=4:3, 4=2.35:1] (default 2): ",
                          {"1": 1, "2": 2, "3": 3, "4": 4}, 2, args.reu_shape)
@@ -980,6 +1136,33 @@ def save_reu(args):
 
         fps = 50 / speed
         sound_on = model != "none"
+
+        # the song's details: a scroller in the pictures and / or the player's info screen
+        auto = kv.song_lines(song)[0]
+        texts = args.reu_text
+        if texts is None:
+            ans = input(f"Scroller text? [Enter=none, s=the song's details ({auto}), or type it]: ").strip()
+            texts = [auto] if ans.lower() == "s" else [ans] if ans else []
+        if [t for t in texts if t.lower() == "song"]:
+            texts = kv.song_lines(song, 2 if len(texts) > 1 else 1)
+        scroller = None
+        if [t for t in texts if t.strip()]:
+            col = (args.reu_scroll_color or "1").lower()
+            col = col if col in ("rainbow", "bands", "cycle") else int(col) & 15 if col.isdigit() else 1
+            sh = (args.reu_scroll_shadow or "11").lower()
+            sh = None if sh in ("off", "none", "no") else int(sh) & 15 if sh.isdigit() else 11
+            scroller = kv.Scroller(texts, args.reu_scroll or "overlay", args.reu_scroll_at or "bottom",
+                                   args.reu_scroll_size or 1, col, sh, args.reu_scroll_speed or "medium", fps)
+            print(f"[*] Scroller: {' / '.join(scroller.lines)}  ({'strip' if scroller.strip else 'over the video'}, "
+                  f"{'top' if scroller.top else 'bottom'})")
+        info = args.reu_info
+        if info is None:
+            ans = input("Info screen with the song's details before the video? [y/N]: ").strip().lower()
+            info = ["song"] if ans in ("y", "yes") else []
+        if info == ["song"]:
+            info = [v for v in (song.get("title"), song.get("artist") or song.get("author"),
+                                song.get("album"), song.get("released") or song.get("year")) if v]
+        info = [l for l in info if l.strip()] or None
         nmax = kv.max_pictures(shape, fps, sound_on)
         if not seconds:
             print("[!] Can't tell how long the video is"); return False
@@ -990,7 +1173,8 @@ def save_reu(args):
         print(f"[*] Koalavideo: {kv.SHAPES[shape][0]}, {kv.SPEEDS[speed]}, sound {model}, "
               f"{n} pictures ({secs:.1f} s)")
         klas, t0 = [], time.time()
-        for k in kv.frames(src, shape, fps, secs, BKGD_PALETTES[pal], dither, viz, audio, loop=bool(ra)):
+        for k in kv.frames(src, shape, fps, secs, BKGD_PALETTES[pal], dither, viz, audio, loop=bool(ra),
+                           scroller=scroller):
             klas.append(k)
             if len(klas) % 25 == 0 or len(klas) == n:
                 print(f"\r[*] Pictures: {len(klas)} / {n}", end="", flush=True)
@@ -1001,7 +1185,7 @@ def save_reu(args):
         if not klas:
             print("[!] ffmpeg gave no pictures"); return False
         samples = kv.sound(audio, len(klas) / fps) if sound_on else None
-        reu, used = kv.build(klas, shape, speed, samples, model)
+        reu, used = kv.build(klas, shape, speed, samples, model, info=info)
         out = os.path.expanduser(args.save_reu)
         open(out, "wb").write(reu)
         print(f"[*] Saved {out}  ({used // 1024} KB of 16 MB used)")
@@ -1009,7 +1193,7 @@ def save_reu(args):
         if model == "ua":
             print("[*] Ultimate Audio sound: turn on Ultimate Audio in the Ultimate's settings")
         if args.play_reu or input("Send it to the Ultimate and play it now? [y/N]: ").strip().lower() in ("y", "yes"):
-            return send_reu(out)
+            return send_reu(out, args.reu_leds)
         return True
     finally:
         for f in os.listdir(tmpdir):
@@ -2677,7 +2861,7 @@ def main():
         if args.save_reu:
             ok = save_reu(args)
         elif args.file and args.file.lower().endswith(".reu"):
-            ok = send_reu(os.path.expanduser(args.file))
+            ok = send_reu(os.path.expanduser(args.file), args.reu_leds)
         else:
             print("[!] --play-reu needs a .reu file (or use it with --save-reu)"); ok = False
         sys.exit(0 if ok else 1)

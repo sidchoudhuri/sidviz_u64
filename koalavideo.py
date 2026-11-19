@@ -5,7 +5,7 @@ freeware and open source); as he asks, his name stays with it.
 The REU is laid out exactly as his "Koalavideo v06 REUmaker" writes it (the same as SIDlab's
 video maker): 16-byte lines from $000000 ("KOALAVIDEO06REU", INDEX, INFOSCR, CHAPTERS, VIDEO,
 AUDIO; addresses high byte first), the picture index (4 bytes a picture: address, background
-colour), an empty info screen and chapter list, the pictures, then the sound from the next
+colour), the info screen (the song's details, or empty) and an empty chapter list, the pictures, then the sound from the next
 256-byte page: 11.7 kHz, a byte a sample, through daddlerTL's Mahoney table for the SID
 (from his BREADAMP REUmaker) or as signed linear samples for Ultimate Audio / FPGASID.
 
@@ -94,16 +94,17 @@ def _picture(kla, shape):
                      for r in range(12) for j in range(32)))
     return out
 
-def build(klas, shape, speed, samples=None, model="6581", border=0):
+def build(klas, shape, speed, samples=None, model="6581", border=0, info=None):
     """The 16 MB REU. samples: 8-bit unsigned at RATE (128 = silence) or None;
-    model: "6581" / "8580" (Mahoney) or "ua" (Ultimate Audio / FPGASID, linear)."""
+    model: "6581" / "8580" (Mahoney) or "ua" (Ultimate Audio / FPGASID, linear);
+    info: lines for the player's info screen (shown for 10 seconds before the video), or None."""
     reu, n, has = bytearray(REU), len(klas), bool(samples)
     at, end, snd = layout(n, shape, has)
     if end > REU:
         raise ValueError("the pictures don't fit in 16 MB")
     lines = 6 if has else 5
     idx = 16 * lines
-    info, chap = idx + 4 * n, idx + 4 * n + 1000
+    info_at, chap = idx + 4 * n, idx + 4 * n + 1000
     a3 = lambda v: bytes([v >> 16 & 255, v >> 8 & 255, v & 255])
     def put(o, b): reu[o:o + len(b)] = b
     for i, k in enumerate(klas):
@@ -115,7 +116,11 @@ def build(klas, shape, speed, samples=None, model="6581", border=0):
     bcd = bytes([int(d[0]) * 16 + int(d[1]), int(d[2]) * 16 + int(d[3])])
     put(0,  b"KOALAVIDEO06REU" + bytes([lines - 1]))
     put(16, b"INDEX" + bytes([0, 0, n >> 8, n & 255, 0]) + a3(idx) + a3(4 * n))
-    put(32, b"INFOSCR" + bytes([14, 6, 14]) + a3(info) + bytes([0, 3, 232]))   # no info screen
+    if info:                                       # $80: there is one (border, background, text colours)
+        put(info_at, info_screen(info))
+        put(32, b"INFOSCR" + bytes([0x80 | 14, 6, 1]) + a3(info_at) + bytes([0, 3, 232]))
+    else:
+        put(32, b"INFOSCR" + bytes([14, 6, 14]) + a3(info_at) + bytes([0, 3, 232]))   # no info screen
     put(48, b"CHAPTERS" + bytes([0, 0]) + a3(chap) + bytes([0, 0, 64]))
     video0 = 16 * lines + 4 * n + 1000 + 64
     put(64, b"VIDEO" + bcd + bytes([(shape - 1) * 8 + (2 if has else 0) * 2, (border & 15) * 16, speed])
@@ -130,6 +135,141 @@ def build(klas, shape, speed, samples=None, model="6581", border=0):
             + a3(snd) + a3((len(s) + 255) // 256 * 256))
         used = snd + len(s)
     return reu, used
+
+# ---------------------------------------------------------------------------
+# Song info: a scroller drawn into the pictures, and the player's info screen
+# ---------------------------------------------------------------------------
+
+# a 3x7 font (each character 4 Koala pixels wide with its gap, 8 high), capitals only
+_FONT_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,!?-:;\'"()/&+*#=_@[]<>%$'
+_FONT_BITS = [0xadf6d,0x1add6e,0xe4923,0x1adb6e,0x1e4d27,0x1e4d24,0xe4b6b,0x16df6d,0x1d2497,0x4926a,0x16e9ad,0x124927,0x17fb6d,0x1adb6d,0xadb6a,0x1add24,0xadb51,0x1add6d,0xe444e,0x1d2492,0x16db6f,0x16db52,0x16dbfd,0x16a4ad,0x16d492,0x1c9527,0x1edb6f,0xb2497,0x189527,0x18944e,0x16de49,0x1e4c4e,0xe4d6a,0x1c9492,0xad56a,0xad64e,0x00000,0x00002,0x00014,0x92482,0x189482,0x00e00,0x12090,0x12094,0x94000,0x168000,0x52491,0x112494,0x4a4a4,0xad56b,0x02e80,0x2aea8,0x17db7d,0x071c0,0x00007,0xaff23,0x1a4926,0xc924b,0x0a888,0x222a0,0x149525,0xbce7a]
+FONT = dict(zip(_FONT_CHARS, _FONT_BITS))
+RAINBOW = [2, 8, 7, 13, 3, 14, 4, 10]           # red, orange, yellow, light green, cyan, light blue, purple, pink
+SCROLL_SPEEDS = {"slow": 16, "medium": 32, "fast": 64}   # Koala pixels a second (normal size)
+
+def _plain(text):
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode()
+    return " ".join(t.split())
+
+class Scroller:
+    """Song info drawn into each picture: 1 or 2 rows, over the video or on a black strip of its own
+    (the video then shrinks to make room), at the top or bottom, normal or double size, in one colour,
+    rainbow bands (fixed or moving) or cycling colours, with or without a shadow. A row that fits
+    stays still in the middle; a longer one scrolls in from the right."""
+    def __init__(self, lines, place="overlay", at="bottom", size=1, color=1, shadow=11,
+                 speed="medium", fps=12.5):
+        self.lines = [_plain(l).upper() for l in lines if l and _plain(l)][:2]
+        self.strip, self.top = place == "strip", at == "top"
+        self.size = 2 if int(size) == 2 else 1
+        self.color, self.shadow = color, shadow
+        self.lh = 8 * self.size
+        self.height = self.lh * len(self.lines)
+        self.step = max(1, round(SCROLL_SPEEDS.get(speed, 32) * self.size / fps))
+        self.cycle = max(1, round(fps / 4))                 # pictures a colour, for "cycle"
+        self.bitmaps = [self._bitmap(l) for l in self.lines]
+
+    def _bitmap(self, text):
+        """Rows of 0/1 for a line of text, at the scroller's size."""
+        rows = [bytearray() for _ in range(8)]      # a blank line above, then the 7 of the font
+        for ch in text:
+            bits = FONT.get(ch, FONT["?"])
+            rows[0].extend(b"\0\0\0\0")
+            for r in range(7):
+                for c in range(3):
+                    rows[r + 1].append(bits >> (20 - (r * 3 + c)) & 1)
+                rows[r + 1].append(0)
+        if self.size == 2:
+            rows = [bytearray(b for b in row for _ in (0, 1)) for row in rows for _ in (0, 1)]
+        return rows
+
+    def _colour(self, x, i, k):
+        c = self.color
+        if c == "rainbow": return RAINBOW[(x // 4 + k) % len(RAINBOW)]
+        if c == "bands":   return RAINBOW[(x // 4 + k + i) % len(RAINBOW)]
+        if c == "cycle":   return RAINBOW[(i // self.cycle + k) % len(RAINBOW)]
+        return int(c) & 15
+
+    def draw(self, q, w, h, i):
+        """Draw picture i's scroller into q (w x h C64 colours). Returns, for each 4x8 cell it
+        touches, the colours that cell has to keep (the text's first)."""
+        must = {}
+        y0 = 0 if self.top else h - self.height
+        if self.strip:
+            for y in range(y0, y0 + self.height):
+                q[y * w:(y + 1) * w] = bytes(w)
+        for k, bm in enumerate(self.bitmaps):
+            tw, top = len(bm[0]), y0 + k * self.lh
+            if tw <= w:
+                cols = [(x, x - (w - tw) // 2) for x in range(w)]
+            else:
+                period = tw + w // 2
+                cols = []
+                for x in range(w):
+                    c = x + i * self.step - w
+                    cols.append((x, c % period if c >= 0 else -1))
+            text, shade = {}, {}
+            for x, c in cols:
+                if not 0 <= c < tw:
+                    continue
+                for r in range(self.lh):
+                    if bm[r][c]:
+                        text[(x, top + r)] = self._colour(x, i, k)
+                        if self.shadow is not None:
+                            shade[(x + 1, top + r + 1)] = self.shadow
+            for layer in (shade, text):
+                for (x, y), col in layer.items():
+                    if x < w and y < min(h, y0 + self.height if self.strip else h) and \
+                            (layer is text or (x, y) not in text):
+                        q[y * w + x] = col
+                        keep = must.setdefault((y // 8) * (w // 4) + x // 4, [])
+                        if col not in keep:
+                            keep.append(col)
+        if self.strip:                                     # the strip's black stays in every cell
+            for y in range(y0, y0 + self.height, 8):
+                for cx in range(w // 4):
+                    keep = must.setdefault((y // 8) * (w // 4) + cx, [])
+                    if 0 not in keep:
+                        keep.append(0)
+        for keep in must.values():                         # text before shadow before black
+            keep.sort(key=lambda c: (c == 0, self.shadow is not None and c == self.shadow))
+        return must
+
+def song_lines(info, rows=1):
+    """Scroller rows from song info (title, artist / author, album, released / year, extra)."""
+    f = lambda k: _plain(info.get(k) or "")
+    who = f("artist") or f("author")
+    first = "  -  ".join(v for v in (f("title"), who) if v)
+    second = "  -  ".join(v for v in (f("album"), f("released") or f("year"), f("extra")) if v)
+    if rows == 2 and second:
+        return [first or second, second if first else ""]
+    return ["  -  ".join(v for v in (first, second) if v)]
+
+def info_screen(lines):
+    """The player's info screen (1000 screen codes, lower/upper case set): the lines in the middle."""
+    def code(ch):
+        o = ord(ch)
+        if 97 <= o <= 122: return o - 96
+        if 65 <= o <= 90:  return o
+        if 32 <= o <= 63:  return o
+        return 63 if o != 64 else 0
+    rows = []
+    for l in (_plain(x) for x in lines):
+        while len(l) > 40:
+            cut = l.rfind(" ", 0, 41)
+            cut = cut if cut > 0 else 40
+            rows.append(l[:cut]); l = l[cut:].strip()
+        rows.append(l)
+    rows = rows[:23]
+    scr = bytearray(b" " * 1000)
+    top = (25 - (2 * len(rows) - 1)) // 2 if 2 * len(rows) - 1 <= 25 else 0
+    gap = 2 if 2 * len(rows) - 1 <= 25 else 1
+    for n, l in enumerate(rows):
+        r = top + n * gap
+        x = (40 - len(l)) // 2
+        for j, ch in enumerate(l):
+            scr[r * 40 + x + j] = code(ch)
+    return bytes(scr)
 
 # ---------------------------------------------------------------------------
 # Frames: ffmpeg -> 16 C64 colours -> Koala cells
@@ -150,8 +290,10 @@ def _viz_filter(viz, w, h, fps):
          "ahistogram":   f"ahistogram=s={w}x{h}:slide=scroll"}[viz]
     return f + f",fps={fps},format=rgb24"
 
-def frames(video, shape, fps, seconds, palette, dither="bayer", viz=None, viz_audio=None, loop=False):
-    """Koala files (10003 bytes each) for the video, one per picture. palette: 16 (r, g, b)."""
+def frames(video, shape, fps, seconds, palette, dither="bayer", viz=None, viz_audio=None, loop=False,
+           scroller=None):
+    """Koala files (10003 bytes each) for the video, one per picture. palette: 16 (r, g, b);
+    scroller: a Scroller drawn into each picture (on a strip of its own, the video makes room)."""
     c0, r0, cols, rows = SHAPES[shape][2]
     w, h = cols * 4, rows * 8                       # Koala pixels (two hires pixels wide)
     tmp = tempfile.mkdtemp(prefix="sidviz_kv_")
@@ -159,8 +301,11 @@ def frames(video, shape, fps, seconds, palette, dither="bayer", viz=None, viz_au
     _png(pal_png, 16, 16, b"".join(bytes(palette[i % 16]) for i in range(256)))
     dith = {"bayer": "bayer:bayer_scale=2", "none": "none", "diffusion": "floyd_steinberg"}[dither]
     cmd = ["ffmpeg", "-v", "error"] + (["-stream_loop", "-1"] if loop else []) + ["-i", video]
-    graph = (f"[0:v]fps={fps},scale={cols * 8}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,"
-             f"pad={cols * 8}:{h}:(ow-iw)/2:(oh-ih)/2,scale={w}:{h}:flags=area,format=rgb24[v]")
+    band = scroller.height if scroller and scroller.strip else 0
+    vh = h - band                                   # the video's own height (less a strip)
+    y = f"{band}+({vh}-ih)/2" if band and scroller.top else f"({vh}-ih)/2"
+    graph = (f"[0:v]fps={fps},scale={cols * 8}:{vh}:force_original_aspect_ratio=decrease:flags=lanczos,"
+             f"pad={cols * 8}:{h}:(ow-iw)/2:{y},scale={w}:{h}:flags=area,format=rgb24[v]")
     src, pin = "[v]", 1
     if viz:
         cmd += ["-i", viz_audio or video]
@@ -173,6 +318,7 @@ def frames(video, shape, fps, seconds, palette, dither="bayer", viz=None, viz_au
     lookup = {tuple(c): i for i, c in enumerate(palette)}
     dist = [[sum((a - b) ** 2 for a, b in zip(palette[i], palette[j])) for j in range(16)] for i in range(16)]
     fsize = w * h + 1024
+    i = 0
     try:
         while True:
             buf = p.stdout.read(fsize)
@@ -180,7 +326,12 @@ def frames(video, shape, fps, seconds, palette, dither="bayer", viz=None, viz_au
                 break
             pal = buf[w * h:]
             remap = bytes(lookup.get((pal[4 * i + 2], pal[4 * i + 1], pal[4 * i]), 0) for i in range(256))
-            yield _koala(buf[:w * h].translate(remap), w, c0, r0, cols, rows, dist)
+            q, must = buf[:w * h].translate(remap), None
+            if scroller and scroller.lines:
+                q = bytearray(q)
+                must = scroller.draw(q, w, h, i)
+            i += 1
+            yield _koala(bytes(q), w, c0, r0, cols, rows, dist, must)
     finally:
         p.stdout.close(); p.wait()
         try:
@@ -188,8 +339,9 @@ def frames(video, shape, fps, seconds, palette, dither="bayer", viz=None, viz_au
         except OSError:
             pass
 
-def _koala(q, w, c0, r0, cols, rows, dist):
-    """One frame of C64 colour indexes (w x rows*8) -> a Koala file, placed at the shape's cells."""
+def _koala(q, w, c0, r0, cols, rows, dist, must=None):
+    """One frame of C64 colour indexes (w x rows*8) -> a Koala file, placed at the shape's cells.
+    must: for some cells, colours they keep before the most used (a scroller's)."""
     counts = [q.count(c) for c in range(16)]
     bg = max(range(16), key=counts.__getitem__)
     kla = bytearray(10003)
@@ -200,7 +352,12 @@ def _koala(q, w, c0, r0, cols, rows, dist):
         for cx in range(cols):
             rws = [q[base + r * w + cx * 4: base + r * w + cx * 4 + 4] for r in range(8)]
             cell = b"".join(rws)
-            cnt = sorted(((cell.count(c), c) for c in set(cell) if c != bg), reverse=True)[:3]
+            cnt = sorted(((cell.count(c), c) for c in set(cell) if c != bg), reverse=True)
+            keep = must.get(cy * cols + cx) if must else None
+            if keep:
+                keep = [c for c in keep if c != bg][:3]
+                cnt = [(0, c) for c in keep] + [t for t in cnt if t[1] not in keep]
+            cnt = cnt[:3]
             choice = [(bg, 0)] + [(c, b) for (_, c), b in zip(cnt, (1, 2, 3))]
             m = [min(choice, key=lambda cb: dist[c][cb[0]])[1] for c in range(16)]
             o = 2 + ((r0 + cy) * 40 + c0 + cx) * 8
@@ -212,6 +369,31 @@ def _koala(q, w, c0, r0, cols, rows, dist):
             kla[8002 + si] = cs[0] << 4 | cs[1]
             kla[9002 + si] = cs[2]
     return bytes(kla)
+
+def reu_sound(data):
+    """A Koalavideo REU's sound back as 8-bit unsigned samples at RATE (128 = silence), and whether
+    it has an info screen (the player shows that first). For the C64U's lights; b"" when silent."""
+    lines = data[15] + 1 if len(data) > 16 else 0
+    snd, info = b"", False
+    for n in range(1, lines):
+        ln = data[16 * n:16 * n + 16]
+        a3 = lambda o: ln[o] << 16 | ln[o + 1] << 8 | ln[o + 2]
+        if ln.startswith(b"INFOSCR"):
+            info = bool(ln[7] & 0x80)
+        elif ln.startswith(b"AUDIO"):
+            raw = data[a3(10):a3(10) + a3(13)]
+            kind = (ln[7] - 32) // 4
+            if kind == 3:
+                snd = bytes(v ^ 0x80 for v in range(256))
+                snd = raw.translate(snd)
+            else:
+                tab = MAHONEY["6581" if kind == 1 else "8580"]
+                back = {}
+                for i, v in enumerate(tab):
+                    back.setdefault(v, []).append(i)
+                inv = bytes(sum(back[v]) // len(back[v]) if v in back else 128 for v in range(256))
+                snd = raw.translate(inv)
+    return snd, info
 
 def sound(path, seconds):
     """8-bit unsigned mono samples at RATE (128 = silence), levelled so quiet parts still carry."""

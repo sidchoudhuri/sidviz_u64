@@ -4,7 +4,7 @@ sidviz_u64.py -- SID/audio waveform + live camera visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 Camera mode: streams webcam footage as PETSCII character art on the C64 screen.
 
-version 2.0.0 (2026-11-18)
+version 2.0.1 (2026-11-18)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -33,7 +33,7 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 BUILD   = "2026-11-18"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
@@ -811,6 +811,37 @@ def _reu_check(addr, expect):
         return False
     return u64_get(f"machine:readmem?address={REU_BUFFER:X}&length={len(expect)}") == bytes(expect)
 
+def _u64_json(path):
+    r = u64_get(path)
+    try:
+        return json.loads(r) if r else {}
+    except ValueError:
+        return {}
+
+def reu_settings():
+    """Turn the Ultimate's REU on at 16 MB, for now (not saved to flash: the Ultimate's own
+    setup comes back after a power cycle). The items are found by name in the C64 and cartridge
+    settings. Returns (the REU items found, the changes made)."""
+    cat = "C64 and Cartridge Settings"
+    q = lambda t: urllib.parse.quote(t, safe="")
+    items = _u64_json(f"configs/{q(cat)}").get(cat, {})
+    reu = {k: v for k, v in items.items() if re.search(r"\breu\b|ram expansion", k, re.I)}
+    on = next((k for k in reu if not re.search(r"size|preload|image|offset|base|file", k, re.I)), None)
+    size = next((k for k in reu if re.search(r"size", k, re.I)), None)
+    changed = []
+    if on and str(reu[on]).strip().lower() not in ("enabled", "on", "yes"):
+        if u64_put(f"configs/{q(cat)}/{q(on)}", {"value": "Enabled"}) == 200:
+            changed.append(f"{on}: Enabled")
+    if size and not str(reu[size]).strip().startswith("16"):
+        info = _u64_json(f"configs/{q(cat)}/{q(size)}").get(cat, {}).get(size, {})
+        vals = info.get("values") or info.get("presets") or [] if isinstance(info, dict) else []
+        value = next((str(v) for v in vals if str(v).strip().startswith("16")), "16 MB")
+        if u64_put(f"configs/{q(cat)}/{q(size)}", {"value": value}) == 200:
+            changed.append(f"{size}: {value}")
+    if not reu:
+        print(f"[!] No REU settings found in the Ultimate's {cat}: {', '.join(items) or 'nothing read'}")
+    return reu, changed
+
 def send_reu(path):
     """Put a Koalavideo .reu into the Ultimate's REU and start the player (no reset in between)."""
     player = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), KV_PLAYER)
@@ -821,6 +852,10 @@ def send_reu(path):
         print(f"[!] {path} is not a Koalavideo REU"); return False
     if not smoke_test():
         return False
+    reu, changed = reu_settings()
+    if changed:
+        print(f"[*] Turned on the Ultimate's REU for now ({'; '.join(changed)}); its saved settings are unchanged")
+        emit("note", message="Turned on the Ultimate's REU at 16 MB for now")
     print("[*] Rebooting C64...")
     u64_put("machine:reboot")
     time.sleep(4.0)
@@ -844,8 +879,10 @@ def send_reu(path):
         if not _reu_wait():
             print("\n[!] The REU loader stopped answering"); return False
         if i == 0 and not _reu_check(0, data[:16]):
-            print("\n[!] No REU answered. Turn on the REU at 16 MB in the Ultimate's C64 and cartridge")
-            print("    settings (and Ultimate Audio, for an Ultimate Audio video), then try again.")
+            print("\n[!] No REU answered, even after turning it on: " + (
+                f"the REU settings read {reu}" if reu else "no REU settings were found") + ".")
+            print("    Check the REU in the Ultimate's C64 and cartridge settings (a cartridge that")
+            print("    can't share the bus with an REU stops it), then try again.")
             return False
         done = a + n
         rate = done / max(0.001, time.time() - t0) / 1024

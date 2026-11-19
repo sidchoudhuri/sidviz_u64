@@ -4,7 +4,7 @@ Real-time waveform visualizer for the Commodore 64, driven by a Mac or Linux mac
 
 ```
 +------------------------------------------------------+
-|  sidviz_u64  v2.0.0  build 2026-11-18                |
+|  sidviz_u64  v2.0.1  build 2026-11-18                |
 +------------------------------------------------------+
 |  File: Commando.sid                                  |
 |  Title        Commando                               |
@@ -368,8 +368,8 @@ blended audio visualizer, and takes `--replace-audio` (a .sid or audio file; the
 until it ends). A 16 MB REU holds about 2 min 20 s at 16:9 and 12.5 fps with sound.
 
 `--play-reu` sends it to the Ultimate and starts the player (after `--save-reu`, or with a .reu
-file). The REU must be on at 16 MB in the Ultimate's C64 and cartridge settings (and Ultimate
-Audio, for an Ultimate Audio video). sidviz starts a small loader (`reuload.asm`), copies the
+file). It turns the Ultimate's REU on at 16 MB itself, for that session only (its saved
+settings are unchanged). Ultimate Audio videos also need Ultimate Audio on. sidviz starts a small loader (`reuload.asm`), copies the
 video into the REU through the REST API, then starts the player.
 
 ```bash

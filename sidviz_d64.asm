@@ -1,7 +1,7 @@
 ; sidviz_d64.asm — standalone D64 player
 ; 64tass assembler  —  autostart: SYS 2064
 ;
-; v2.0.3 (2026-11-19)
+; v2.0.4 (2026-11-19)
 ;
 ; PRG layout (Python assembles final file by appending after $09D0):
 ;   $0801-$080C  BASIC stub (SYS 2064)

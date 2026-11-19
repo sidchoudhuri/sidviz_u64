@@ -4,7 +4,7 @@ sidviz_u64.py -- SID/audio waveform + live camera visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 Camera mode: streams webcam footage as PETSCII character art on the C64 screen.
 
-version 2.0.3 (2026-11-19)
+version 2.0.4 (2026-11-19)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -33,7 +33,7 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "2.0.3"
+VERSION = "2.0.4"
 BUILD   = "2026-11-19"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
@@ -820,8 +820,12 @@ def _reu_wait():
 
 def _reu_check(addr, expect):
     """Read REU bytes back through the loader and compare (no REU, or a smaller one, fails)."""
-    write_mem(REU_BUFFER, [0] * len(expect))
-    write_mem(REU_MBOX, [2, addr & 255, addr >> 8 & 255, addr >> 16 & 255, len(expect), 0])
+    if len(expect) > 64 and u64_post_mem(REU_BUFFER, bytes(len(expect))):
+        pass
+    else:
+        write_mem(REU_BUFFER, [0] * len(expect))
+    n = len(expect)
+    write_mem(REU_MBOX, [2, addr & 255, addr >> 8 & 255, addr >> 16 & 255, n & 255, n >> 8 & 255])
     if not _reu_wait():
         return False
     return u64_get(f"machine:readmem?address={REU_BUFFER:X}&length={len(expect)}") == bytes(expect)
@@ -965,8 +969,9 @@ def reu_lights(path, start, before=None):
 
 REU_FOLDER = "/SD/viz"       # where a .reu goes on the Ultimate (FTP), for it to load into the REU itself
 
-def ftp_put(data, folder, name):
-    """Upload data to the Ultimate by FTP as folder/name, making the folder if it isn't there."""
+def ftp_put(data, folder, name, clean=None):
+    """Upload data to the Ultimate by FTP as folder/name, making the folder if it isn't there;
+    clean: a pattern for older files in the folder to delete first."""
     import ftplib, io
     ip = U64.replace("http://", "")
     try:
@@ -980,6 +985,17 @@ def ftp_put(data, folder, name):
                 ftp.cwd(part)
             except ftplib.error_perm:
                 ftp.mkd(part); ftp.cwd(part)
+        if clean:
+            try:
+                old = [f.rsplit("/", 1)[-1] for f in ftp.nlst()]
+            except ftplib.error_perm:
+                old = []
+            for f in old:
+                if re.fullmatch(clean, f):
+                    try:
+                        ftp.delete(f)
+                    except ftplib.error_perm:
+                        pass
         sent, t0, last = [0], time.time(), [0.0]
         def step(block):
             sent[0] += len(block)
@@ -1001,7 +1017,8 @@ def reu_preload(data):
     """Upload the .reu to REU_FOLDER and point the Ultimate's REU preload at it, so it loads it into
     the REU itself at the next reset (much faster than through the C64). For now only: returns
     the settings to put back, or None when it can't."""
-    cat, name = "C64 and Cartridge Settings", "viz.reu"
+    # a new name each time (the older ones are deleted), so the Ultimate can't use one it had before
+    cat, name = "C64 and Cartridge Settings", f"viz-{time.strftime('%Y%m%d-%H%M%S')}.reu"
     items = _cfg(cat)
     on = next((k for k in items if re.fullmatch(r"reu\s*preload", k, re.I)), None)
     image = next((k for k in items if re.search(r"preload\s*image", k, re.I)), None)
@@ -1009,7 +1026,7 @@ def reu_preload(data):
     if not on or not image:
         print("[*] This Ultimate has no REU preload setting: sending the video the slow way")
         return None
-    if not ftp_put(data, REU_FOLDER, name):
+    if not ftp_put(data, REU_FOLDER, name, clean=r"viz(-[0-9-]+)?\.reu"):
         return None
     saved = []
     for item, value in ((image, f"{REU_FOLDER.rstrip('/')}/{name}"), (on, "Enabled"),
@@ -1070,10 +1087,12 @@ def send_reu(path, lights=False):
     last = (len(data) - 1) // REU_BLOCK * REU_BLOCK
     loaded = False
     if preload is not None:
-        mid = len(data) // 2 // 256 * 256
+        # 32 KB from the start, the middle and the end, compared byte for byte: whole pictures, so
+        # an older video in the REU (the same one with another scroller, say) can't pass
+        spots = sorted({0, len(data) // 2 // 256 * 256, last})
         give_up = time.time() + 20                # a big file can still be loading
         while True:
-            loaded = all(_reu_check(o, data[o:o + 16]) for o in (0, mid, last))
+            loaded = all(_reu_check(o, data[o:o + REU_BLOCK]) for o in spots)
             if loaded or time.time() > give_up:
                 break
             time.sleep(1.0)

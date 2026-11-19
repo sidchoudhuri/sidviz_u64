@@ -4,7 +4,7 @@ Real-time waveform visualizer for the Commodore 64, driven by a Mac or Linux mac
 
 ```
 +------------------------------------------------------+
-|  sidviz_u64  v2.0.3  build 2026-11-19                |
+|  sidviz_u64  v2.0.4  build 2026-11-19                |
 +------------------------------------------------------+
 |  File: Commando.sid                                  |
 |  Title        Commando                               |
@@ -370,9 +370,10 @@ until it ends). A 16 MB REU holds about 2 min 20 s at 16:9 and 12.5 fps with sou
 `--play-reu` sends it to the Ultimate and starts the player (after `--save-reu`, or with a .reu
 file). It turns the Ultimate's REU on at 16 MB itself, for that session only (its saved
 settings are unchanged). Ultimate Audio videos also need Ultimate Audio on. sidviz uploads the
-.reu by FTP to `/SD/viz/viz.reu` (`--reu-folder` for another place; the folder is made if it isn't
-there) and points the Ultimate's REU preload at it, so the Ultimate loads it into the REU itself
-when the C64 resets; then it puts the preload settings back. A small loader (`reuload.asm`)
+.reu by FTP to `/SD/viz/` under a new name each time, deleting the ones it put there before
+(`--reu-folder` for another place; the folder is made if it isn't there) and points the Ultimate's REU preload at it, so the Ultimate loads it into the REU itself
+when the C64 resets; then it puts the preload settings back and compares the start, middle and end
+of the REU with the video (an older video still in the REU is sent again the slow way). A small loader (`reuload.asm`)
 checks the REU and starts the player. For the video, sidviz also takes out a cartridge (it would
 stop the REU) and maps Ultimate Audio for an Ultimate Audio video, for that session only.
 Without the preload setting, the loader copies the video

@@ -1421,7 +1421,7 @@ def emit(event, **kw):
 
 def question_key(prompt):
     """A question's key: its wording up to the "?" (or "[" / ":"), lower case."""
-    return re.sub(r"\s+", " ", re.split(r"[?\[:]", prompt, 1)[0]).strip().lower()
+    return re.sub(r"\s+", " ", re.split(r"[?\[:]", prompt, maxsplit=1)[0]).strip().lower()
 
 def _engine_input(prompt=""):
     key = question_key(prompt)

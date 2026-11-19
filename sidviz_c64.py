@@ -4,7 +4,7 @@ sidviz_u64.py -- SID/audio waveform + live camera visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 Camera mode: streams webcam footage as PETSCII character art on the C64 screen.
 
-version 1.9.9 (2026-11-18)
+version 2.0.0 (2026-11-18)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -33,11 +33,15 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.9.9"
+VERSION = "2.0.0"
 BUILD   = "2026-11-18"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
-import argparse, threading, termios, tty, re, json, select as _select, struct, queue
+import argparse, threading, re, json, select as _select, struct, queue
+try:
+    import termios, tty
+except ImportError:              # Windows: no terminal raw mode (engine mode doesn't need it)
+    termios = tty = None
 
 # Populated in main() from --cookies-from-browser / --cookies CLI flags;
 # injected into every yt-dlp subprocess call.
@@ -287,6 +291,8 @@ def parse_args():
     p.add_argument("--bkgd-palette",   type=str.lower, choices=["palette", "colodore", "pepto", "deekay"], help="Background: which C64 palette to match")
     p.add_argument("--bkgd-wavecolor", choices=["mode", "picture"], help="Visualizer colours over the picture: the colour mode, or the picture's colours")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
+    p.add_argument("--engine",   action="store_true",    help=argparse.SUPPRESS)   # run by Viz
+    p.add_argument("--answers",  default=None,           help=argparse.SUPPRESS)   # Viz's answers (JSON)
     p.add_argument("--save-reu",     metavar="FILE.reu",
                    help="Save a video (file or link) as a Koalavideo REU: real C64 pictures with sampled sound")
     p.add_argument("--play-reu",     action="store_true",
@@ -651,6 +657,7 @@ def build_ticker_string(info, mode):
     return ticker
 
 def show_info_header(info, mode, filepath):
+    emit("info", mode=mode, file=filepath, **{k: v for k, v in info.items() if isinstance(v, (str, int, float))})
     width = 54
     print("+" + "-" * width + "+")
     print(f"|  sidviz_u64  v{VERSION}  build {BUILD}".ljust(width + 1) + "|")
@@ -843,6 +850,7 @@ def send_reu(path):
         done = a + n
         rate = done / max(0.001, time.time() - t0) / 1024
         print(f"\r[*] Sending to the REU: {done // 1024} / {len(data) // 1024} KB  ({rate:.0f} KB/s)", end="", flush=True)
+        emit("reu-send", done=done, total=len(data))
     last = (len(data) - 1) // REU_BLOCK * REU_BLOCK
     if not _reu_check(last, data[last:last + 16]):
         print("\n[!] The end of the video didn't stick: is the REU set to 16 MB?"); return False
@@ -949,6 +957,7 @@ def save_reu(args):
             klas.append(k)
             if len(klas) % 25 == 0 or len(klas) == n:
                 print(f"\r[*] Pictures: {len(klas)} / {n}", end="", flush=True)
+                emit("reu-make", done=len(klas), total=n)
             if len(klas) >= n:
                 break
         print(f"   ({time.time() - t0:.0f} s)")
@@ -1323,7 +1332,7 @@ _led_lock = threading.Lock()
 def _leds_cmd(cmd):
     """Add the band-audio output to a visualizer ffmpeg command (when the LEDs are on)."""
     global LED_FDS
-    if not LEDS:
+    if not LEDS or os.name == "nt":
         return cmd
     i = cmd.index("-filter_complex")
     viz = cmd[i + 1].replace("[0:a]", "[vz]", 1) + "[v]"
@@ -1391,7 +1400,88 @@ def leds_tick(lv):
 # Keypress toggle
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Engine mode (--engine): sidviz run by Viz. Questions are answered from Viz's JSON list
+# (--answers, keyed by each question's wording up to its "?"; missing ones take the default);
+# keys come in as lines on stdin; status goes out as "@viz {json}" lines.
+# ---------------------------------------------------------------------------
+
+ENGINE = False
+ENGINE_ANSWERS = {}
+_emit_lock = threading.Lock()
+_frame_emit = [0.0]
+
+def emit(event, **kw):
+    """A status line for Viz (engine mode only)."""
+    if not ENGINE:
+        return
+    with _emit_lock:
+        sys.stdout.write("\n@viz " + json.dumps({"event": event, **kw}, default=str) + "\n")
+        sys.stdout.flush()
+
+def question_key(prompt):
+    """A question's key: its wording up to the "?" (or "[" / ":"), lower case."""
+    return re.sub(r"\s+", " ", re.split(r"[?\[:]", prompt, 1)[0]).strip().lower()
+
+def _engine_input(prompt=""):
+    key = question_key(prompt)
+    ans = ENGINE_ANSWERS.get(key)
+    emit("question", key=key, prompt=prompt.strip(), answer=ans, default=ans is None)
+    return "" if ans is None else str(ans)
+
+def show_frame(n, text):
+    """The frame status line, and once a second the same for Viz."""
+    print("\r" + text, end="", flush=True)
+    now = time.time()
+    if ENGINE and now - _frame_emit[0] >= 1.0:
+        _frame_emit[0] = now
+        emit("frame", n=n, status=text.replace("[*] ", "", 1))
+
+def handle_key(ch, state):
+    """One key (or Viz command): False when it's quit."""
+    if ch in ("c", "C"):
+        state["cam_color"]     = (state["cam_color"] + 1) % 3
+        state["color_pending"] = True
+        label = ["rainbow", "white", "fire"][state["cam_color"]]
+        sys.stdout.write(f"\r\n[*] Camera color -> {label}\r\n")
+    elif ch in ("v", "V"):
+        state["viz_color"]     = (state["viz_color"] + 1) % 3
+        label = ["rainbow", "white", "fire"][state["viz_color"]]
+        sys.stdout.write(f"\r\n[*] Viz color -> {label}\r\n")
+    elif ch in ("w", "W"):
+        cur = VIZ_MODE
+        idx = VIZ_ORDER.index(cur) if cur in VIZ_ORDER else 0
+        new_mode = VIZ_ORDER[(idx + 1) % len(VIZ_ORDER)]
+        state["viz_pending"] = new_mode
+        sys.stdout.write(f"\r\n[*] Viz -> {VIZ_LABELS.get(new_mode, new_mode)}\r\n")
+    elif ch == "0":
+        state["viz_pending"] = "none"
+        sys.stdout.write(f"\r\n[*] Viz -> off\r\n")
+    elif ch in ("1", "2", "3", "4", "5"):
+        new_mode = VIZ_ORDER[int(ch)]  # VIZ_ORDER[0]="none", so 1→showwaves, etc.
+        state["viz_pending"] = new_mode
+        sys.stdout.write(f"\r\n[*] Viz -> {VIZ_LABELS.get(new_mode, new_mode)}\r\n")
+    elif ch in ("q", "Q", "\x03"):
+        state["quit"] = True
+        return False
+    sys.stdout.flush()
+    emit("state", cam_color=state.get("cam_color"), viz_color=state.get("viz_color"),
+         viz=state.get("viz_pending") or VIZ_MODE)
+    return True
+
 def make_keypress_listener(state):
+    def _commands():
+        # engine mode: a line from Viz is a key ("c", "w", "3", "q" ...); Viz gone = quit
+        for line in sys.stdin:
+            cmd = line.strip()
+            if cmd and not handle_key(cmd[0], state):
+                break
+            if state["quit"]:
+                break
+        state["quit"] = True
+    if ENGINE or termios is None:
+        return threading.Thread(target=_commands, daemon=True)
+
     def _listen():
         fd  = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
@@ -1401,36 +1491,7 @@ def make_keypress_listener(state):
             tty.setraw(fd)
             while not state["quit"]:
                 ch = sys.stdin.read(1)
-                if not ch: break
-                if ch in ("c", "C"):
-                    state["cam_color"]     = (state["cam_color"] + 1) % 3
-                    state["color_pending"] = True
-                    label = ["rainbow", "white", "fire"][state["cam_color"]]
-                    sys.stdout.write(f"\r\n[*] Camera color -> {label}\r\n")
-                    sys.stdout.flush()
-                elif ch in ("v", "V"):
-                    state["viz_color"]     = (state["viz_color"] + 1) % 3
-                    label = ["rainbow", "white", "fire"][state["viz_color"]]
-                    sys.stdout.write(f"\r\n[*] Viz color -> {label}\r\n")
-                    sys.stdout.flush()
-                elif ch in ("w", "W"):
-                    cur = VIZ_MODE
-                    idx = VIZ_ORDER.index(cur) if cur in VIZ_ORDER else 0
-                    new_mode = VIZ_ORDER[(idx + 1) % len(VIZ_ORDER)]
-                    state["viz_pending"] = new_mode
-                    sys.stdout.write(f"\r\n[*] Viz -> {VIZ_LABELS.get(new_mode, new_mode)}\r\n")
-                    sys.stdout.flush()
-                elif ch == "0":
-                    state["viz_pending"] = "none"
-                    sys.stdout.write(f"\r\n[*] Viz -> off\r\n")
-                    sys.stdout.flush()
-                elif ch in ("1", "2", "3", "4", "5"):
-                    new_mode = VIZ_ORDER[int(ch)]  # VIZ_ORDER[0]="none", so 1→showwaves, etc.
-                    state["viz_pending"] = new_mode
-                    sys.stdout.write(f"\r\n[*] Viz -> {VIZ_LABELS.get(new_mode, new_mode)}\r\n")
-                    sys.stdout.flush()
-                elif ch in ("q", "Q", "\x03"):
-                    state["quit"] = True
+                if not ch or not handle_key(ch, state):
                     break
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -2536,7 +2597,7 @@ def bkgd_top(bk, top_screen, mode_col):
     return bytes(chars), bytes(cols)
 
 def main():
-    global U64, FPS, VIZ_MODE, VIZ_W, LEDS, _YTDLP_COOKIE_ARGS  # noqa: PLW0603
+    global U64, FPS, VIZ_MODE, VIZ_W, LEDS, _YTDLP_COOKIE_ARGS, ENGINE, ENGINE_ANSWERS  # noqa: PLW0603
 
     def _kill_proc(p):
         if p is None:
@@ -2559,6 +2620,16 @@ def main():
         _YTDLP_COOKIE_ARGS = ["--cookies-from-browser", args.cookies_from_browser]
     elif args.cookies:
         _YTDLP_COOKIE_ARGS = ["--cookies", args.cookies]
+
+    if args.engine:
+        import builtins
+        ENGINE = True
+        try:
+            ENGINE_ANSWERS = {question_key(k): v for k, v in json.loads(args.answers or "{}").items()}
+        except ValueError as e:
+            emit("error", message=f"--answers is not valid JSON: {e}"); sys.exit(2)
+        builtins.input = _engine_input
+        emit("hello", version=VERSION, build=BUILD)
 
     if args.version:
         print(f"sidviz_u64  v{VERSION}  build {BUILD}")
@@ -3330,7 +3401,7 @@ def main():
                 vfc = viz_frame_count[0] if viz_ffmpeg_proc else -1
                 vsuf = f" viz={vfc:05d}" if vfc >= 0 else ""
                 tsuf = f" top={len(top_raw)}" if cam_ext_rows else ""
-                print(f"\r[*] Frame {frame_num:05d} [{ind}]{vsuf}{tsuf}", end="", flush=True)
+                show_frame(frame_num, f"[*] Frame {frame_num:05d} [{ind}]{vsuf}{tsuf}")
 
         except KeyboardInterrupt:
             print("\r\n[*] Interrupted.")
@@ -4025,7 +4096,7 @@ def main():
                     ind = ["R","W","F"][state["cam_color"]]
                 vfc  = viz_frame_count[0] if viz_ffmpeg_proc else -1
                 vsuf = f" viz={vfc:05d}" if vfc >= 0 else ""
-                print(f"\r[*] Frame {frame_num:05d} [{ind}]{vsuf}", end="", flush=True)
+                show_frame(frame_num, f"[*] Frame {frame_num:05d} [{ind}]{vsuf}")
 
         except KeyboardInterrupt:
             print("\r\n[*] Interrupted.")
@@ -4500,7 +4571,7 @@ def main():
                 write_byte(FRAME_FLAG, 1)
                 frame_num += 1
                 ind = ["R","W","F"][state["cam_color"]]
-                print(f"\r[*] Frame {frame_num:05d} [{ind}]{fsuf}", end="", flush=True)
+                show_frame(frame_num, f"[*] Frame {frame_num:05d} [{ind}]{fsuf}")
                 continue
 
             top_raw = raw[:_EXT_ROWS * WIDTH]
@@ -4538,7 +4609,7 @@ def main():
             frame_num += 1
             ind  = ["R","W","F"][state["cam_color"]]
             vind = VIZ_LABELS.get(VIZ_MODE, VIZ_MODE)[:3].upper()
-            print(f"\r[*] Frame {frame_num:05d} [{ind}|{vind}]{fsuf}", end="", flush=True)
+            show_frame(frame_num, f"[*] Frame {frame_num:05d} [{ind}|{vind}]{fsuf}")
 
     except KeyboardInterrupt:
         print("\r\n[*] Interrupted.")
@@ -4589,4 +4660,13 @@ def main():
         print("[*] Done.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        emit("exit", code=0)
+    except SystemExit as e:
+        emit("exit", code=e.code if isinstance(e.code, int) else (0 if e.code is None else 1))
+        raise
+    except BaseException as e:
+        emit("error", message=f"{type(e).__name__}: {e}")
+        emit("exit", code=1)
+        raise

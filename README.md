@@ -4,7 +4,7 @@ Real-time waveform visualizer for the Commodore 64, driven by a Mac or Linux mac
 
 ```
 +------------------------------------------------------+
-|  sidviz_u64  v1.9.9  build 2026-11-18                |
+|  sidviz_u64  v2.0.0  build 2026-11-18                |
 +------------------------------------------------------+
 |  File: Commando.sid                                  |
 |  Title        Commando                               |
@@ -382,6 +382,24 @@ python3 sidviz_c64.py clip.reu --play-reu
 tables are from his BREADAMP REUmaker. `koalavideo.prg` is his program, included unchanged and
 not covered by this repository's GPL; `koalavideo.py` writes the REU as his Koalavideo v06
 REUmaker does.
+
+---
+
+## Engine mode (for Viz)
+
+`--engine` runs sidviz under Viz, the desktop app, with no terminal:
+
+- **Questions** are answered from `--answers`, a JSON object keyed by each question's wording up
+  to its `?`, in any case (for example `{"visualization": "2", "flash the c64u's leds with the
+  music": "y"}`). A question it doesn't answer takes its default.
+- **Keys** come in on stdin, one per line: `c`, `v`, `w`, `0`-`5`, `q`. When stdin closes,
+  sidviz stops.
+- **Status** goes out as lines starting `@viz ` followed by JSON: `hello` (version), `question`
+  (each question, its answer, and whether it took the default), `info` (the track), `frame`
+  (once a second), `state` (after a key), `reu-make` / `reu-send` (progress), `error` and
+  `exit` (the exit code).
+
+Everything else prints as usual, so the same run reads the same in a terminal.
 
 ---
 

@@ -4,13 +4,18 @@ sidviz_u64.py -- SID/audio waveform + live camera visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 Camera mode: streams webcam footage as PETSCII character art on the C64 screen.
 
-version 1.7.8 (2026-04-25)
+version 2.0.0 (2026-11-18)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
   $C001     = color flag  (2=rainbow, 1=white density, 3=fire density)
   $C002     = sid_ready   (Python sets 1 after uploading SID code)
   $C003     = quit_flag   (Python writes 1 to stop SID and return C64 to BASIC)
+  $C004     = bg_flag     (Python writes 1 once a background picture is uploaded)
+  $C005     = bg_wcol     (0=visualizer keeps the colour mode, 1=takes the picture's colour)
+  $C700     = background picture, 680 screen codes (rows 8-24)
+  $CA00     = background picture, 680 colours      (rows 8-24)
+  $C007-$C020 = bitmap background settings; $8000-$BFFF + $E000 = bitmap background (see sidviz.asm)
   $C620/$C621 = SID play vector saved post-init (play_addr=0 SIDs)
   $C100     = frame buffer, 680 bytes PETSCII (rows 8-24, $C100-$C3A7)
   $C3A8     = white density color table, 128 bytes (screen_code → C64 color)
@@ -28,11 +33,15 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.8.0"
-BUILD   = "2026-05-11"
+VERSION = "2.0.0"
+BUILD   = "2026-11-18"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
-import argparse, threading, termios, tty, re, json, select as _select, struct
+import argparse, threading, re, json, select as _select, struct, queue
+try:
+    import termios, tty
+except ImportError:              # Windows: no terminal raw mode (engine mode doesn't need it)
+    termios = tty = None
 
 # Populated in main() from --cookies-from-browser / --cookies CLI flags;
 # injected into every yt-dlp subprocess call.
@@ -41,20 +50,119 @@ _YTDLP_COOKIE_ARGS: list = []
 FIFO_PATH    = "/tmp/sidpipe.wav"
 WIDTH        = 40
 HEIGHT       = 17              # rows 8-24 — protects SID driver at $0400-$04FF
+VIDEO_EXTS   = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".ts", ".wmv", ".3gp"}
 FRAME_BUF    = 0xC100
 FRAME_FLAG   = 0xC000
 COLOR_FLAG   = 0xC001
+WAVE_COL_ADDR = 0xD940   # color RAM rows 8-24 ($D940-$DBE7)
 C64_AUDIO_FLAG = 0xC002  # 0=off, 1=waiting, 2=SID ready
 QUIT_FLAG      = 0xC003  # Python writes 1 → C64 silences SID and JMPs to BASIC
 TICKER_BUF   = 0xC500
 TICKER_LEN   = 0xC5FE
 TICKER_ROW   = 0x0428          # screen RAM row 1
-PRG_LOCAL    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidviz.prg")
+PRG_LOCAL    = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "sidviz.prg")
 PRG_REMOTE   = "sidviz.prg"
 TIMEOUT      = 5.0
 # C64 colors: 0=black 1=white 2=red 7=yellow 8=orange 9=brown 10=ltred 11=dkgray 12=mdgray 15=ltgray
 WHITE_CTABLE_ADDR = 0xC3A8   # 128-byte table written by Python: screen_code → C64 color
 FIRE_CTABLE_ADDR  = 0xC428   # 128-byte table written by Python: screen_code → C64 color
+PETSCII_BLOCK   = 16   # output pixels per char cell in saved PETSCII video (640×400 for 40×25)
+_REC_BLOCK      = 8    # render at native C64 resolution (320×200); ffmpeg scales up
+C64_PALETTE_RGB = [    # standard C64 VICE palette (R, G, B)
+    (  0,  0,  0), (255,255,255), (136,  0,  0), (170,255,238),
+    (204, 68,204), (  0,204, 85), (  0,  0,170), (238,238,119),
+    (221,136, 85), (102, 68,  0), (255,119,119), ( 51, 51, 51),
+    (119,119,119), (170,255,102), (  0,136,255), (187,187,187),
+]
+SCROLL_RATE = 6   # IRQ ticks per ticker scroll step (matches sidviz.asm)
+RAINBOW_TAB = [2,2,8,8,7,7,7,7,5,5,5,5,13,13,14,14,
+               6,6,6,6,4,4,4,4,10,10,2,2,8,8,7,7,
+               5,5,13,13,14,14,6,6]
+
+# ---------------------------------------------------------------------------
+# C64 character ROM — load from VICE install if present, else use fallback.
+# Each char is 8 bytes: MSB = leftmost pixel, rows top→bottom.
+# ---------------------------------------------------------------------------
+
+def _load_c64_chargen():
+    for p in [
+        os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "chargen"),
+        os.path.expanduser("~/Library/Application Support/VICE/C64/chargen"),
+        "/opt/homebrew/share/vice/C64/chargen",
+        "/usr/local/share/vice/C64/chargen",
+        "/usr/share/vice/C64/chargen",
+        "/usr/lib/vice/C64/chargen",
+    ]:
+        try:
+            d = open(p, "rb").read()
+            if len(d) >= 2048:
+                print(f"[*] C64 chargen ROM loaded: {p}")
+                return d[:2048]
+        except OSError:
+            pass
+    return None
+
+_C64_CHARGEN = _load_c64_chargen()
+
+# Hardcoded 8×8 bitmaps for chars used by sidviz (CHARS_CAMERA + ticker A-Z/0-9).
+# Used when VICE chargen ROM is not installed.
+_C64_CHAR_FALLBACK: dict = {
+    32: b'\x00\x00\x00\x00\x00\x00\x00\x00',  # space
+    33: b'\x18\x18\x18\x18\x18\x00\x18\x00',  # !
+    34: b'\x66\x66\x22\x00\x00\x00\x00\x00',  # "
+    35: b'\x66\x66\xff\x66\xff\x66\x66\x00',  # #
+    37: b'\x62\x66\x0c\x18\x30\x66\x46\x00',  # %
+    42: b'\x00\x66\x3c\xff\x3c\x66\x00\x00',  # *
+    43: b'\x00\x18\x18\x7e\x18\x18\x00\x00',  # +
+    44: b'\x00\x00\x00\x00\x00\x18\x18\x30',  # ,
+    45: b'\x00\x00\x00\x7e\x00\x00\x00\x00',  # -
+    46: b'\x00\x00\x00\x00\x00\x00\x18\x00',  # .
+    47: b'\x02\x06\x0c\x18\x30\x60\x40\x00',  # /
+    58: b'\x00\x18\x18\x00\x18\x18\x00\x00',  # :
+    61: b'\x00\x00\x7e\x00\x7e\x00\x00\x00',  # =
+    63: b'\x3c\x66\x06\x1c\x18\x00\x18\x00',  # ?
+    64: b'\xff\xff\xff\xff\xff\xff\xff\xff',   # screen code 64 (dense graphic block)
+   102: b'\xcc\xcc\x33\x33\xcc\xcc\x33\x33',  # screen code 102 (2×2 checker ▒)
+    # A-Z (screen codes 1-26)
+     1: b'\x3c\x66\x66\x7e\x66\x66\x66\x00',  # A
+     2: b'\x7c\x66\x66\x7c\x66\x66\x7c\x00',  # B
+     3: b'\x3c\x66\x60\x60\x60\x66\x3c\x00',  # C
+     4: b'\x78\x6c\x66\x66\x66\x6c\x78\x00',  # D
+     5: b'\x7e\x60\x60\x7c\x60\x60\x7e\x00',  # E
+     6: b'\x7e\x60\x60\x7c\x60\x60\x60\x00',  # F
+     7: b'\x3c\x66\x60\x6e\x66\x66\x3c\x00',  # G
+     8: b'\x66\x66\x66\x7e\x66\x66\x66\x00',  # H
+     9: b'\x3c\x18\x18\x18\x18\x18\x3c\x00',  # I
+    10: b'\x1e\x0c\x0c\x0c\x0c\x6c\x38\x00',  # J
+    11: b'\x66\x6c\x78\x70\x78\x6c\x66\x00',  # K
+    12: b'\x60\x60\x60\x60\x60\x60\x7e\x00',  # L
+    13: b'\x63\x77\x7f\x6b\x63\x63\x63\x00',  # M
+    14: b'\x66\x76\x7e\x6e\x66\x66\x66\x00',  # N
+    15: b'\x3c\x66\x66\x66\x66\x66\x3c\x00',  # O
+    16: b'\x7c\x66\x66\x7c\x60\x60\x60\x00',  # P
+    17: b'\x3c\x66\x66\x66\x6e\x3c\x0e\x00',  # Q
+    18: b'\x7c\x66\x66\x7c\x6c\x66\x66\x00',  # R
+    19: b'\x3c\x66\x60\x3c\x06\x66\x3c\x00',  # S
+    20: b'\x7e\x18\x18\x18\x18\x18\x18\x00',  # T
+    21: b'\x66\x66\x66\x66\x66\x66\x3c\x00',  # U
+    22: b'\x66\x66\x66\x66\x66\x3c\x18\x00',  # V
+    23: b'\x63\x63\x63\x6b\x7f\x77\x63\x00',  # W
+    24: b'\x66\x66\x3c\x18\x3c\x66\x66\x00',  # X
+    25: b'\x66\x66\x66\x3c\x18\x18\x18\x00',  # Y
+    26: b'\x7e\x06\x0c\x18\x30\x60\x7e\x00',  # Z
+    # 0-9 (screen codes 48-57)
+    48: b'\x3c\x66\x6e\x76\x66\x66\x3c\x00',  # 0
+    49: b'\x18\x38\x18\x18\x18\x18\x3c\x00',  # 1
+    50: b'\x3c\x66\x06\x0c\x18\x30\x7e\x00',  # 2
+    51: b'\x3c\x66\x06\x1c\x06\x66\x3c\x00',  # 3
+    52: b'\x0c\x1c\x3c\x6c\x7e\x0c\x0c\x00',  # 4
+    53: b'\x7e\x60\x7c\x06\x06\x66\x3c\x00',  # 5
+    54: b'\x3c\x60\x60\x7c\x66\x66\x3c\x00',  # 6
+    55: b'\x7e\x06\x0c\x18\x18\x18\x18\x00',  # 7
+    56: b'\x3c\x66\x66\x3c\x66\x66\x3c\x00',  # 8
+    57: b'\x3c\x66\x66\x3e\x06\x06\x3c\x00',  # 9
+}
+_char_cell_cache: dict = {}
 
 #                             code       white       fire
 CHARS_DEF = [               # showwaves  (least → most dense)
@@ -63,7 +171,7 @@ CHARS_DEF = [               # showwaves  (least → most dense)
     (58,  12,  10),         # :          med gray    light red
     (42,  15,   8),         # *          light gray  orange
     (35,   1,   2),         # #          white       red
-    (64,   1,   2),         # ─          white       red
+    (160,  1,   2),         # █ solid    white       red
 ]
 CHARS_FREQ_DEF = [          # showfreqs  (least → most dense)
     (32,   0,   0),         # space      black       black
@@ -106,7 +214,7 @@ CHARS_CAMERA_DEF = [        # camera — 10 density levels for photo-like detail
     (42,   1,   2),         # *          white       red
     (37,   1,   2),         # %          white       red
     (35,   1,   2),         # #          white       red
-    (64,   1,   2),         # ─          white       red
+    (160,  1,   2),         # █ solid    white       red
 ]
 CHARS      = [t[0] for t in CHARS_DEF]
 CHARS_FREQ = [t[0] for t in CHARS_FREQ_DEF]
@@ -118,6 +226,15 @@ SID_EXTS     = {".sid"}
 U64          = ""
 FPS          = 10
 VIZ_MODE     = "showwaves"
+VIZ_ORDER    = ["none", "showwaves", "showfreqs", "avectorscope", "showspectrum", "ahistogram"]
+VIZ_LABELS   = {
+    "none":         "off",
+    "showwaves":    "waveform",
+    "showfreqs":    "spectrum",
+    "avectorscope": "scope",
+    "showspectrum": "spectrogram",
+    "ahistogram":   "histogram",
+}
 
 # ---------------------------------------------------------------------------
 # Args
@@ -138,6 +255,8 @@ def parse_args():
     p.add_argument("--macaudio", action="store_true",    help="Play SID audio locally via sidplayfp (default)")
     p.add_argument("--fps",      type=int, default=10,   help="Frame rate (default 10)")
     p.add_argument("--save",     metavar="FILE.mp3",     help="Save YouTube stream to MP3 (YouTube mode only)")
+    p.add_argument("--save-petscii", metavar="FILE.mp4",
+                   help="Save the PETSCII rendering itself as an MP4 video (camera and video modes)")
     p.add_argument("--yt-search", metavar="QUERY",        help="Search YouTube by title/artist and choose a result")
     p.add_argument("--yt-max",   type=int, default=10,    help="Max YouTube search results (default 10)")
     p.add_argument("--cookies-from-browser", metavar="BROWSER",
@@ -149,11 +268,53 @@ def parse_args():
     p.add_argument("--avectorscope",  action="store_true", help="Force vectorscope (oscilloscope) visualization")
     p.add_argument("--showspectrum",  action="store_true", help="Force scrolling spectrogram visualization")
     p.add_argument("--ahistogram",    action="store_true", help="Force amplitude histogram visualization")
+    p.add_argument("--video",         action="store_true", help="Video file/URL mode: display as PETSCII art on C64")
+    p.add_argument("--replace-audio", metavar="FILE",
+                   help="Video mode: play this .sid or audio file instead of the video's sound "
+                        "(the video loops until it ends)")
     p.add_argument("--camera",        action="store_true", help="Live camera mode: stream webcam as PETSCII art on C64")
     p.add_argument("--camera-device", default="0",         metavar="DEV",
                    help="Camera device: index (0,1,…) or path (/dev/video0). Default: 0")
     p.add_argument("--list-cameras",  action="store_true", help="List available camera devices and exit")
+    p.add_argument("--background", "--bkgd", dest="background", metavar="FILE",
+                   help="Background picture behind the visualizer (JPEG, PNG..., or a Koala .kla / Art Studio .art file)")
+    p.add_argument("--no-background", "--no-bkgd", dest="no_background", action="store_true",
+                   help="No background picture, and do not ask for one")
+    p.add_argument("--bkgd-type",      choices=["petscii", "koala", "hires"], help="Background: PETSCII characters, Koala (multicolour) or hires bitmap")
+    p.add_argument("--bkgd-layout",    choices=["behind", "split"], help="Bitmap background: behind the visualizer, or split screen")
+    p.add_argument("--bkgd-split",     choices=["top", "bottom", "left", "right"], help="Split screen: where the picture goes")
+    p.add_argument("--bkgd-size",      type=int, metavar="N", help="Split screen: picture rows (top/bottom) or columns (left/right)")
+    p.add_argument("--bkgd-scale",     choices=["crop", "rescale"], help="A .kla/.art file: crop to fit (pixels unchanged) or rescale")
+    p.add_argument("--bkgd-fit",       choices=["fill", "fit", "stretch"], help="Background: fill the screen, fit with black bars, or stretch")
+    p.add_argument("--bkgd-dither",    choices=["none", "2x2", "4x4", "8x8"], help="Background: Bayer dither pattern")
+    p.add_argument("--bkgd-strength",  type=int, metavar="0-100", help="Background: dither strength (default 50)")
+    p.add_argument("--bkgd-palette",   type=str.lower, choices=["palette", "colodore", "pepto", "deekay"], help="Background: which C64 palette to match")
+    p.add_argument("--bkgd-wavecolor", choices=["mode", "picture"], help="Visualizer colours over the picture: the colour mode, or the picture's colours")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
+    p.add_argument("--engine",   action="store_true",    help=argparse.SUPPRESS)   # run by Viz
+    p.add_argument("--answers",  default=None,           help=argparse.SUPPRESS)   # Viz's answers (JSON)
+    p.add_argument("--save-reu",     metavar="FILE.reu",
+                   help="Save a video (file or link) as a Koalavideo REU: real C64 pictures with sampled sound")
+    p.add_argument("--play-reu",     action="store_true",
+                   help="Send a Koalavideo .reu to the Ultimate's REU and play it (after --save-reu, or a .reu file)")
+    p.add_argument("--reu-shape",    type=int, choices=[1, 2, 3, 4], help="REU video: 1=16:10 2=16:9 3=4:3 4=2.35:1")
+    p.add_argument("--reu-speed",    type=int, choices=[2, 3, 4, 5, 6, 7, 8],
+                   help="REU video: C64 frames a picture (4 = 12.5 fps; 2 = 25 fps, 2.35:1 only)")
+    p.add_argument("--reu-sound",    choices=["6581", "8580", "ua", "none"], help="REU video: SID model, Ultimate Audio, or none")
+    p.add_argument("--reu-dither",   choices=["bayer", "none", "diffusion"], help="REU video: dithering")
+    p.add_argument("--reu-viz",      choices=["showwaves", "showfreqs", "avectorscope", "showspectrum", "ahistogram"],
+                   help="REU video: blend an audio visualizer into the picture")
+    p.add_argument("--save-d64",     metavar="FILE.d64",
+                   help="Save SID + pre-rendered frames to a bootable D64 disk image")
+    p.add_argument("--d64-fps",      type=int, default=10,
+                   help="Frame rate for D64 recording (default 10; 50 must be divisible)")
+    p.add_argument("--d64-duration", type=int, default=None, metavar="SECS",
+                   help="Capture duration in seconds for D64 (default: auto from SID length)")
+    p.add_argument("--d64-viz",      default=None,
+                   choices=["showwaves","showfreqs","avectorscope","showspectrum","ahistogram"],
+                   help="Visualization type for D64 frames (prompt if omitted)")
+    p.add_argument("--d64-color",    default=None, type=int, choices=[0,1,2],
+                   help="Color mode for D64 frames: 0=rainbow 1=white 2=fire (prompt if omitted)")
     return p.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -456,7 +617,8 @@ def start_ffmpeg_waveform_stream(url, height=HEIGHT):
     cmd = ["ffmpeg", "-loglevel", "quiet", "-re", "-i", "pipe:0",
            "-filter_complex", _build_viz_filter(height),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
-    p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.Popen(_leds_cmd(cmd), pass_fds=LED_FDS, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _leds_started()
     yt_proc.stdout.close()  # let ffmpeg own the pipe; yt_proc gets SIGPIPE if ffmpeg exits early
     print("[*] ffmpeg waveform (stream) started.")
     return yt_proc, p
@@ -495,6 +657,7 @@ def build_ticker_string(info, mode):
     return ticker
 
 def show_info_header(info, mode, filepath):
+    emit("info", mode=mode, file=filepath, **{k: v for k, v in info.items() if isinstance(v, (str, int, float))})
     width = 54
     print("+" + "-" * width + "+")
     print(f"|  sidviz_u64  v{VERSION}  build {BUILD}".ljust(width + 1) + "|")
@@ -570,9 +733,11 @@ def write_color_tables():
         defs = CHARS_CAMERA_DEF
     else:
         defs = CHARS_HIST_DEF
-    for code, wcol, fcol in defs:
-        white[code] = wcol
-        fire[code]  = fcol
+    # The C64 looks colours up by (code & $7F); codes 128+ (160 = solid block) go
+    # last so they take the slot they share with an invisible char (160 -> space)
+    for code, wcol, fcol in sorted(defs, key=lambda d: d[0] >= 128):
+        white[code & 0x7F] = wcol
+        fire[code & 0x7F]  = fcol
     write_mem(WHITE_CTABLE_ADDR, white)
     write_mem(FIRE_CTABLE_ADDR,  fire)
 
@@ -603,6 +768,218 @@ def send_ticker(ticker_str):
     print(f"[*] Ticker: {length} chars")
     write_mem(TICKER_BUF, petscii)
     write_byte(TICKER_LEN, length)
+
+# ---------------------------------------------------------------------------
+# Koalavideo REUs (--save-reu / --play-reu): a video as real C64 pictures with sampled sound,
+# for daddlerTL's Koalavideo v06 player (koalavideo.prg, next to sidviz). See koalavideo.py.
+# ---------------------------------------------------------------------------
+
+import tempfile
+
+KV_PLAYER   = "koalavideo.prg"
+REU_MBOX    = 0x02A7          # reuload.asm's mailbox: command, REU address (3), length (2)
+REU_BUFFER  = 0x2000
+REU_BLOCK   = 0x8000
+# reuload.asm, assembled (64tass -a -B): copies blocks from $2000 into the REU, then starts the player
+REULOAD_PRG = bytes([0x01, 0x08, 0x0B, 0x08, 0xEA, 0x07, 0x9E, 0x32, 0x30, 0x36, 0x31, 0x00, 0x00, 0x00, 0xA2, 0x64, 0xBD, 0x1B, 0x08, 0x9D, 0x40, 0x03, 0xCA, 0x10, 0xF7, 0x4C, 0x40, 0x03, 0x78, 0xA9, 0x00, 0x8D, 0xA7, 0x02, 0x8D, 0x20, 0xD0, 0xAD, 0xA7, 0x02, 0xF0, 0xFB, 0xC9, 0x03, 0xF0, 0x47, 0xA9, 0x00, 0x8D, 0x02, 0xDF, 0xA9, 0x20, 0x8D, 0x03, 0xDF, 0xAD, 0xA8, 0x02, 0x8D, 0x04, 0xDF, 0xAD, 0xA9, 0x02, 0x8D, 0x05, 0xDF, 0xAD, 0xAA, 0x02, 0x8D, 0x06, 0xDF, 0xAD, 0xAB, 0x02, 0x8D, 0x07, 0xDF, 0xAD, 0xAC, 0x02, 0x8D, 0x08, 0xDF, 0xA9, 0x00, 0x8D, 0x0A, 0xDF, 0xAD, 0xA7, 0x02, 0xC9, 0x02, 0xF0, 0x04, 0xA9, 0x90, 0xD0, 0x02, 0xA9, 0x91, 0x8D, 0x01, 0xDF, 0xEE, 0x20, 0xD0, 0xA9, 0x00, 0x8D, 0xA7, 0x02, 0xF0, 0xB0, 0xA9, 0x00, 0x8D, 0xA7, 0x02, 0x58, 0x20, 0x0E, 0x08, 0x4C, 0x7B, 0xE3])
+
+def u64_post_mem(addr, data):
+    """machine:writemem with the data as a binary attachment (one request for a whole block)."""
+    req = urllib.request.Request(f"{U64}/v1/machine:writemem?address={addr:X}", data=bytes(data),
+                                 method="POST", headers={"Content-Type": "application/octet-stream"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status == 200
+    except Exception as e:
+        print(f"\n[!] POST writemem failed: {e}")
+        return False
+
+def _reu_wait():
+    """Until the loader has taken the command (its mailbox goes back to 0)."""
+    for _ in range(200):
+        r = u64_get(f"machine:readmem?address={REU_MBOX:X}&length=1")
+        if r and r[0] == 0:
+            return True
+        time.sleep(0.02)
+    return False
+
+def _reu_check(addr, expect):
+    """Read REU bytes back through the loader and compare (no REU, or a smaller one, fails)."""
+    write_mem(REU_BUFFER, [0] * len(expect))
+    write_mem(REU_MBOX, [2, addr & 255, addr >> 8 & 255, addr >> 16 & 255, len(expect), 0])
+    if not _reu_wait():
+        return False
+    return u64_get(f"machine:readmem?address={REU_BUFFER:X}&length={len(expect)}") == bytes(expect)
+
+def send_reu(path):
+    """Put a Koalavideo .reu into the Ultimate's REU and start the player (no reset in between)."""
+    player = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), KV_PLAYER)
+    if not os.path.isfile(player):
+        print(f"[!] {KV_PLAYER} (daddlerTL's Koalavideo player) not found at {player}"); return False
+    data = open(path, "rb").read().rstrip(b"\0")          # only the part in use
+    if not data.startswith(b"KOALAVIDEO06REU"):
+        print(f"[!] {path} is not a Koalavideo REU"); return False
+    if not smoke_test():
+        return False
+    print("[*] Rebooting C64...")
+    u64_put("machine:reboot")
+    time.sleep(4.0)
+    tmp = os.path.join(tempfile.gettempdir(), "sidviz-reuload.prg")
+    open(tmp, "wb").write(REULOAD_PRG)
+    if not ftp_upload(tmp, "sidviz-reuload.prg") or not run_prg_from_temp("sidviz-reuload.prg"):
+        print("[!] Could not start the REU loader"); return False
+    time.sleep(1.5)
+    post_ok = True
+    t0 = time.time()
+    for i, a in enumerate(range(0, len(data), REU_BLOCK)):
+        block = data[a:a + REU_BLOCK]
+        if post_ok:
+            post_ok = u64_post_mem(REU_BUFFER, block)
+            if not post_ok:
+                print("[!] Falling back to small writes (much slower)")
+        if not post_ok:
+            write_mem(REU_BUFFER, block)
+        n = len(block)
+        write_mem(REU_MBOX, [1, a & 255, a >> 8 & 255, a >> 16 & 255, n & 255, n >> 8 & 255])
+        if not _reu_wait():
+            print("\n[!] The REU loader stopped answering"); return False
+        if i == 0 and not _reu_check(0, data[:16]):
+            print("\n[!] No REU answered. Turn on the REU at 16 MB in the Ultimate's C64 and cartridge")
+            print("    settings (and Ultimate Audio, for an Ultimate Audio video), then try again.")
+            return False
+        done = a + n
+        rate = done / max(0.001, time.time() - t0) / 1024
+        print(f"\r[*] Sending to the REU: {done // 1024} / {len(data) // 1024} KB  ({rate:.0f} KB/s)", end="", flush=True)
+        emit("reu-send", done=done, total=len(data))
+    last = (len(data) - 1) // REU_BLOCK * REU_BLOCK
+    if not _reu_check(last, data[last:last + 16]):
+        print("\n[!] The end of the video didn't stick: is the REU set to 16 MB?"); return False
+    print("\n[*] REU loaded. Starting daddlerTL's Koalavideo player...")
+    prg = open(player, "rb").read()
+    if post_ok:
+        u64_post_mem(prg[0] | prg[1] << 8, prg[2:])
+    else:
+        write_mem(prg[0] | prg[1] << 8, prg[2:])
+    write_byte(REU_MBOX, 3)
+    return True
+
+def _reu_ask(prompt, options, default, flag=None):
+    if flag is not None:
+        return flag
+    ans = input(prompt).strip()
+    return options.get(ans, default)
+
+def save_reu(args):
+    """--save-reu: a video file or link (with --replace-audio, a visualizer blended in) as a Koalavideo REU."""
+    import koalavideo as kv
+    tmpdir = tempfile.mkdtemp(prefix="sidviz_reu_")
+    try:
+        if args.yt_search:
+            cands = youtube_search(args.yt_search.strip(), args.yt_max)
+            src = choose_youtube_result(cands) if cands else None
+            if not src:
+                print("[*] Nothing chosen."); return False
+        else:
+            src = os.path.expanduser(args.file) if args.file else \
+                  os.path.expanduser(input("Video file or URL: ").strip())
+        if is_url(src):
+            print("[*] Downloading the video (yt-dlp)...")
+            dst = os.path.join(tmpdir, "video.mp4")
+            subprocess.run(["yt-dlp", "-q", "--no-playlist", "-f", "bv*[height<=480]+ba/b[height<=480]/b",
+                            "--merge-output-format", "mp4", "-o", dst] + _YTDLP_COOKIE_ARGS + [src])
+            if not os.path.isfile(dst):
+                print("[!] Download failed"); return False
+            src = dst
+        if not os.path.isfile(src):
+            print(f"[!] File not found: {src}"); return False
+        vlen = kv.duration(src) or 0
+
+        # replacement audio: the same choice as video mode
+        ra = args.replace_audio if args.replace_audio is not None else \
+             input("Replace the video's audio? [.sid/.mp3 file, Enter=keep]: ").strip()
+        ra = os.path.expanduser(ra) if ra else None
+        audio, seconds = src, vlen
+        if ra:
+            if not os.path.isfile(ra):
+                print(f"[!] File not found: {ra}"); return False
+            if os.path.splitext(ra)[1].lower() in SID_EXTS:
+                raw = get_sid_info(ra).get("Song Length", "")
+                try:
+                    p = raw.split(".")[0].split(":"); seconds = int(p[0]) * 60 + int(p[1])
+                except Exception:
+                    seconds = vlen or 180
+                audio = os.path.join(tmpdir, "sid.wav")
+                print(f"[*] Rendering the SID ({seconds} s)...")
+                subprocess.run(["sidplayfp", f"-t{int(seconds) + 1}", f"-w{audio}", ra],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                audio, seconds = ra, kv.duration(ra) or vlen
+            print(f"[*] Audio: {os.path.basename(ra)}  (the video loops until it ends)")
+        has_sound = kv.has_audio(audio)
+
+        shape = _reu_ask("Picture shape? [1=16:10 full screen, 2=16:9, 3=4:3, 4=2.35:1] (default 2): ",
+                         {"1": 1, "2": 2, "3": 3, "4": 4}, 2, args.reu_shape)
+        speeds = [s for s in kv.SPEEDS if s != 2 or shape == 4]
+        speed = _reu_ask("Speed? [" + ", ".join(f"{s}={kv.SPEEDS[s]}" for s in speeds) + "] (default 4): ",
+                         {str(s): s for s in speeds}, 4, args.reu_speed)
+        if speed == 2 and shape != 4:
+            print("[!] 25 fps is for 2.35:1 only; using 16.7 fps"); speed = 3
+        model = "none"
+        if has_sound:
+            model = _reu_ask("Sound? [0=SID 6581, 1=SID 8580, 2=Ultimate Audio, 3=none] (default 0): ",
+                             {"0": "6581", "1": "8580", "2": "ua", "3": "none"}, "6581", args.reu_sound)
+        else:
+            print("[*] No sound in the source: a silent video.")
+        pal = _reu_ask("Palette? [0=PALette, 1=Colodore, 2=Pepto, 3=DeeKay] (default 0): ",
+                       {"0": "palette", "1": "colodore", "2": "pepto", "3": "deekay"}, "palette", args.bkgd_palette)
+        dither = _reu_ask("Dither? [0=ordered (Bayer), 1=none, 2=error diffusion] (default 0): ",
+                          {"0": "bayer", "1": "none", "2": "diffusion"}, "bayer", args.reu_dither)
+        viz = None
+        if has_sound:
+            viz = _reu_ask("Blend an audio visualizer into the picture? [0=none, 1=waveform, 2=spectrum, "
+                           "3=scope, 4=spectrogram, 5=histogram] (default 0): ",
+                           {"1": "showwaves", "2": "showfreqs", "3": "avectorscope", "4": "showspectrum",
+                            "5": "ahistogram"}, None, args.reu_viz)
+
+        fps = 50 / speed
+        sound_on = model != "none"
+        nmax = kv.max_pictures(shape, fps, sound_on)
+        if not seconds:
+            print("[!] Can't tell how long the video is"); return False
+        n = min(int(seconds * fps), nmax)
+        if n < int(seconds * fps):
+            print(f"[*] 16 MB holds {nmax / fps:.0f} s at this shape and speed: the first {n / fps:.0f} s go in")
+        secs = n / fps
+        print(f"[*] Koalavideo: {kv.SHAPES[shape][0]}, {kv.SPEEDS[speed]}, sound {model}, "
+              f"{n} pictures ({secs:.1f} s)")
+        klas, t0 = [], time.time()
+        for k in kv.frames(src, shape, fps, secs, BKGD_PALETTES[pal], dither, viz, audio, loop=bool(ra)):
+            klas.append(k)
+            if len(klas) % 25 == 0 or len(klas) == n:
+                print(f"\r[*] Pictures: {len(klas)} / {n}", end="", flush=True)
+                emit("reu-make", done=len(klas), total=n)
+            if len(klas) >= n:
+                break
+        print(f"   ({time.time() - t0:.0f} s)")
+        if not klas:
+            print("[!] ffmpeg gave no pictures"); return False
+        samples = kv.sound(audio, len(klas) / fps) if sound_on else None
+        reu, used = kv.build(klas, shape, speed, samples, model)
+        out = os.path.expanduser(args.save_reu)
+        open(out, "wb").write(reu)
+        print(f"[*] Saved {out}  ({used // 1024} KB of 16 MB used)")
+        print("[*] On the Ultimate: REU on at 16 MB, load the .reu into it, then run koalavideo.prg")
+        if model == "ua":
+            print("[*] Ultimate Audio sound: turn on Ultimate Audio in the Ultimate's settings")
+        if args.play_reu or input("Send it to the Ultimate and play it now? [y/N]: ").strip().lower() in ("y", "yes"):
+            return send_reu(out)
+        return True
+    finally:
+        for f in os.listdir(tmpdir):
+            try: os.remove(os.path.join(tmpdir, f))
+            except OSError: pass
+        try: os.rmdir(tmpdir)
+        except OSError: pass
 
 # ---------------------------------------------------------------------------
 # Audio mode detection
@@ -641,9 +1018,46 @@ def make_fifo(path):
     os.mkfifo(path)
     print(f"[*] FIFO created: {path}")
 
+VIZ_W = 40     # visualizer width in cells (narrower beside a left/right picture)
+
+class LatestFrame:
+    """Reads visualizer frames from ffmpeg as they come and keeps only the newest, so the
+    C64 always gets the frame that goes with the music now (older ones are dropped)."""
+    def __init__(self, pipe, frame_size):
+        self.pipe, self.size = pipe, frame_size
+        self.frame, self.eof, self.dropped = None, False, 0
+        self.cv = threading.Condition()
+        threading.Thread(target=self._run, daemon=True).start()
+    def _run(self):
+        while True:
+            data = b""
+            while len(data) < self.size:
+                try:
+                    chunk = self.pipe.read(self.size - len(data))
+                except (ValueError, OSError):
+                    chunk = b""
+                if not chunk:
+                    with self.cv:
+                        self.eof = True
+                        self.cv.notify_all()
+                    return
+                data += chunk
+            with self.cv:
+                if self.frame is not None:
+                    self.dropped += 1
+                self.frame = data
+                self.cv.notify_all()
+    def get(self, timeout):
+        """The newest unsent frame, or None if none arrived within timeout."""
+        with self.cv:
+            if self.frame is None and not self.eof:
+                self.cv.wait(timeout)
+            data, self.frame = self.frame, None
+            return data
+
 def _build_viz_filter(height=HEIGHT):
     if VIZ_MODE == "showfreqs":
-        return (f"[0:a]showfreqs=s={WIDTH}x{height}:mode=bar"
+        return (f"[0:a]showfreqs=s={VIZ_W}x{height}:mode=bar"
                 f":ascale=log:fscale=log:colors=#ffffff,format=gray")
     if VIZ_MODE == "avectorscope":
         # avectorscope lissajous mode: X=L, Y=R.  SID is mono so L=R → diagonal.
@@ -652,17 +1066,17 @@ def _build_viz_filter(height=HEIGHT):
         filt = (f"[0:a]aformat=channel_layouts=mono,asplit=2[La][Ra];"
                 f"[Ra]adelay=2[Rd];"
                 f"[La][Rd]amerge=inputs=2[S];"
-                f"[S]avectorscope=s={WIDTH}x{height}:zoom=1.8:draw=dot:scale=log"
+                f"[S]avectorscope=s={VIZ_W}x{height}:zoom=1.8:draw=dot:scale=log"
                 f",format=gray")
         print(f"[*] avectorscope filter: {filt}")
         return filt
     if VIZ_MODE == "showspectrum":
-        return (f"[0:a]showspectrum=s={WIDTH}x{height}:slide=scroll"
+        return (f"[0:a]showspectrum=s={VIZ_W}x{height}:slide=scroll"
                 f":scale=log:color=intensity,format=gray")
     if VIZ_MODE == "ahistogram":
-        return (f"[0:a]ahistogram=s={WIDTH}x{height}:scale=log:slide=scroll"
+        return (f"[0:a]ahistogram=s={VIZ_W}x{height}:scale=log:slide=scroll"
                 f",format=gray")
-    return (f"[0:a]showwaves=s={WIDTH}x{height}:mode=cline"
+    return (f"[0:a]showwaves=s={VIZ_W}x{height}:mode=cline"
             f":rate={FPS}:colors=#ffffff,format=gray")
 
 def start_ffmpeg_waveform_fifo(realtime=False, height=HEIGHT):
@@ -671,19 +1085,22 @@ def start_ffmpeg_waveform_fifo(realtime=False, height=HEIGHT):
     cmd = ["ffmpeg", "-loglevel", "quiet"] + re_flag + ["-f", "wav", "-i", FIFO_PATH,
            "-filter_complex", _build_viz_filter(height),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.Popen(_leds_cmd(cmd), pass_fds=LED_FDS, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _leds_started()
     print("[*] ffmpeg waveform (FIFO) started."); return p
 
-def start_ffmpeg_waveform_file(filepath, height=HEIGHT):
+def start_ffmpeg_waveform_file(filepath, height=HEIGHT, seek_secs=0.0):
     # -re: read at 1x (native) speed so viz stays synchronized with real-time
     # audio playback.  Without it ffmpeg races through the whole file in seconds,
     # last_viz_frame ends up at the end-of-song (silent) frame, then ffmpeg exits
     # and the blend drops to camera-only.
-    cmd = ["ffmpeg", "-loglevel", "quiet", "-re",
+    seek_flags = ["-ss", str(int(seek_secs))] if seek_secs > 0.5 else []
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-re"] + seek_flags + [
            "-i", filepath,
            "-filter_complex", _build_viz_filter(height),
            "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1"]
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.Popen(_leds_cmd(cmd), pass_fds=LED_FDS, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _leds_started()
     print("[*] ffmpeg waveform (file) started."); return p
 
 def start_ffmpeg_camera(device="0", height=HEIGHT):
@@ -720,16 +1137,55 @@ def start_ffmpeg_camera(device="0", height=HEIGHT):
     print(f"[*] ffmpeg camera started (device: {device})")
     return p
 
+def start_ffmpeg_video_frames(source, height=HEIGHT):
+    """Extract grayscale video frames from a file at target FPS."""
+    vf = (f"fps={FPS},scale={WIDTH}:{height}:flags=lanczos,"
+          f"eq=contrast=1.3,format=gray")
+    # -re: pace output to real-time so the pipe doesn't overflow and ffmpeg
+    # doesn't race through the whole file before the main loop can consume frames.
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-re", "-i", source,
+           "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    print(f"[*] ffmpeg video frames started: {os.path.basename(source)}")
+    return p
+
+def start_yt_video_frames(url, height=HEIGHT):
+    """Stream YouTube/URL video frames via yt-dlp piped to ffmpeg."""
+    yt_proc = subprocess.Popen(
+        ["yt-dlp", "-f", "bestvideo[height<=480]/bestvideo", "-o", "-",
+         "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [url],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    vf = (f"fps={FPS},scale={WIDTH}:{height}:flags=lanczos,"
+          f"eq=contrast=1.3,format=gray")
+    # -re: read input at native speed — yt-dlp delivers compressed video faster
+    # than real-time; without it ffmpeg races through all frames at once.
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-re", "-i", "pipe:0",
+           "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+    p = subprocess.Popen(cmd, stdin=yt_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    yt_proc.stdout.close()
+    print("[*] yt-dlp + ffmpeg video frames started.")
+    return yt_proc, p
+
 def start_ffplay_audio(filepath):
     p = subprocess.Popen(
         ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", filepath],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("[*] ffplay audio started."); return p
 
-def start_sidplayfp_fifo(filepath, duration_secs=None):
+def start_ffplay_video_audio(filepath):
+    """Play audio track from a video file without showing a video window."""
+    p = subprocess.Popen(
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", filepath],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("[*] ffplay video audio started."); return p
+
+def start_sidplayfp_fifo(filepath, duration_secs=None, start_secs=0):
     cmd = ["sidplayfp"]
     if duration_secs:
         cmd += [f"-t{duration_secs}"]
+    if start_secs >= 1:
+        cmd += [f"-b{int(start_secs)}"]
     cmd += [f"-w{FIFO_PATH}", filepath]
     print(f"[*] sidplayfp FIFO cmd: {' '.join(cmd)}")
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -857,11 +1313,175 @@ def upload_sid_to_c64(psid):
         else:
             print(f"[!] Could not read $C620 — play may not work")
 
+
+# ---------------------------------------------------------------------------
+# C64U LEDs: the LEDs follow the SID at $D400's registers, so a silent fake
+# SID (volume 0) driven by the music makes them flash with an MP3 or stream.
+# The visualizer's ffmpeg also outputs the audio as three bands (bass, mid,
+# treble) on a second pipe; each band drives one SID voice's gate.
+# ---------------------------------------------------------------------------
+
+LEDS      = False      # set in main() when the user says yes
+LED_FDS   = ()         # the write end of the band pipe, passed to ffmpeg
+LED_SID   = 0xD400
+LED_RATE  = 8000       # band audio sample rate
+LED_HZ    = 15         # LED updates a second
+_led_state = {"avg": [0.0, 0.0, 0.0], "on": [0, 0, 0], "rfd": None, "stop": False}
+_led_lock = threading.Lock()
+
+def _leds_cmd(cmd):
+    """Add the band-audio output to a visualizer ffmpeg command (when the LEDs are on)."""
+    global LED_FDS
+    if not LEDS or os.name == "nt":
+        return cmd
+    i = cmd.index("-filter_complex")
+    viz = cmd[i + 1].replace("[0:a]", "[vz]", 1) + "[v]"
+    bands = ("[ld]aformat=channel_layouts=mono,asplit=3[l1][l2][l3];"
+             "[l1]lowpass=f=200[b1];[l2]bandpass=f=1000:width_type=o:w=2[b2];[l3]highpass=f=4000[b3];"
+             f"[b1][b2][b3]amerge=inputs=3,aresample={LED_RATE}[ab]")
+    r, w = os.pipe()
+    _led_state["rfd"] = r
+    LED_FDS = (w,)
+    return (cmd[:i] + ["-filter_complex", "[0:a]asplit=2[vz][ld];" + viz + ";" + bands,
+                       "-map", "[v]", "-f", "rawvideo", "-pix_fmt", "gray", "-r", str(FPS), "pipe:1",
+                       "-map", "[ab]", "-f", "s16le", "-ac", "3", f"pipe:{w}"])
+
+def _leds_started():
+    """After ffmpeg has started: close our copy of the write end, start reading the bands."""
+    global LED_FDS
+    if not LEDS or _led_state["rfd"] is None:
+        return
+    for fd in LED_FDS:
+        os.close(fd)
+    LED_FDS = ()
+    threading.Thread(target=_leds_reader, args=(_led_state["rfd"],), daemon=True).start()
+
+def _leds_reader(rfd):
+    """Measure each band about 15 times a second and update the fake SID straight from here,
+    so the LEDs don't wait for the (slower) frame loop."""
+    per = max(1, LED_RATE // LED_HZ) * 6        # bytes per tick: 3 channels x 2 bytes
+    buf, last = b"", 0.0
+    with os.fdopen(rfd, "rb", buffering=0) as f:
+        while not _led_state["stop"]:
+            d = f.read(65536)
+            if not d:
+                return
+            buf += d
+            while len(buf) >= per:
+                blk, buf = buf[:per], buf[per:]
+                vals = struct.unpack(f"<{per // 2}h", blk)
+                lv = [sum(abs(v) for v in vals[c::3]) / (per // 6) for c in range(3)]
+                regs = leds_tick(lv)
+                now = time.time()
+                if now - last >= 0.5 / LED_HZ and not _led_state["stop"]:   # skip writes if blocks arrive in a burst
+                    last = now
+                    write_mem(LED_SID, regs)
+
+def leds_tick(lv):
+    """The 21 SID voice registers for this tick. A band with sound in it blinks its voice's gate:
+    loud = every tick, medium = every 2 ticks, quiet = every 4; a jump restarts the blink."""
+    regs = []
+    for c in range(3):
+        avg = _led_state["avg"][c] = _led_state["avg"][c] * 0.95 + lv[c] * 0.05
+        cnt = _led_state["on"][c] + 1
+        if lv[c] > avg * 1.4:
+            cnt = 0                                 # a hit: light up now
+        _led_state["on"][c] = cnt
+        if lv[c] < 25:
+            on = False                              # silence in this band
+        else:
+            period = 1 if lv[c] >= avg * 1.1 else 2 if lv[c] >= avg * 0.6 else 4
+            on = (cnt // period) % 2 == 0
+        freq = (0x0800, 0x1800, 0x3000)[c]
+        regs += [freq & 0xFF, freq >> 8, 0x00, 0x08, 0x10 | (1 if on else 0), 0x00, 0xF0]
+    return regs
+
 # ---------------------------------------------------------------------------
 # Keypress toggle
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Engine mode (--engine): sidviz run by Viz. Questions are answered from Viz's JSON list
+# (--answers, keyed by each question's wording up to its "?"; missing ones take the default);
+# keys come in as lines on stdin; status goes out as "@viz {json}" lines.
+# ---------------------------------------------------------------------------
+
+ENGINE = False
+ENGINE_ANSWERS = {}
+_emit_lock = threading.Lock()
+_frame_emit = [0.0]
+
+def emit(event, **kw):
+    """A status line for Viz (engine mode only)."""
+    if not ENGINE:
+        return
+    with _emit_lock:
+        sys.stdout.write("\n@viz " + json.dumps({"event": event, **kw}, default=str) + "\n")
+        sys.stdout.flush()
+
+def question_key(prompt):
+    """A question's key: its wording up to the "?" (or "[" / ":"), lower case."""
+    return re.sub(r"\s+", " ", re.split(r"[?\[:]", prompt, maxsplit=1)[0]).strip().lower()
+
+def _engine_input(prompt=""):
+    key = question_key(prompt)
+    ans = ENGINE_ANSWERS.get(key)
+    emit("question", key=key, prompt=prompt.strip(), answer=ans, default=ans is None)
+    return "" if ans is None else str(ans)
+
+def show_frame(n, text):
+    """The frame status line, and once a second the same for Viz."""
+    print("\r" + text, end="", flush=True)
+    now = time.time()
+    if ENGINE and now - _frame_emit[0] >= 1.0:
+        _frame_emit[0] = now
+        emit("frame", n=n, status=text.replace("[*] ", "", 1))
+
+def handle_key(ch, state):
+    """One key (or Viz command): False when it's quit."""
+    if ch in ("c", "C"):
+        state["cam_color"]     = (state["cam_color"] + 1) % 3
+        state["color_pending"] = True
+        label = ["rainbow", "white", "fire"][state["cam_color"]]
+        sys.stdout.write(f"\r\n[*] Camera color -> {label}\r\n")
+    elif ch in ("v", "V"):
+        state["viz_color"]     = (state["viz_color"] + 1) % 3
+        label = ["rainbow", "white", "fire"][state["viz_color"]]
+        sys.stdout.write(f"\r\n[*] Viz color -> {label}\r\n")
+    elif ch in ("w", "W"):
+        cur = VIZ_MODE
+        idx = VIZ_ORDER.index(cur) if cur in VIZ_ORDER else 0
+        new_mode = VIZ_ORDER[(idx + 1) % len(VIZ_ORDER)]
+        state["viz_pending"] = new_mode
+        sys.stdout.write(f"\r\n[*] Viz -> {VIZ_LABELS.get(new_mode, new_mode)}\r\n")
+    elif ch == "0":
+        state["viz_pending"] = "none"
+        sys.stdout.write(f"\r\n[*] Viz -> off\r\n")
+    elif ch in ("1", "2", "3", "4", "5"):
+        new_mode = VIZ_ORDER[int(ch)]  # VIZ_ORDER[0]="none", so 1→showwaves, etc.
+        state["viz_pending"] = new_mode
+        sys.stdout.write(f"\r\n[*] Viz -> {VIZ_LABELS.get(new_mode, new_mode)}\r\n")
+    elif ch in ("q", "Q", "\x03"):
+        state["quit"] = True
+        return False
+    sys.stdout.flush()
+    emit("state", cam_color=state.get("cam_color"), viz_color=state.get("viz_color"),
+         viz=state.get("viz_pending") or VIZ_MODE)
+    return True
+
 def make_keypress_listener(state):
+    def _commands():
+        # engine mode: a line from Viz is a key ("c", "w", "3", "q" ...); Viz gone = quit
+        for line in sys.stdin:
+            cmd = line.strip()
+            if cmd and not handle_key(cmd[0], state):
+                break
+            if state["quit"]:
+                break
+        state["quit"] = True
+    if ENGINE or termios is None:
+        return threading.Thread(target=_commands, daemon=True)
+
     def _listen():
         fd  = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
@@ -871,15 +1491,7 @@ def make_keypress_listener(state):
             tty.setraw(fd)
             while not state["quit"]:
                 ch = sys.stdin.read(1)
-                if not ch: break
-                if ch in ("c", "C"):
-                    state["color_mode"]    = (state["color_mode"] + 1) % 3
-                    state["color_pending"] = True
-                    label = ["rainbow", "white", "fire"][state["color_mode"]]
-                    sys.stdout.write(f"\r\n[*] Color -> {label}\r\n")
-                    sys.stdout.flush()
-                elif ch in ("q", "Q", "\x03"):
-                    state["quit"] = True
+                if not ch or not handle_key(ch, state):
                     break
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -892,6 +1504,103 @@ def make_keypress_listener(state):
 
 def pixel_to_char(val, chars=CHARS):
     return chars[val * (len(chars) - 1) // 255]
+
+def _build_color_luts(chars_def):
+    return (
+        {code: wcol for code, wcol, fcol in chars_def},
+        {code: fcol for code, wcol, fcol in chars_def},
+    )
+
+def _pixel_color(pixel, chars, color_mode, col_x, white_lut, fire_lut, rainbow_tab):
+    if color_mode == 0:
+        return rainbow_tab[col_x]
+    char_code = pixel_to_char(pixel, chars)
+    if color_mode == 1:
+        return white_lut.get(char_code, 1)
+    return fire_lut.get(char_code, 8)
+
+def start_petscii_recorder(filepath, num_cols, num_rows, block=PETSCII_BLOCK,
+                           audio_source=None, audio_fd=None):
+    """Start ffmpeg PETSCII video recorder (all 25 C64 rows = 640×400).
+    Frames are piped at _REC_BLOCK (8px/cell = 320×200) and scaled up to
+    block×block (16px/cell = 640×400) inside ffmpeg — 4× less pipe data.
+    audio_source: local file path.  audio_fd: open fd from a yt-dlp pipe."""
+    rw, rh = num_cols * _REC_BLOCK, num_rows * _REC_BLOCK   # pipe input size
+    out_w, out_h = num_cols * block, num_rows * block        # output file size
+    cmd = ["ffmpeg", "-y",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{rw}x{rh}", "-r", str(FPS),
+           "-i", "pipe:0"]
+    pass_fds = ()
+    if audio_source:
+        cmd += ["-i", audio_source]
+    elif audio_fd is not None:
+        cmd += ["-i", f"/dev/fd/{audio_fd}"]
+        pass_fds = (audio_fd,)
+    has_audio = bool(audio_source) or (audio_fd is not None)
+    vf = f"scale={out_w}:{out_h}:flags=neighbor"
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-crf", "23", "-preset", "fast", "-tune", "animation",
+            "-r", str(FPS), "-vf", vf]
+    if has_audio:
+        cmd += ["-c:a", "aac", "-map", "0:v", "-map", "1:a"]
+    cmd += [filepath]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         pass_fds=pass_fds)
+    atag = (f" + audio: {os.path.basename(audio_source)}" if audio_source
+            else " + audio: stream" if audio_fd is not None else "")
+    print(f"[*] PETSCII recorder: {filepath} ({out_w}x{out_h} @ {FPS}fps){atag}")
+    return p
+
+def _cached_char_cell(screen_code, fg_color, block=PETSCII_BLOCK):
+    """Render one C64 character cell as block×block RGB bytes; result is cached."""
+    key = (screen_code, fg_color & 0x0F)
+    cached = _char_cell_cache.get(key)
+    if cached is not None:
+        return cached
+    if _C64_CHARGEN is not None:
+        bm = _C64_CHARGEN[screen_code * 8 : screen_code * 8 + 8]
+    else:
+        bm = _C64_CHAR_FALLBACK.get(screen_code, b'\x00' * 8)
+    r, g, b = C64_PALETTE_RGB[fg_color & 0x0F]
+    fg = bytes([r, g, b])
+    bg = b'\x00\x00\x00'
+    scale = block // 8   # 2× for block=16
+    cell = bytearray(block * block * 3)
+    for row8 in range(8):
+        byte = bm[row8] if row8 < len(bm) else 0
+        for col8 in range(8):
+            pix = fg if (byte >> (7 - col8)) & 1 else bg
+            for dr in range(scale):
+                for dc in range(scale):
+                    off = ((row8 * scale + dr) * block + col8 * scale + dc) * 3
+                    cell[off:off + 3] = pix
+    result = bytes(cell)
+    _char_cell_cache[key] = result
+    return result
+
+def _render_petscii_frame(screen_codes, colors, num_cols, num_rows, block=PETSCII_BLOCK):
+    """Render a full PETSCII frame as raw RGB24 bytes using cached C64 char bitmaps.
+    screen_codes: PETSCII screen code per cell; colors: C64 color index per cell."""
+    bstride = block * 3
+    lines = []
+    for row in range(num_rows):
+        base = row * num_cols
+        cells = [_cached_char_cell(screen_codes[base + col], colors[base + col], block)
+                 for col in range(num_cols)]
+        for br in range(block):
+            off = br * bstride
+            end = off + bstride
+            lines.append(b''.join(c[off:end] for c in cells))
+    return b''.join(lines)
+
+def _screen_code_color(screen_code, color_mode, col_x, white_lut, fire_lut, rainbow_tab):
+    """Map a screen code to a C64 color index for the recorder (mirrors C64 ASM logic)."""
+    if color_mode == 0:
+        return rainbow_tab[col_x]
+    if color_mode == 1:
+        return white_lut.get(screen_code, 1)
+    return fire_lut.get(screen_code, 8)
 
 def _apply_freq_gradient(raw, color_mode, height=HEIGHT):
     """Apply a per-mode vertical gradient to showfreqs frames so density/fire
@@ -912,29 +1621,1055 @@ def _apply_freq_gradient(raw, color_mode, height=HEIGHT):
                 scale = 1.0 - (row - (height - 3)) / 2 * 0.5
             else:                    # tip→body: 0.2 at row 0, 1.0 at row height-3
                 scale = 0.2 + row / (height - 3) * 0.8
-        start = row * WIDTH
-        for i in range(start, start + WIDTH):
+        width = len(buf) // height
+        start = row * width
+        for i in range(start, start + width):
             if buf[i] > 0:
                 buf[i] = max(1, int(buf[i] * scale))
     return bytes(buf)
 
 # ---------------------------------------------------------------------------
+# D64 save — pack SID + pre-rendered frames onto a bootable D64 disk image
+# ---------------------------------------------------------------------------
+
+def _rle_compress(data: bytes) -> bytes:
+    """RLE compress a frame for the D64 player.
+
+    Token format:
+      $00-$7F  count byte — the next (count+1) bytes are literals (1..128)
+      $80-$FF  run marker — repeat the next byte (value-$7E) times (2..129)
+    """
+    out = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        b = data[i]
+        run = 1
+        while i + run < n and data[i + run] == b and run < 129:
+            run += 1
+
+        if run >= 3:
+            consumed = 0
+            while consumed < run:
+                chunk = min(run - consumed, 129)
+                out.append(0x7e + chunk)   # $80=2 reps ... $FF=129 reps
+                out.append(b)
+                consumed += chunk
+            i += run
+        else:
+            # Gather consecutive non-run bytes as a literal batch (up to 128)
+            lits = bytearray()
+            while i < n and len(lits) < 128:
+                c = data[i]
+                rlen = 1
+                while i + rlen < n and data[i + rlen] == c and rlen < 3:
+                    rlen += 1
+                if rlen >= 3:
+                    break
+                lits.append(c)
+                i += 1
+            if lits:
+                out.append(len(lits) - 1)   # $00=1 literal, $7F=128 literals
+                out.extend(lits)
+    return bytes(out)
+
+
+def save_to_d64(sid_file, output_d64, fps=10, viz="showwaves", color_mode=0, duration=None):
+    """
+    Generate a bootable D64 disk image from a SID file.
+
+    The image contains two files:
+      "*"       — autostart player PRG (pre-rendered PETSCII frames + player code)
+      "SIDDATA" — raw SID binary (player loads this at boot via KERNAL LOAD)
+
+    sid_file   : path to a .sid / .psid file
+    output_d64 : output path for the .d64 image
+    fps        : visualization frame rate (default 10; must divide 50 evenly)
+    viz        : ffmpeg viz filter: "showwaves" | "showfreqs" | "avectorscope" |
+                 "showspectrum" | "ahistogram"
+    duration   : capture duration in seconds (None = auto from SID length)
+    """
+    import tempfile, struct as _struct
+    from d64 import build_d64
+
+    # ── locate player binary ────────────────────────────────────────────────
+    player_prg = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])),
+                              "sidviz_d64.prg")
+    if not os.path.isfile(player_prg):
+        print(f"[!] player binary not found: {player_prg}")
+        print("[!] Run:  64tass -a -B -o sidviz_d64.prg sidviz_d64.asm")
+        return False
+
+    # ── parse SID ────────────────────────────────────────────────────────────
+    psid = parse_psid(sid_file)
+    if psid is None:
+        return False
+
+    # ── SID metadata (used for duration and ticker) ──────────────────────────
+    info = get_sid_info(sid_file)
+    if duration is None:
+        raw_len = info.get("Song Length", "")
+        if raw_len:
+            try:
+                parts = raw_len.split(".")[0].split(":")
+                duration = int(parts[0]) * 60 + int(parts[1])
+            except Exception:
+                pass
+        if duration is None:
+            duration = 180  # default 3 minutes
+
+    fps_div = max(1, 50 // fps)
+    actual_fps = 50 // fps_div
+    frame_size = WIDTH * HEIGHT  # 40 × 17 = 680 bytes per frame
+
+    print(f"[d64] SID: {os.path.basename(sid_file)}")
+    print(f"[d64] Duration: {duration}s  FPS: {actual_fps}  "
+          f"Viz: {viz}  Est frames: {duration * actual_fps}")
+
+    # ── generate audio WAV via sidplayfp ─────────────────────────────────────
+    wav_fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="sidviz_d64_")
+    os.close(wav_fd)
+    try:
+        sid_cmd = ["sidplayfp", f"-t{duration}", f"-w{wav_path}", sid_file]
+        print(f"[d64] Rendering audio: {' '.join(sid_cmd)}")
+        r = subprocess.run(sid_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not os.path.isfile(wav_path) or os.path.getsize(wav_path) == 0:
+            print("[!] sidplayfp failed to produce WAV")
+            return False
+
+        # ── generate waveform frames via ffmpeg ──────────────────────────────
+        viz_filters = {
+            # mode=cline fills from center to waveform (bar-like but bidirectional)
+            "showwaves":
+                f"[0:a]showwaves=s={WIDTH}x{HEIGHT}:mode=cline"
+                f":rate={actual_fps}:colors=#ffffff,format=gray",
+            "showfreqs":
+                f"[0:a]showfreqs=s={WIDTH}x{HEIGHT}:mode=bar"
+                f":ascale=log:fscale=log:colors=#ffffff,format=gray",
+            "avectorscope":
+                (f"[0:a]aformat=channel_layouts=mono,asplit=2[La][Ra];"
+                 f"[Ra]adelay=50[Rd];[La][Rd]amerge=inputs=2[S];"
+                 f"[S]avectorscope=s={WIDTH}x{HEIGHT}:zoom=1.5:draw=line"
+                 f":scale=lin,format=gray"),
+            "showspectrum":
+                f"[0:a]showspectrum=s={WIDTH}x{HEIGHT}:slide=scroll"
+                f":scale=log:color=intensity,format=gray",
+            "ahistogram":
+                f"[0:a]ahistogram=s={WIDTH}x{HEIGHT}:scale=log:slide=scroll"
+                f",format=gray",
+        }
+        filt = viz_filters.get(viz, viz_filters["showwaves"])
+        chars_map = {
+            "showwaves": CHARS, "showfreqs": CHARS_FREQ,
+            "avectorscope": CHARS_SCOPE, "showspectrum": CHARS_SPECTRUM,
+            "ahistogram": CHARS_HIST,
+        }
+        chars = chars_map.get(viz, CHARS)
+
+        ff_cmd = [
+            "ffmpeg", "-loglevel", "quiet",
+            "-i", wav_path,
+            "-filter_complex", filt,
+            "-f", "rawvideo", "-pix_fmt", "gray",
+            "-r", str(actual_fps), "pipe:1",
+        ]
+        # ── C64 RAM budget ────────────────────────────────────────────────────
+        # The player PRG is loaded entirely into C64 RAM ($0801-$CFFF).
+        # Frame data must also land above the SID's own load range, because
+        # KERNAL LOAD of SIDDATA overwrites whatever is in that range.
+        #
+        # PRG layout:
+        #   [player binary  449 bytes  $0801-$09BF]
+        #   [metadata       16 bytes   $09C0-$09CF]
+        #   [TRAM_INIT       3 bytes   $09D0-$09D2]
+        #   [TRAM_PLAY       3 bytes   $09D3-$09D5]
+        #   [fdat_page       1 byte    $09D6      ]
+        #   [frame index  2*N bytes   $09D7-...  ]
+        #   [pad to page boundary                ]
+        #   [compressed frames  (must end < $D000)]
+
+        # $09E7 = ticker_len (1 byte), $09E8-$0AE4 = ticker_buf (253 bytes)
+        FRAME_IDX_C64  = 0x0AE5   # C64 addr where frame index starts
+        IDX_FILE_OFF   = 742      # same as file byte offset (2 + FRAME_IDX_C64 - 0x0801)
+        MAX_C64_END    = 0xD000   # exclusive — stop before I/O at $D000
+
+        sid_load  = psid["load_addr"]
+        sid_end   = sid_load + len(psid["data"])
+        sid_end_page = (sid_end + 255) >> 8   # first page fully above SID
+
+        # Player code lives at $0810-$09CF.  If the SID loads into that range,
+        # KERNAL LOAD of SIDDATA will overwrite the running player → crash.
+        PLAYER_CODE_START = 0x0810
+        PLAYER_CODE_END   = 0x09D0  # exclusive
+        if sid_load < PLAYER_CODE_END and sid_end > PLAYER_CODE_START:
+            print(f"[!] Error: SID loads at ${sid_load:04X}-${sid_end-1:04X}, "
+                  f"which overlaps the player code at $0810-$09CF.")
+            print(f"[!] This SID cannot be played from a D64 image.")
+            return False
+
+        if sid_load < FRAME_IDX_C64 < sid_end:
+            print(f"[!] Warning: SID occupies ${sid_load:04X}-${sid_end-1:04X} "
+                  f"which overlaps the frame-index area — playback may be garbled")
+
+        # Frame data base = max(page after index, first page above SID)
+        # Computed per-iteration during capture as frame_count grows.
+        def _fdat_c64(n_frames):
+            """Return the page-aligned C64 address where frame data would start
+            if we have n_frames (each index entry = 2 bytes)."""
+            after_idx = FRAME_IDX_C64 + n_frames * 2
+            page = max((after_idx + 255) >> 8, sid_end_page)
+            return page << 8
+
+        # Pre-flight: how much space is available for frame data at all?
+        min_fdat_start = _fdat_c64(0)   # best case: 0 frames, so smallest idx
+        available_bytes = MAX_C64_END - min_fdat_start
+        if available_bytes <= 0:
+            print(f"[!] SID loads too high (${sid_load:04X}-${sid_end-1:04X}) — "
+                  f"no room for frame data below I/O ($D000)")
+            return False
+        print(f"[d64] SID range: ${sid_load:04X}-${sid_end-1:04X}  "
+              f"frame data starts at ${min_fdat_start:04X}+  "
+              f"budget ≤{available_bytes//1024}KB")
+
+        print("[d64] Generating frames (stopping when C64 RAM fills)...")
+        ff = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE,
+                              stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # colour lookup tables for color_mode 1 (white) and 2 (fire)
+        chars_def_map = {
+            "showwaves": CHARS_DEF, "showfreqs": CHARS_FREQ_DEF,
+            "avectorscope": CHARS_SCOPE_DEF, "showspectrum": CHARS_SPECTRUM_DEF,
+            "ahistogram": CHARS_HIST_DEF,
+        }
+        _wlut, _flut = _build_color_luts(chars_def_map.get(viz, CHARS_DEF))
+
+        def _frame_color(frame_idx):
+            if color_mode == 1:   return 1   # white
+            if color_mode == 2:   return 8   # orange (fire)
+            return RAINBOW_TAB[frame_idx % len(RAINBOW_TAB)]  # rainbow
+
+        # ── read + compress frames — stop at C64 RAM limit ───────────────────
+        compressed_frames = []
+        running_compressed = 0
+        frame_num = 0
+        ram_capped = False
+        while True:
+            raw = ff.stdout.read(frame_size)
+            if len(raw) < frame_size:
+                break
+            screen_codes = bytes(pixel_to_char(p, chars) for p in raw)
+            color_byte   = _frame_color(frame_num)
+            # color byte is stored raw (1 byte) before the RLE stream;
+            # the player reads it, fills color RAM, then decompresses screen
+            c_frame = bytes([color_byte]) + _rle_compress(screen_codes)
+
+            # Would adding this frame push frame data end past $D000?
+            n_after = len(compressed_frames) + 1
+            fdat_start = _fdat_c64(n_after)
+            fdat_end   = fdat_start + running_compressed + len(c_frame)
+            if fdat_end >= MAX_C64_END:
+                ram_capped = True
+                break
+
+            compressed_frames.append(c_frame)
+            running_compressed += len(c_frame)
+            frame_num += 1
+            if frame_num % 50 == 0:
+                ratio = running_compressed / (frame_num * frame_size)
+                print(f"\r[d64] Frames: {frame_num}  "
+                      f"Compressed: {running_compressed//1024}KB  "
+                      f"Ratio: {ratio:.0%}", end="", flush=True)
+
+        ff.stdout.close()
+        ff.wait()
+        print()
+
+        if not compressed_frames:
+            print("[!] No frames generated — check sidplayfp and ffmpeg are installed")
+            return False
+
+        frame_count = len(compressed_frames)
+        total_compressed = running_compressed
+        avg_frame = total_compressed // frame_count
+        loop_secs = frame_count / actual_fps
+        if ram_capped:
+            print(f"[d64] C64 RAM full — captured {frame_count} frames "
+                  f"({loop_secs:.0f}s loop @ {actual_fps}fps)  "
+                  f"Visualization will loop every {loop_secs:.0f}s")
+        else:
+            print(f"[d64] Captured {frame_count} frames ({loop_secs:.0f}s)")
+        print(f"[d64] Compressed: {total_compressed//1024}KB  "
+              f"Avg/frame: {avg_frame}B  "
+              f"(uncompressed: {frame_count*frame_size//1024}KB)")
+
+        # ── build player PRG ─────────────────────────────────────────────────
+        player_bin = bytearray(open(player_prg, "rb").read())
+
+        sid_disk_name    = "SIDDATA"
+        sid_name_petscii = sid_disk_name.encode("ascii")[:8]
+        sid_name_petscii = sid_name_petscii + b"\xa0" * (8 - len(sid_name_petscii))
+
+        init_addr = psid["init_addr"]
+        play_addr = psid["play_addr"]
+
+        # Ticker string — same build_ticker_string + ascii_to_petscii used in live mode
+        ticker_str     = build_ticker_string(info, "sid")
+        ticker_petscii = bytes(ascii_to_petscii(ticker_str))
+        ticker_petscii = (ticker_petscii + b'\x20' * 253)[:253]  # fixed 253-byte buffer
+        ticker_len_val = min(len(bytes(ascii_to_petscii(ticker_str))), 253)
+        print(f"[d64] Ticker ({ticker_len_val}): {ticker_str[:60].rstrip()}")
+
+        # Metadata (16 bytes → $09D0-$09DF)
+        meta = bytearray(16)
+        meta[0]  = init_addr & 0xFF
+        meta[1]  = (init_addr >> 8) & 0xFF
+        meta[2]  = play_addr & 0xFF
+        meta[3]  = (play_addr >> 8) & 0xFF
+        meta[4]  = frame_count & 0xFF
+        meta[5]  = (frame_count >> 8) & 0xFF
+        meta[6]  = fps_div
+        meta[7]  = len(sid_disk_name)
+        meta[8:16] = sid_name_petscii
+
+        tram_init = bytes([0x4C, init_addr & 0xFF, (init_addr >> 8) & 0xFF])
+        tram_play = bytes([0x4C, play_addr & 0xFF, (play_addr >> 8) & 0xFF])
+
+        # Compute exact frame data base address
+        fdat_c64_addr = _fdat_c64(frame_count)
+        fdat_page_val = fdat_c64_addr >> 8
+
+        # Padding from end of frame index to fdat_c64_addr
+        idx_end_c64 = FRAME_IDX_C64 + frame_count * 2
+        pad = fdat_c64_addr - idx_end_c64
+        assert pad >= 0 and fdat_c64_addr % 256 == 0
+
+        # Frame index: 2-byte LE offsets from fdat_c64_addr
+        frame_index = bytearray()
+        offset = 0
+        for f in compressed_frames:
+            frame_index += _struct.pack("<H", offset)
+            offset += len(f)
+
+        frame_data = b"".join(compressed_frames)
+
+        prg_data = (
+            player_bin               # 465 bytes: 2-byte header + code to $09CF
+            + meta                   # 16 bytes  ($09D0-$09DF)
+            + tram_init              # 3 bytes   ($09E0-$09E2)
+            + tram_play              # 3 bytes   ($09E3-$09E5)
+            + bytes([fdat_page_val]) # 1 byte    ($09E6)
+            + bytes([ticker_len_val])# 1 byte    ($09E7)
+            + ticker_petscii         # 253 bytes ($09E8-$0AE4)
+            + frame_index            # 2*N bytes ($0AE5-...)
+            + bytes(pad)             # pad to page boundary
+            + frame_data             # color byte + RLE per frame
+        )
+
+        prg_end_c64 = 0x0801 + len(prg_data) - 2
+        print(f"[d64] Player PRG: {len(prg_data)//1024}KB  "
+              f"Frame data: ${fdat_c64_addr:04X}-${prg_end_c64:04X}  "
+              f"(page ${fdat_page_val:02X})")
+
+        # ── build SIDDATA PRG ─────────────────────────────────────────────────
+        sid_prg = _struct.pack("<H", psid["load_addr"]) + psid["data"]
+        print(f"[d64] SIDDATA: {len(sid_prg)} bytes  "
+              f"load ${psid['load_addr']:04X}  "
+              f"init ${psid['init_addr']:04X}  "
+              f"play ${psid['play_addr']:04X}")
+
+        # ── D64 capacity check ────────────────────────────────────────────────
+        total_bytes = len(prg_data) + len(sid_prg)
+        D64_CAPACITY = 664 * 254
+        if total_bytes > D64_CAPACITY:
+            print(f"[!] Data ({total_bytes//1024}KB) exceeds D64 capacity "
+                  f"({D64_CAPACITY//1024}KB) — this shouldn't happen; "
+                  f"C64 RAM limit should have caught this first")
+            return False
+
+        # ── create D64 image ──────────────────────────────────────────────────
+        sid_base = os.path.splitext(os.path.basename(sid_file))[0].upper()[:8]
+        build_d64(
+            output_d64,
+            [
+                ("SIDVIZ",   prg_data),   # autostart: LOAD"*",8,1
+                ("SIDDATA",  sid_prg),    # SID binary with embedded load addr
+            ],
+            disk_name=sid_base,
+            disk_id="SV",
+        )
+        print(f"[d64] Done → {output_d64}")
+        print(f"[d64] On C64: LOAD\"*\",8,1  then  RUN")
+        return True
+
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Background picture (--background / --bkgd)
+#
+# The picture is turned into PETSCII block characters over rows 2-24: each cell
+# is one colour on the black background, as quarter blocks (80 x 46 of them) or
+# as a half-tone checker for a darker shade. Rows 8-24 are
+# uploaded to the PRG ($C700 screen codes, $CA00 colours), which shows them
+# wherever the waveform frame has a space; rows 2-7 are mixed in here, since
+# Python writes those rows itself.
+# ---------------------------------------------------------------------------
+
+import zlib
+
+BKGD_FLAG   = 0xC004   # Python writes 1 once the picture is uploaded
+BKGD_WCOL   = 0xC005   # 0 = waveform keeps the colour mode, 1 = takes the picture's colour
+BKGD_CHARS  = 0xC700   # 680 screen codes, rows 8-24
+BKGD_COLS   = 0xCA00   # 680 colours,      rows 8-24
+BKGD_ROWS   = 23       # rows 2-24
+BKGD_TOP    = 6 * WIDTH            # cells in rows 2-7
+BKGD_PW     = WIDTH * 2            # 80 blocks across
+BKGD_PH     = BKGD_ROWS * 2        # 46 blocks down
+BKGD_PAR    = 0.936                # width of a C64 pixel on a PAL screen (height = 1)
+
+# The C64's 16 colours as measured four ways (the same sets as retropixels / SIDlab's Picture maker)
+BKGD_PALETTES = {
+    "palette":  [(0x00,0x00,0x00),(0xff,0xff,0xff),(0x8c,0x32,0x3d),(0x66,0xbf,0xb3),(0x8e,0x36,0xa1),(0x4a,0xa6,0x48),(0x32,0x2d,0xab),(0xcd,0xd2,0x56),
+                 (0x8f,0x50,0x1a),(0x53,0x3d,0x01),(0xbd,0x63,0x6e),(0x4e,0x4e,0x4e),(0x76,0x76,0x76),(0x8c,0xe9,0x8b),(0x6b,0x66,0xe4),(0xa3,0xa3,0xa3)],
+    "colodore": [(0x00,0x00,0x00),(0xff,0xff,0xff),(0x81,0x33,0x38),(0x75,0xce,0xc8),(0x8e,0x3c,0x97),(0x56,0xac,0x4d),(0x2e,0x2c,0x9b),(0xed,0xf0,0x71),
+                 (0x8e,0x50,0x29),(0x55,0x38,0x00),(0xc4,0x6c,0x71),(0x4a,0x4a,0x4a),(0x7b,0x7b,0x7b),(0xa9,0xff,0x9f),(0x70,0x6e,0xeb),(0xb2,0xb2,0xb2)],
+    "pepto":    [(0x00,0x00,0x00),(0xff,0xff,0xff),(0x68,0x37,0x2b),(0x70,0xa4,0xb2),(0x6f,0x3d,0x86),(0x58,0x8d,0x43),(0x35,0x28,0x79),(0xb8,0xc7,0x6f),
+                 (0x6f,0x4f,0x25),(0x43,0x39,0x00),(0x9a,0x67,0x59),(0x44,0x44,0x44),(0x6c,0x6c,0x6c),(0x9a,0xd2,0x84),(0x6c,0x5e,0xb5),(0x95,0x95,0x95)],
+    "deekay":   [(0x00,0x00,0x00),(0xff,0xff,0xff),(0x88,0x20,0x00),(0x68,0xd0,0xa8),(0xa8,0x38,0xa0),(0x50,0xb8,0x43),(0x18,0x10,0x90),(0xf0,0xe8,0x58),
+                 (0xa0,0x48,0x00),(0x47,0x2b,0x1b),(0xc8,0x78,0x70),(0x48,0x48,0x48),(0x80,0x80,0x80),(0x98,0xff,0x98),(0x50,0x90,0xd0),(0xb8,0xb8,0xb8)],
+}
+
+# Screen code for each mix of quarter blocks: bit 0 = upper left, 1 = upper right, 2 = lower left, 3 = lower right
+BKGD_QUAD = [0x20, 0x7E, 0x7C, 0xE2, 0x7B, 0x61, 0xFF, 0xEC, 0x6C, 0x7F, 0xE1, 0xFB, 0x62, 0xFC, 0xFE, 0xA0]
+BKGD_CHECKER = 0x66    # the fine checker: half the cell lit, read as a darker shade of its colour
+BKGD_HALF    = 0.73    # how bright that half-lit cell looks next to a solid one
+
+BKGD_BAYER = {
+    "2x2": [[0, 2], [3, 1]],
+    "4x4": [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]],
+    "8x8": [[ 0, 32,  8, 40,  2, 34, 10, 42], [48, 16, 56, 24, 50, 18, 58, 26],
+            [12, 44,  4, 36, 14, 46,  6, 38], [60, 28, 52, 20, 62, 30, 54, 22],
+            [ 3, 35, 11, 43,  1, 33,  9, 41], [51, 19, 59, 27, 49, 17, 57, 25],
+            [15, 47,  7, 39, 13, 45,  5, 37], [63, 31, 55, 23, 61, 29, 53, 21]],
+}
+
+def _bkgd_clean_path(s):
+    """A typed or dragged-in path: no quotes, no backslashes before spaces."""
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        s = s[1:-1]
+    return s.replace("\\ ", " ")
+
+def bkgd_decode_c64(path, palette):
+    """A Koala Painter (.kla/.koa, 10003 bytes) or Art Studio hires (.art, 9009 bytes) file
+    as 320x200 RGB bytes, or None if the file is neither."""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        with open(path, "rb") as f:
+            d = f.read(10004)
+    except OSError:
+        return None
+    koala = ext in (".kla", ".koa") and len(d) == 10003
+    hires = ext in (".art", ".aas") and len(d) == 9009
+    if not (koala or hires):
+        return None
+    bitmap, scr = d[2:8002], d[8002:9002]
+    colram = d[9002:10002] if koala else None
+    bg = (d[10002] & 15) if koala else 0
+    out = bytearray(320 * 200 * 3)
+    for cell in range(1000):
+        cx, cy = cell % 40, cell // 40
+        hi, lo = scr[cell] >> 4, scr[cell] & 15
+        for r in range(8):
+            b = bitmap[cell * 8 + r]
+            o = ((cy * 8 + r) * 320 + cx * 8) * 3
+            for x in range(8):
+                if koala:
+                    v = (b >> (6 - (x & 6))) & 3
+                    c = (bg, hi, lo, colram[cell] & 15)[v]
+                else:
+                    c = hi if (b >> (7 - x)) & 1 else lo
+                out[o + x * 3: o + x * 3 + 3] = bytes(palette[c])
+    return bytes(out)
+
+def bkgd_fetch_rgb(path, w, h, fit, palette, par=BKGD_PAR):
+    """The picture as w x h RGB bytes, scaled by ffmpeg. fit = fit / fill / stretch."""
+    vw, vh = round(w * par * 8), h * 8               # the target area in square pixels, 8x oversized
+    if fit == "stretch":
+        chain = f"scale={w}:{h}:flags=area"
+    elif fit == "fit":
+        chain = (f"scale={vw}:{vh}:force_original_aspect_ratio=decrease:flags=lanczos,"
+                 f"pad={vw}:{vh}:(ow-iw)/2:(oh-ih)/2:black,scale={w}:{h}:flags=area")
+    else:
+        chain = (f"scale={vw}:{vh}:force_original_aspect_ratio=increase:flags=lanczos,"
+                 f"crop={vw}:{vh},scale={w}:{h}:flags=area")
+    c64 = bkgd_decode_c64(path, palette)
+    if c64 is not None:
+        src = ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "320x200", "-i", "pipe:0"]
+        chain = "scale=300:200:flags=area," + chain  # C64 pixels to square pixels first
+    else:
+        src = ["-i", path]
+    cmd = ["ffmpeg", "-v", "error"] + src + ["-vf", "format=rgb24," + chain,
+           "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    try:
+        r = subprocess.run(cmd, input=c64, stdin=None if c64 is not None else subprocess.DEVNULL,
+                           capture_output=True, timeout=60)
+    except Exception as e:
+        print(f"[!] ffmpeg could not read the picture: {e}")
+        return None
+    if len(r.stdout) != w * h * 3:
+        print(f"[!] ffmpeg could not read the picture: {r.stderr.decode(errors='replace').strip() or 'no picture data'}")
+        return None
+    return r.stdout
+
+def bkgd_convert(rgb, palette, dither, strength):
+    """80 x 46 RGB bytes -> (920 screen codes, 920 colours) for rows 2-24.
+    Each cell gets the one colour, and the mix of quarter blocks or the half-tone checker,
+    closest to its four pixels. The dither works cell by cell (a cell has only one colour)."""
+    bayer = BKGD_BAYER.get(dither)
+    n = len(bayer) if bayer else 1
+    amp = 128.0 * max(0, min(100, strength)) / 100.0   # the dither's reach, in colour levels
+
+    def dist(p, c):
+        return 3 * (p[0] - c[0]) ** 2 + 6 * (p[1] - c[1]) ** 2 + (p[2] - c[2]) ** 2
+
+    chars, cols = bytearray(WIDTH * BKGD_ROWS), bytearray(WIDTH * BKGD_ROWS)
+    for cy in range(BKGD_ROWS):
+        for cx in range(WIDTH):
+            px = []
+            for q in range(4):                                  # UL, UR, LL, LR
+                x, y = cx * 2 + (q & 1), cy * 2 + (q >> 1)
+                o = (y * BKGD_PW + x) * 3
+                d = ((bayer[cy % n][cx % n] + 0.5) / (n * n) - 0.5) * amp if bayer else 0.0
+                px.append((rgb[o] + d, rgb[o + 1] + d, rgb[o + 2] + d))
+            black = [dist(p, palette[0]) for p in px]
+            best = None
+            for c in range(1, 16):
+                err, bits = 0.0, 0
+                for q in range(4):
+                    e = dist(px[q], palette[c])
+                    if e < black[q]:
+                        err += e; bits |= 1 << q
+                    else:
+                        err += black[q]
+                if best is None or err < best[0]:
+                    best = (err, BKGD_QUAD[bits], c if bits else 0)
+                half = [v * BKGD_HALF for v in palette[c]]
+                err = sum(dist(p, half) for p in px)
+                if err < best[0]:
+                    best = (err, BKGD_CHECKER, c)
+            i = cy * WIDTH + cx
+            chars[i] = best[1]
+            cols[i] = best[2]
+    return bytes(chars), bytes(cols)
+
+def bkgd_write_preview(path, chars, cols, palette):
+    """Save how the picture will look on the C64 as a PNG (640 x 368)."""
+    w, h, s = WIDTH * 8, BKGD_ROWS * 8, 2          # C64 pixels, each drawn 2 x 2
+    rows = []
+    for y in range(h):
+        line = bytearray()
+        for x in range(w):
+            i = (y // 8) * WIDTH + x // 8
+            if chars[i] == BKGD_CHECKER:
+                on = (((x & 7) >> 1) + ((y & 7) >> 1)) & 1 == 0
+            else:
+                on = (BKGD_QUAD.index(chars[i]) >> (((y & 7) >> 2) * 2 + ((x & 7) >> 2))) & 1
+            line += bytes(palette[cols[i]] if on else palette[0]) * s
+        rows.append(b"\x00" + bytes(line))
+    raw = b"".join(r for r in rows for _ in range(s))
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w * s, h * s, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+# ---------------------------------------------------------------------------
+# Bitmap backgrounds (Koala multicolour or hires): the PRG shows them in VIC
+# bank 2 with a raster split, so the ticker rows stay text.
+#   behind:            the picture fills rows 2-24; the C64 draws the visualizer into it
+#   split left/right:  the picture on one side; the visualizer drawn into the other side
+#   split top/bottom:  the picture in some rows; the visualizer in text mode in the others
+# ---------------------------------------------------------------------------
+
+BM_MODE    = 0xC007   # ASM: 0 text, 1 drawn into the bitmap, 2 top/bottom split, 3 stopped
+BM_CMD     = 0xC008   # Python writes 1 once the picture and settings are uploaded
+BM_STOP    = 0xC009   # Python writes 1 at the end (local audio): the picture stays on screen
+BM_LINE    = 0xC00A   # raster line where the bitmap starts
+TX_LINE    = 0xC00B   # raster line where text starts again
+BM_D016    = 0xC00C
+BM_KOALA   = 0xC00D
+BM_VR0     = 0xC00E   # visualizer area: first row, rows, first column, columns
+BM_BG      = 0xC012
+BM_KIND    = 0xC013
+BM_GLCOUNT = 0xC01E
+BM_FRAME   = 0xC700   # the visualizer frame (up to 920 bytes)
+BM_BITMAP  = 0xA000
+BM_MATRIX  = 0x8400
+BM_COLRAM  = 0xD800
+BM_GLMAP   = 0x9D00
+BM_GLCODES = 0x9E00
+BM_FIRST   = 2        # the picture area starts at row 2 (rows 0-1: ticker)
+# memory a C64-audio tune must stay out of
+BM_AREAS   = [(0x8000, 0xBFFF), (0xE000, 0xFFFF)]
+
+def bkgd_layout(layout, side, size):
+    """Where the picture and the visualizer go: rows and columns as (first, count)."""
+    full_r, full_c = (BM_FIRST, 25 - BM_FIRST), (0, WIDTH)
+    first_line = 51 + 8 * BM_FIRST - 1          # the bitmap starts on the last line of row 1 (kept black)
+    if layout == "behind":
+        return {"pic": full_r + full_c, "viz": full_r + full_c, "kind": 1, "bm": first_line, "tx": 251}
+    if side in ("left", "right"):
+        pc = size
+        pic_c = (0, pc) if side == "left" else (WIDTH - pc, pc)
+        viz_c = (pc, WIDTH - pc) if side == "left" else (0, WIDTH - pc)
+        return {"pic": full_r + pic_c, "viz": full_r + viz_c, "kind": 1, "bm": first_line, "tx": 251}
+    pr = size
+    if side == "top":
+        return {"pic": (BM_FIRST, pr) + full_c, "viz": (BM_FIRST + pr, 25 - BM_FIRST - pr) + full_c,
+                "kind": 2, "bm": first_line, "tx": 51 + 8 * (BM_FIRST + pr) - 1}
+    return {"pic": (25 - pr, pr) + full_c, "viz": (BM_FIRST, 25 - BM_FIRST - pr) + full_c,
+            "kind": 2, "bm": 51 + 8 * (25 - pr) - 1, "tx": 251}
+
+def _bm_dist(p, c):
+    return 3 * (p[0] - c[0]) ** 2 + 6 * (p[1] - c[1]) ** 2 + (p[2] - c[2]) ** 2
+
+def bkgd_conv_bitmap(rgb, w, h, palette, dither, strength, koala):
+    """w x h RGB bytes (Koala: w = 4 a cell, fat pixels; hires: w = 8 a cell) ->
+    (cells, bg): cells row by row, each (8 bitmap bytes, matrix byte, colour RAM byte)."""
+    bayer = BKGD_BAYER.get(dither)
+    n = len(bayer) if bayer else 1
+    amp = 96.0 * max(0, min(100, strength)) / 100.0
+    px, q = [], []
+    for y in range(h):
+        for x in range(w):
+            o = (y * w + x) * 3
+            d = ((bayer[y % n][x % n] + 0.5) / (n * n) - 0.5) * amp if bayer else 0.0
+            p = (rgb[o] + d, rgb[o + 1] + d, rgb[o + 2] + d)
+            px.append(p)
+            q.append(min(range(16), key=lambda c: _bm_dist(p, palette[c])))
+    cw = 4 if koala else 8
+    if koala:
+        counts = [0] * 16
+        for c in q: counts[c] += 1
+        bg = max(range(16), key=lambda c: counts[c])
+    else:
+        bg = 0
+    cells = []
+    for cy in range(h // 8):
+        for cx in range(w // cw):
+            idx = [(cy * 8 + r) * w + cx * cw + x for r in range(8) for x in range(cw)]
+            cnt = {}
+            for i in idx:
+                if not koala or q[i] != bg:
+                    cnt[q[i]] = cnt.get(q[i], 0) + 1
+            top = sorted(cnt, key=lambda c: -cnt[c])[:3 if koala else 2]
+            if koala:
+                # least used of the three on %11 (colour RAM): the visualizer recolours that one
+                c1, c2, c3 = (top + [0, 0, 0])[:3]
+                choice = [(bg, 0)] + [(c, b) for c, b in ((c1, 1), (c2, 2), (c3, 3)) if c in cnt]
+            else:
+                a = top[0] if top else 0
+                b = top[1] if len(top) > 1 else a
+                # the less used colour is the foreground (set bits): the visualizer recolours it
+                fg, bgc = (b, a) if len(top) > 1 else (0, a)
+                choice = [(bgc, 0)] + ([(fg, 1)] if len(top) > 1 else [])
+            exact = dict(choice)
+            data = bytearray(8)
+            for r in range(8):
+                v = 0
+                for x in range(cw):
+                    i = (cy * 8 + r) * w + cx * cw + x
+                    bits = exact.get(q[i])
+                    if bits is None:
+                        bits = min(choice, key=lambda cb: _bm_dist(px[i], palette[cb[0]]))[1]
+                    v = (v << (2 if koala else 1)) | bits
+                data[r] = v
+            if koala:
+                cells.append((bytes(data), (c1 << 4) | c2, c3))
+            else:
+                cells.append((bytes(data), (fg << 4) | bgc, 0))
+    return cells, bg
+
+def bkgd_crop_c64(path, rows, cols, koala):
+    """The middle rows x cols cells of a Koala or Art Studio file, unchanged: (cells, bg)."""
+    with open(path, "rb") as f:
+        d = f.read()
+    bitmap, scr = d[2:8002], d[8002:9002]
+    colram = d[9002:10002] if koala else None
+    bg = (d[10002] & 15) if koala else 0
+    r0, c0 = (25 - rows) // 2, (WIDTH - cols) // 2
+    cells = []
+    for r in range(r0, r0 + rows):
+        for c in range(c0, c0 + cols):
+            s = r * 40 + c
+            cells.append((bytes(bitmap[s * 8:s * 8 + 8]), scr[s], (colram[s] & 15) if koala else 0))
+    return cells, bg
+
+def bkgd_place(cells, bg, layout, koala):
+    """Put the picture's cells into whole-screen bitmap, matrix and colour RAM images."""
+    # outside the picture: black. Koala bits %00 would be the picture's background colour,
+    # so those cells use %01 (the matrix's high nibble, 0 = black); a Koala glyph ORs in as %11.
+    bitmap = bytearray([0x55 if koala else 0x00]) * 8000
+    matrix, colour = bytearray(1000), bytearray(1000)
+    r0, rn, c0, cn = layout["pic"]
+    for k, (data, mx, co) in enumerate(cells):
+        s = (r0 + k // cn) * 40 + c0 + k % cn
+        bitmap[s * 8:s * 8 + 8] = data
+        matrix[s] = mx
+        colour[s] = co
+    return bitmap, matrix, colour
+
+def bkgd_render(bitmap, matrix, colour, bg, koala, palette):
+    """How the whole screen's bitmap looks (ticker and visualizer areas black): 320 x 200 RGB."""
+    out = bytearray(320 * 200 * 3)
+    for s in range(1000):
+        cx, cy = s % 40, s // 40
+        hi, lo = matrix[s] >> 4, matrix[s] & 15
+        for r in range(8):
+            b = bitmap[s * 8 + r]
+            o = ((cy * 8 + r) * 320 + cx * 8) * 3
+            for x in range(8):
+                if koala:
+                    c = (bg, hi, lo, colour[s])[(b >> (6 - (x & 6))) & 3]
+                else:
+                    c = hi if (b >> (7 - x)) & 1 else lo
+                out[o + x * 3:o + x * 3 + 3] = bytes(palette[c])
+    return bytes(out)
+
+def _bkgd_png(path, w, h, rgb, scale=2):
+    rows = []
+    for y in range(h):
+        line = b"".join(bytes(rgb[(y * w + x) * 3:(y * w + x) * 3 + 3]) * scale for x in range(w))
+        rows.append(b"\x00" + line)
+    raw = b"".join(r for r in rows for _ in range(scale))
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w * scale, h * scale, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+def _psid_range(filepath):
+    """(first, last) address a PSID/RSID file loads into, or None."""
+    try:
+        with open(filepath, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    if raw[0:4] not in (b"PSID", b"RSID") or len(raw) < 0x7C:
+        return None
+    off  = struct.unpack_from(">H", raw, 6)[0]
+    load = struct.unpack_from(">H", raw, 8)[0]
+    data = raw[off:]
+    if load == 0 and len(data) >= 2:
+        load = struct.unpack_from("<H", data, 0)[0]
+        data = data[2:]
+    return load, load + len(data) - 1
+
+def bkgd_check_tune(bk, sidpath):
+    """C64-audio mode: warn if the tune loads where the bitmap background lives, and ask."""
+    rng = _psid_range(sidpath)
+    if not rng:
+        return bk
+    lo, hi = rng
+    hits = [f"${a:04X}-${b:04X}" for a, b in BM_AREAS if lo <= b and hi >= a]
+    if not hits:
+        return bk
+    print(f"\n[!] WARNING: the tune loads at ${lo:04X}-${hi:04X}, which overlaps the memory a")
+    print(f"[!] {bk['type']} background needs ({', '.join(hits)}). The picture would overwrite the tune.")
+    ans = input("Background? [0=PETSCII background instead (recommended), 1=keep the bitmap anyway, "
+                "2=no background] (default 0): ").strip()
+    if ans == "1":
+        return bk
+    if ans == "2":
+        print("[*] Continuing without a background.")
+        return None
+    print("[*] Switching to a PETSCII background.")
+    return bkgd_make_petscii(bk["src"])
+
+def bkgd_make_petscii(src):
+    """The stage 1 PETSCII background from the same picture and settings."""
+    palette = BKGD_PALETTES[src["palette"]]
+    rgb = bkgd_fetch_rgb(src["path"], BKGD_PW, BKGD_PH, src["fit"], palette)
+    if rgb is None:
+        sys.exit(1)
+    chars, cols = bkgd_convert(rgb, palette, src["dither"], src["strength"])
+    if src["wavecol"] == "picture":
+        cols = bytes(11 if ch == 0x20 else co for ch, co in zip(chars, cols))
+    preview = src["preview"]
+    try:
+        bkgd_write_preview(preview, chars, cols, palette)
+        print(f"[*] Background preview saved: {preview}")
+    except OSError as e:
+        print(f"[!] Could not save the background preview: {e}")
+    return {"type": "petscii", "chars": chars, "cols": cols,
+            "wavecol": 1 if src["wavecol"] == "picture" else 0, "src": src}
+
+def bkgd_viz_charset():
+    return {"showfreqs": CHARS_FREQ, "avectorscope": CHARS_SCOPE, "showspectrum": CHARS_SPECTRUM,
+            "ahistogram": CHARS_HIST}.get(VIZ_MODE, CHARS)
+
+def bkgd_viz_chars(raw, color_mode, height):
+    """A visualizer frame as screen codes (for the bitmap modes, which take it all at $C700)."""
+    if VIZ_MODE == "showfreqs":
+        raw = _apply_freq_gradient(raw, color_mode, height=height)
+    cs = bkgd_viz_charset()
+    return bytes(pixel_to_char(p, cs) for p in raw)
+
+def bkgd_upload_bitmap(bk):
+    """Send the bitmap picture and its settings to the PRG, then switch it on."""
+    L = bk["layout"]
+    print("[*] Uploading bitmap background ($A000, $8400, colour RAM)...")
+    write_mem(BM_BITMAP, bk["bitmap"])                   # all of it: rows 0-1 black (shown at the end)
+    write_mem(BM_MATRIX, bk["matrix"])
+    if L["kind"] == 1:
+        c_lo, c_hi = BM_FIRST * 40, 1000
+    else:
+        c_lo, c_hi = L["pic"][0] * 40, (L["pic"][0] + L["pic"][1]) * 40
+    for _ in range(3):                                   # colour RAM 3x, as the rows 2-7 code does
+        write_mem(BM_COLRAM + c_lo, bk["colour"][c_lo:c_hi])
+        time.sleep(0.05)
+    vr0, vrn, vc0, vcn = L["viz"]
+    write_mem(BM_LINE, [L["bm"], L["tx"], 0xD8 if bk["koala"] else 0xC8, 1 if bk["koala"] else 0,
+                        vr0, vrn, vc0, vcn, bk["bg"], L["kind"]])
+    write_byte(BKGD_WCOL, bk["wavecol"])
+    # glyphs for every visualizer, so switching with the keys still draws (8 codes in all)
+    codes = [c for c in dict.fromkeys(CHARS + CHARS_FREQ + CHARS_SCOPE + CHARS_SPECTRUM + CHARS_HIST)
+             if c != 0x20][:32]
+    glmap = bytearray(256)
+    for i, c in enumerate(codes):
+        glmap[c] = i * 8
+    write_mem(BM_GLCODES, bytes(codes) if codes else b"\x00")
+    write_mem(BM_GLMAP, glmap)
+    write_byte(BM_GLCOUNT, len(codes) if L["kind"] == 1 else 0)
+    write_byte(BM_CMD, 1)
+    time.sleep(0.5)                                      # the PRG copies the clean picture (~0.2 s)
+
+def bkgd_halt(bk):
+    """End of a local-audio run: clear the visualizer, then leave the whole picture on screen."""
+    vr0, vrn, vc0, vcn = bk["layout"]["viz"]
+    write_mem(BM_FRAME, [0x20] * (vrn * vcn))
+    write_byte(FRAME_FLAG, 1)
+    time.sleep(1.0)
+    write_byte(BM_STOP, 1)
+    time.sleep(0.2)
+
+def bkgd_setup(args):
+    """Ask about the background picture (anything not given as a flag), convert it and save a
+    preview. Returns a dict ("type" = petscii / koala / hires) or None for no background."""
+    asked = False
+    path = args.background
+    if not path:
+        if args.no_background:
+            return None
+        path = _bkgd_clean_path(input("Background picture? [file path, Enter=none]: "))
+        if not path:
+            return None
+        asked = True
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        print(f"[!] Background picture not found: {path}"); sys.exit(1)
+    ext = os.path.splitext(path)[1].lower()
+    c64file = "koala" if ext in (".kla", ".koa") else "hires" if ext in (".art", ".aas") else None
+    if c64file and bkgd_decode_c64(path, BKGD_PALETTES["palette"]) is None:
+        c64file = None                                   # wrong size: let ffmpeg try it
+
+    btype = args.bkgd_type
+    if not btype:
+        dflt = {"koala": "1", "hires": "2"}.get(c64file, "0")
+        ans = input(f"Background type? [0=PETSCII characters, 1=Koala (multicolour bitmap), 2=hires bitmap] (default {dflt}): ").strip() or dflt
+        btype = {"1": "koala", "2": "hires"}.get(ans, "petscii"); asked = True
+
+    layout, side, size = "behind", None, None
+    if btype != "petscii":
+        layout = args.bkgd_layout or ("split" if args.bkgd_split else None)
+        if not layout:
+            ans = input("Layout? [0=picture behind the visualizer, 1=split screen] (default 0): ").strip()
+            layout = "split" if ans == "1" else "behind"; asked = True
+        if layout == "split":
+            side = args.bkgd_split
+            if not side:
+                ans = input("Picture where? [0=top, 1=bottom, 2=left, 3=right] (default 0): ").strip()
+                side = {"1": "bottom", "2": "left", "3": "right"}.get(ans, "top"); asked = True
+            lr = side in ("left", "right")
+            lo, hi, dflt = (1, WIDTH - 1, 20) if lr else (1, 25 - BM_FIRST - 1, 12)
+            size = args.bkgd_size
+            if size is None:
+                ans = input(f"Picture {'columns' if lr else 'rows'}? [{lo}-{hi}] (default {dflt}): ").strip()
+                size = int(ans) if ans.isdigit() else dflt; asked = True
+            size = max(lo, min(hi, size))
+
+    scale = "rescale"
+    if c64file and c64file == btype:
+        scale = args.bkgd_scale
+        if not scale:
+            ans = input("The picture is a C64 file: [0=crop to fit (pixels unchanged), 1=rescale to fit] (default 0): ").strip()
+            scale = "rescale" if ans == "1" else "crop"; asked = True
+
+    fit, dither, strength, pal_name = "fill", "4x4", 50, "palette"
+    if scale == "rescale":
+        fit = args.bkgd_fit
+        if not fit:
+            ans = input("Background fit? [0=fill (edges cut off), 1=fit (black bars), 2=stretch] (default 0): ").strip()
+            fit = {"1": "fit", "2": "stretch"}.get(ans, "fill"); asked = True
+        dither = args.bkgd_dither
+        if not dither:
+            ans = input("Background dither? [0=none, 1=Bayer 2x2, 2=Bayer 4x4, 3=Bayer 8x8] (default 2): ").strip()
+            dither = {"0": "none", "1": "2x2", "3": "8x8"}.get(ans, "4x4"); asked = True
+        strength = args.bkgd_strength
+        if strength is None:
+            strength = 50
+            if dither != "none":
+                ans = input("Dither strength? [0-100] (default 50): ").strip()
+                if ans.isdigit(): strength = int(ans)
+                asked = True
+        pal_name = args.bkgd_palette
+        if not pal_name:
+            ans = input("Background palette? [0=PALette, 1=Colodore, 2=Pepto, 3=DeeKay] (default 0): ").strip()
+            pal_name = {"1": "colodore", "2": "pepto", "3": "deekay"}.get(ans, "palette"); asked = True
+
+    wavecol = "mode"
+    if layout == "behind":
+        wavecol = args.bkgd_wavecolor
+        if not wavecol:
+            ans = input("Visualizer colours over the picture? [0=the colour mode, 1=the picture's colours] (default 0): ").strip()
+            wavecol = "picture" if ans == "1" else "mode"; asked = True
+
+    stem = re.sub(r"\s+", "-", os.path.splitext(os.path.basename(path))[0])
+    preview = os.path.join(os.path.dirname(os.path.abspath(path)), stem + "-c64-preview.png")
+    src = {"path": path, "fit": fit if scale == "rescale" else "fit", "dither": dither, "strength": strength,
+           "palette": pal_name, "wavecol": wavecol, "preview": preview}
+    desc = (f"{btype}" + (f", {layout}" if btype != "petscii" else "")
+            + (f" ({side}, {size} {'columns' if side in ('left', 'right') else 'rows'})" if layout == "split" else "")
+            + (", cropped" if scale == "crop" else f", {fit}, dither {dither}{'' if dither == 'none' else ' ' + str(strength)}, {pal_name}")
+            + (f", visualizer colours: {wavecol}" if layout == "behind" else ""))
+    print(f"[*] Background: {os.path.basename(path)}  ({desc})")
+
+    if btype == "petscii":
+        bk = bkgd_make_petscii(src)
+    else:
+        koala = btype == "koala"
+        palette = BKGD_PALETTES[pal_name]
+        L = bkgd_layout(layout, side, size)
+        r0, rn, c0, cn = L["pic"]
+        if scale == "crop":
+            cells, bg = bkgd_crop_c64(path, rn, cn, koala)
+        else:
+            w, h = (4 if koala else 8) * cn, 8 * rn
+            rgb = bkgd_fetch_rgb(path, w, h, fit, palette, par=BKGD_PAR * (2 if koala else 1))
+            if rgb is None:
+                sys.exit(1)
+            print("[*] Converting the picture...")
+            cells, bg = bkgd_conv_bitmap(rgb, w, h, palette, dither, strength, koala)
+        bitmap, matrix, colour = bkgd_place(cells, bg, L, koala)
+        bk = {"type": btype, "koala": koala, "bitmap": bytes(bitmap), "matrix": bytes(matrix),
+              "colour": bytes(colour), "bg": bg, "layout": L,
+              "wavecol": 1 if wavecol == "picture" else 0, "src": src}
+        try:
+            _bkgd_png(preview, 320, 200, bkgd_render(bitmap, matrix, colour, bg, koala, palette))
+            print(f"[*] Background preview saved: {preview}")
+        except OSError as e:
+            print(f"[!] Could not save the background preview: {e}")
+    if asked:
+        ans = input("Use this background? [Y/n]: ").strip().lower()
+        if ans in ("n", "no"):
+            print("[*] Continuing without a background.")
+            return None
+    return bk
+
+def bkgd_top(bk, top_screen, mode_col):
+    """Rows 2-7 with the picture behind: (screen codes, colours)."""
+    chars, cols = bytearray(top_screen), bytearray(len(top_screen))
+    for i, c in enumerate(top_screen):
+        if c == 0x20:
+            chars[i] = bk["chars"][i]; cols[i] = bk["cols"][i]
+        else:
+            cols[i] = bk["cols"][i] if bk["wavecol"] else mode_col
+    return bytes(chars), bytes(cols)
+
 def main():
-    global U64, FPS, VIZ_MODE, _YTDLP_COOKIE_ARGS  # noqa: PLW0603
+    global U64, FPS, VIZ_MODE, VIZ_W, LEDS, _YTDLP_COOKIE_ARGS, ENGINE, ENGINE_ANSWERS  # noqa: PLW0603
+
+    def _kill_proc(p):
+        if p is None:
+            return
+        try:
+            p.kill()
+        except Exception:
+            pass
+        try:
+            p.wait(timeout=2.0)
+        except Exception:
+            pass
 
     args = parse_args()
+
+    if args.camera and args.background:
+        print("[!] --background is not used in camera mode; ignoring it.")
 
     if args.cookies_from_browser:
         _YTDLP_COOKIE_ARGS = ["--cookies-from-browser", args.cookies_from_browser]
     elif args.cookies:
         _YTDLP_COOKIE_ARGS = ["--cookies", args.cookies]
 
+    if args.engine:
+        import builtins
+        ENGINE = True
+        try:
+            ENGINE_ANSWERS = {question_key(k): v for k, v in json.loads(args.answers or "{}").items()}
+        except ValueError as e:
+            emit("error", message=f"--answers is not valid JSON: {e}"); sys.exit(2)
+        builtins.input = _engine_input
+        emit("hello", version=VERSION, build=BUILD)
+
     if args.version:
         print(f"sidviz_u64  v{VERSION}  build {BUILD}")
         sys.exit(0)
+
+    if args.save_reu or args.play_reu:
+        U64 = f"http://{args.ip}"
+        if args.save_reu:
+            ok = save_reu(args)
+        elif args.file and args.file.lower().endswith(".reu"):
+            ok = send_reu(os.path.expanduser(args.file))
+        else:
+            print("[!] --play-reu needs a .reu file (or use it with --save-reu)"); ok = False
+        sys.exit(0 if ok else 1)
+
+    if args.save_d64:
+        if not args.file:
+            print("[!] --save-d64 requires a .sid file argument")
+            sys.exit(1)
+        sid_path = os.path.expanduser(args.file)
+        if not os.path.isfile(sid_path):
+            print(f"[!] File not found: {sid_path}")
+            sys.exit(1)
+        d64_viz = args.d64_viz
+        if d64_viz is None:
+            ans = input("Visualization? [0=waveform, 1=spectrum, 2=scope, 3=spectrogram, 4=histogram] (default 0): ").strip()
+            d64_viz = {"1":"showfreqs","2":"avectorscope","3":"showspectrum","4":"ahistogram"}.get(ans, "showwaves")
+        d64_color = args.d64_color
+        if d64_color is None:
+            ans = input("Color mode? [0=rainbow, 1=white, 2=fire] (default 0): ").strip()
+            d64_color = int(ans) if ans in ("0","1","2") else 0
+        ok = save_to_d64(
+            sid_path,
+            args.save_d64,
+            fps=args.d64_fps,
+            viz=d64_viz,
+            color_mode=d64_color,
+            duration=args.d64_duration,
+        )
+        sys.exit(0 if ok else 1)
 
     if args.list_cameras:
         if sys.platform == "darwin":
@@ -1006,6 +2741,31 @@ def main():
                 }.get(ans)
             if blend_viz_mode:
                 print(f"[*] Blend viz: {blend_viz_mode}")
+
+        # --- Viz color (only meaningful in blend mode) ---
+        if blend_viz_mode:
+            if args.color:      viz_color_mode_init = 0
+            elif args.no_color: viz_color_mode_init = 1
+            else:
+                ans = input("Viz color mode? [0=rainbow, 1=white, 2=fire] (default 2): ").strip()
+                viz_color_mode_init = int(ans) if ans in ("0","1","2") else 2
+        else:
+            viz_color_mode_init = 2
+
+        # --- Color lookup tables for per-pixel dual-color blend ---
+        _cam_wlut, _cam_flut = _build_color_luts(CHARS_CAMERA_DEF)
+        if blend_viz_mode:
+            _viz_chars_def = {
+                "showwaves":    CHARS_DEF,
+                "showfreqs":    CHARS_FREQ_DEF,
+                "avectorscope": CHARS_SCOPE_DEF,
+                "showspectrum": CHARS_SPECTRUM_DEF,
+                "ahistogram":   CHARS_HIST_DEF,
+            }.get(blend_viz_mode, CHARS_DEF)
+            _viz_chars = [t[0] for t in _viz_chars_def]
+            _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
+        else:
+            _viz_chars, _viz_wlut, _viz_flut = None, {}, {}
 
         # --- Audio mode detection ---
         audio_mode        = None
@@ -1117,7 +2877,10 @@ def main():
             write_byte(0xDC0E, 0x11)
 
         _cflag_map = {0: 2, 1: 1, 2: 3}
-        write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
+        if blend_viz_mode:
+            write_byte(COLOR_FLAG, 5)  # manual mode — Python writes color RAM per-pixel
+        else:
+            write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
         send_ticker(ticker_str)
 
         # --- Camera display dimensions (needed by viz ffmpeg start calls below) ---
@@ -1132,6 +2895,8 @@ def main():
         ffplay_proc    = None
         yt_audio_proc  = None
         viz_ffmpeg_proc = None
+        sid_fifo_proc  = None
+        yt_viz_proc    = None
         sid_end_time   = (time.time() + sid_duration_secs) if sid_duration_secs else None
 
         if audio_mode == "sid":
@@ -1205,18 +2970,14 @@ def main():
         # --- Camera display area ---
         _cam_ext_scr  = 0x0400 + 2 * WIDTH                     # $0450 (row 2)
         _cam_ext_col  = 0xD800 + 2 * WIDTH                     # $D850 (row 2 color RAM)
-        _CAM_RTAB     = [2,2,8,8,7,7,7,7,5,5,5,5,13,13,14,14,
-                         6,6,6,6,4,4,4,4,10,10,2,2,8,8,7,7,
-                         5,5,13,13,14,14,6,6]
-
-        def _top_colors(cmode):
+        def _top_colors(cmode, screen=None):
             """6-row rainbow/density color stripe for rows 2-7."""
             if cmode == 0:
-                return bytes(_CAM_RTAB[col] for _ in range(6) for col in range(WIDTH))
-            elif cmode == 1:
-                return bytes([1] * 6 * WIDTH)   # all white
-            else:
-                return bytes([8] * 6 * WIDTH)   # all orange (fire mid-tone)
+                return bytes(RAINBOW_TAB[col] for _ in range(6) for col in range(WIDTH))
+            lut, default = (_cam_wlut, 1) if cmode == 1 else (_cam_flut, 8)
+            if screen is None:
+                return [default] * (6 * WIDTH)
+            return bytes(lut.get(sc, default) for sc in screen)
 
         # --- Start camera ---
         cam_proc = start_ffmpeg_camera(camera_device, height=cam_height)
@@ -1245,6 +3006,86 @@ def main():
                 write_mem(_cam_ext_col, _top_colors(color_mode_init))
                 time.sleep(0.05)
         print("[*] Camera zone cleared.")
+
+        petscii_recorder  = None
+        petscii_queue     = None
+        petscii_thread    = None
+        yt_petscii_audio  = None
+        _prec_ticker_petscii = None
+        _prec_ticker_t0   = None
+        _prec_tmp_video   = None
+        _prec_tmp_audio   = None
+        if args.save_petscii:
+            _prec_ticker_petscii = bytes(ascii_to_petscii(ticker_str))[:253] or b'\x20'
+            _prec_ticker_t0 = time.time()
+            _prec_audio_src = None
+            if audio_mode == "audio" and filepath and not is_url(filepath):
+                # Local file: pass audio directly to ffmpeg (no timing issues)
+                _prec_audio_src = filepath
+                _rec_dst = args.save_petscii
+            elif audio_mode == "stream":
+                # Stream: download audio to temp file; mux after recording ends.
+                # Avoids the fast-download / muxer-interleave problem that cut
+                # video short when audio was piped directly into ffmpeg.
+                _prec_tmp_video = args.save_petscii + ".video.tmp"
+                _prec_tmp_audio = args.save_petscii + ".audio.tmp.m4a"
+                yt_petscii_audio = subprocess.Popen(
+                    ["yt-dlp", "-f", "bestaudio/best", "-o", _prec_tmp_audio,
+                     "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [stream_url],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _rec_dst = _prec_tmp_video
+            else:
+                _rec_dst = args.save_petscii
+            petscii_recorder = start_petscii_recorder(
+                _rec_dst, WIDTH, 25,  # 25 rows = full C64 screen (640×400)
+                audio_source=_prec_audio_src)
+            petscii_queue = queue.Queue(maxsize=10)
+            def _petscii_worker():
+                # Write at a fixed wall-clock rate (FPS), repeating the last
+                # frame when no new one is available.  This decouples recording
+                # duration from the HTTP-limited main-loop frame rate.
+                interval   = 1.0 / FPS
+                last_item  = None
+                next_write = time.monotonic()
+                while True:
+                    wait = next_write - time.monotonic()
+                    if wait > 0:
+                        try:
+                            item = petscii_queue.get(timeout=wait)
+                            if item is None:
+                                break
+                            last_item = item
+                            # Drain any extras, keep only the latest
+                            while True:
+                                try:
+                                    i2 = petscii_queue.get_nowait()
+                                    if i2 is None:
+                                        if last_item is not None:
+                                            sc, col = last_item
+                                            try:
+                                                petscii_recorder.stdin.write(
+                                                    _render_petscii_frame(sc, col, WIDTH, 25, block=_REC_BLOCK))
+                                            except Exception:
+                                                pass
+                                        return
+                                    last_item = i2
+                                except queue.Empty:
+                                    break
+                            continue  # re-check next_write
+                        except queue.Empty:
+                            pass  # timed out → fall through to write
+                    if last_item is not None:
+                        sc, col = last_item
+                        try:
+                            petscii_recorder.stdin.write(
+                                _render_petscii_frame(sc, col, WIDTH, 25, block=_REC_BLOCK))
+                        except Exception:
+                            break
+                    next_write += interval
+                    if time.monotonic() > next_write + interval:
+                        next_write = time.monotonic()  # reset if too far behind
+            petscii_thread = threading.Thread(target=_petscii_worker, daemon=True)
+            petscii_thread.start()
 
         # Background thread keeps the latest viz frame for blending (17-row)
         last_viz_frame = bytearray(viz_frame_size)
@@ -1298,7 +3139,16 @@ def main():
                 except Exception:
                     break
 
-        state   = {"color_mode": color_mode_init, "color_pending": False, "quit": False}
+        _blend_capable = blend_viz_mode is not None  # True if started with blend; never changes
+        VIZ_MODE = blend_viz_mode if blend_viz_mode else "none"  # sync for w-key cycling
+
+        state   = {
+            "cam_color":     color_mode_init,
+            "viz_color":     viz_color_mode_init,
+            "color_pending": False,
+            "viz_pending":   None,
+            "quit":          False,
+        }
         kthread = make_keypress_listener(state)
         kthread.start()
 
@@ -1311,7 +3161,11 @@ def main():
 
         frame_num = 0
         blend_tag = f"+{blend_viz_mode}" if blend_viz_mode else ""
-        print(f"[*] Camera{blend_tag} streaming to C64 at {FPS}fps -- [c] color, [q] quit\n")
+        if blend_viz_mode:
+            controls = "[c] cam-color, [v] viz-color, [w/0-5] viz, [q] quit"
+        else:
+            controls = "[c] color, [q] quit"
+        print(f"[*] Camera{blend_tag} streaming to C64 at {FPS}fps\n    {controls}\n")
 
         # Streams need time to buffer; don't declare "Song ended" until this many
         # seconds have elapsed — prevents false early-exit if yt-dlp is slow to start.
@@ -1364,13 +3218,83 @@ def main():
                     if verr:
                         print(f"[!] ffmpeg viz: {verr[:300]}")
                     viz_ffmpeg_proc = None  # suppress further checks
+                    # Revert C64 to single-color mode (camera color)
+                    write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                    if cam_ext_rows:
+                        write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
 
                 if state["color_pending"]:
                     state["color_pending"] = False
-                    write_byte(COLOR_FLAG, _cflag_map[state["color_mode"]])
-                    if cam_ext_rows:
-                        # Update rows 2-7 static colors to match new mode
-                        write_mem(_cam_ext_col, _top_colors(state["color_mode"]))
+                    if not viz_ffmpeg_proc:
+                        # Non-blend: let C64 IRQ handle color RAM
+                        write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                        if cam_ext_rows:
+                            write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+
+                if state["viz_pending"] is not None and _blend_capable:
+                    new_viz = state["viz_pending"]
+                    state["viz_pending"] = None
+                    _cur_blend = blend_viz_mode or "none"
+                    if new_viz != _cur_blend:
+                        sys.stdout.write(
+                            f"\r\n[*] Switching viz: {VIZ_LABELS.get(_cur_blend, _cur_blend)}"
+                            f" -> {VIZ_LABELS.get(new_viz, new_viz)}\r\n")
+                        sys.stdout.flush()
+
+                        if viz_ffmpeg_proc is not None:
+                            _old_viz = viz_ffmpeg_proc
+                            _kill_proc(_old_viz)
+                            try: _old_viz.stdout.close()
+                            except: pass
+                            time.sleep(0.1)  # let _read_viz thread see EOF and exit
+
+                        if new_viz == "none":
+                            viz_ffmpeg_proc = None
+                            blend_viz_mode  = None
+                            VIZ_MODE        = "none"
+                            write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                            if cam_ext_rows:
+                                write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+                        else:
+                            blend_viz_mode = new_viz
+                            VIZ_MODE = new_viz  # _build_viz_filter() reads this; stays set
+                            _viz_chars_def = {
+                                "showwaves":    CHARS_DEF,
+                                "showfreqs":    CHARS_FREQ_DEF,
+                                "avectorscope": CHARS_SCOPE_DEF,
+                                "showspectrum": CHARS_SPECTRUM_DEF,
+                            }.get(blend_viz_mode, CHARS_HIST_DEF)
+                            _viz_chars = [t[0] for t in _viz_chars_def]
+                            _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
+
+                            if audio_mode == "sid":
+                                _kill_proc(sid_fifo_proc)
+                                make_fifo(FIFO_PATH)
+                                viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(
+                                    realtime=True, height=cam_height)
+                                time.sleep(0.3)
+                                sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
+                            elif audio_mode == "stream":
+                                _kill_proc(yt_viz_proc)
+                                yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(
+                                    stream_url, height=cam_height)
+                            else:
+                                viz_ffmpeg_proc = start_ffmpeg_waveform_file(
+                                    filepath, height=cam_height)
+
+                            write_byte(COLOR_FLAG, 5)  # re-enable per-pixel color mode
+                            threading.Thread(target=_read_viz, daemon=True).start()
+
+                            time.sleep(0.1)
+                            if viz_ffmpeg_proc.poll() is not None:
+                                try:
+                                    err = viz_ffmpeg_proc.stderr.read(512).decode(
+                                        errors="replace").strip()
+                                except Exception:
+                                    err = ""
+                                sys.stdout.write(
+                                    f"\r\n[!] New viz ffmpeg exited immediately: {err}\r\n")
+                                sys.stdout.flush()
 
                 with cam_frame_lock:
                     raw = latest_cam_frame[0]
@@ -1394,11 +3318,36 @@ def main():
                         vz_bot = last_viz_frame[cam_ext_rows * WIDTH:]
                     blended_top = bytes(max(c, v) for c, v in zip(top_raw, vz_top)) if top_raw else b""
                     blended_bot = bytes(max(c, v) for c, v in zip(bot_raw, vz_bot))
+
+                    # Per-pixel color: camera color when cam wins, viz color when viz wins
+                    cam_cmode = state["cam_color"]
+                    viz_cmode = state["viz_color"]
+                    if cam_ext_rows:
+                        color_top = bytearray(cam_ext_rows * WIDTH)
+                        for i in range(cam_ext_rows * WIDTH):
+                            col_x = i % WIDTH
+                            cp, vp = top_raw[i], vz_top[i]
+                            if cp >= vp:
+                                color_top[i] = _pixel_color(cp, CHARS_CAMERA, cam_cmode, col_x,
+                                                            _cam_wlut, _cam_flut, RAINBOW_TAB)
+                            else:
+                                color_top[i] = _pixel_color(vp, _viz_chars, viz_cmode, col_x,
+                                                            _viz_wlut, _viz_flut, RAINBOW_TAB)
+                    color_bot = bytearray(HEIGHT * WIDTH)
+                    for i in range(HEIGHT * WIDTH):
+                        col_x = i % WIDTH
+                        cp, vp = bot_raw[i], vz_bot[i]
+                        if cp >= vp:
+                            color_bot[i] = _pixel_color(cp, CHARS_CAMERA, cam_cmode, col_x,
+                                                        _cam_wlut, _cam_flut, RAINBOW_TAB)
+                        else:
+                            color_bot[i] = _pixel_color(vp, _viz_chars, viz_cmode, col_x,
+                                                        _viz_wlut, _viz_flut, RAINBOW_TAB)
                 else:
                     blended_top = top_raw
                     blended_bot = bot_raw
 
-                # Bottom rows (8-24): write via frame buffer path
+                # Bottom rows (8-24): write screen chars via frame buffer path
                 bot_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended_bot)
                 write_mem(FRAME_BUF, bot_screen)
                 write_byte(FRAME_FLAG, 1)
@@ -1407,19 +3356,84 @@ def main():
                 if blended_top:
                     top_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended_top)
                     write_mem(_cam_ext_scr, top_screen)
-                    write_mem(_cam_ext_col, _top_colors(state["color_mode"]))
+                    if viz_ffmpeg_proc:
+                        write_mem(_cam_ext_col, color_top)
+                    else:
+                        write_mem(_cam_ext_col, _top_colors(state["cam_color"], top_screen))
+
+                # Bottom rows color RAM: Python writes directly in blend mode
+                if viz_ffmpeg_proc:
+                    write_mem(WAVE_COL_ADDR, color_bot)
+
+                if petscii_queue is not None:
+                    # Rows 2-7 screen codes (already computed for C64 write above)
+                    sc_top = top_screen if cam_ext_rows else bytes([0x20] * 6 * WIDTH)
+                    sc_bot = bot_screen
+                    if viz_ffmpeg_proc:
+                        col_top = bytes(color_top) if cam_ext_rows else bytes([0] * 6 * WIDTH)
+                        col_bot = bytes(color_bot)
+                    else:
+                        cmode = state["cam_color"]
+                        col_top = bytes(_screen_code_color(sc_top[i], cmode, i % WIDTH,
+                                        _cam_wlut, _cam_flut, RAINBOW_TAB) for i in range(len(sc_top)))
+                        col_bot = bytes(_screen_code_color(sc_bot[i], cmode, i % WIDTH,
+                                        _cam_wlut, _cam_flut, RAINBOW_TAB) for i in range(len(sc_bot)))
+                    # Ticker simulation: advance at 50Hz / SCROLL_RATE chars per second
+                    _tlen = len(_prec_ticker_petscii)
+                    _tpos = int((time.time() - _prec_ticker_t0) * 50.0 / SCROLL_RATE) % _tlen
+                    ticker_sc  = bytes(_prec_ticker_petscii[(_tpos + i) % _tlen] for i in range(WIDTH))
+                    ticker_col = bytes([13] * WIDTH)   # light green
+                    # Assemble all 25 rows: row0 (black) + row1 (ticker) + rows2-7 + rows8-24
+                    all_sc  = bytes([0x20] * WIDTH) + ticker_sc  + sc_top  + sc_bot
+                    all_col = bytes([0]    * WIDTH) + ticker_col + col_top + col_bot
+                    try:
+                        petscii_queue.put_nowait((all_sc, all_col))
+                    except queue.Full:
+                        pass   # drop frame if renderer is behind; main loop must not block
 
                 frame_num += 1
-                ind = ["R","W","F"][state["color_mode"]]
+                if blend_viz_mode and viz_ffmpeg_proc:
+                    cam_ind = ["R","W","F"][state["cam_color"]]
+                    viz_ind = ["R","W","F"][state["viz_color"]]
+                    ind = f"cam:{cam_ind} viz:{viz_ind}"
+                else:
+                    ind = ["R","W","F"][state["cam_color"]]
                 vfc = viz_frame_count[0] if viz_ffmpeg_proc else -1
                 vsuf = f" viz={vfc:05d}" if vfc >= 0 else ""
                 tsuf = f" top={len(top_raw)}" if cam_ext_rows else ""
-                print(f"\r[*] Frame {frame_num:05d} [{ind}]{vsuf}{tsuf}", end="", flush=True)
+                show_frame(frame_num, f"[*] Frame {frame_num:05d} [{ind}]{vsuf}{tsuf}")
 
         except KeyboardInterrupt:
             print("\r\n[*] Interrupted.")
         finally:
             state["quit"] = True
+            if petscii_queue is not None:
+                petscii_queue.put(None)
+                if petscii_thread is not None:
+                    petscii_thread.join(timeout=60)
+            if petscii_recorder is not None:
+                try:
+                    petscii_recorder.stdin.close()
+                    petscii_recorder.wait(timeout=120)
+                except Exception:
+                    try: petscii_recorder.kill()
+                    except Exception: pass
+            if _prec_tmp_video and _prec_tmp_audio:
+                if yt_petscii_audio is not None:
+                    try: yt_petscii_audio.wait(timeout=60)
+                    except Exception: pass
+                print("\r\n[*] Muxing PETSCII audio+video...")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", _prec_tmp_video, "-i", _prec_tmp_audio,
+                     "-c:v", "copy", "-c:a", "aac", "-shortest", args.save_petscii],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for _f in (_prec_tmp_video, _prec_tmp_audio):
+                    try: os.unlink(_f)
+                    except Exception: pass
+            elif yt_petscii_audio is not None:
+                try: yt_petscii_audio.terminate(); yt_petscii_audio.wait(timeout=3)
+                except Exception: pass
+            print("\r\n[*] PETSCII recording saved.")
             if c64_audio:
                 write_byte(C64_AUDIO_FLAG, 0)
                 time.sleep(0.04)
@@ -1448,6 +3462,699 @@ def main():
             _stop(cam_proc)
             for p in procs:
                 _stop(p)
+            try: os.remove(FIFO_PATH)
+            except: pass
+            if "_term_fd" in state and "_term_old" in state:
+                try:
+                    termios.tcsetattr(state["_term_fd"], termios.TCSADRAIN, state["_term_old"])
+                except Exception:
+                    pass
+            print("[*] Done.")
+        return
+
+    # -------------------------------------------------------------------------
+    # Video mode: video file or URL displayed as PETSCII art on C64
+    # -------------------------------------------------------------------------
+    _video_file = (args.file and not is_url(args.file) and
+                   os.path.splitext(args.file)[1].lower() in VIDEO_EXTS)
+    if args.video or _video_file:
+        U64 = f"http://{args.ip}"
+        FPS = args.fps
+        VIZ_MODE = "camera"
+
+        # --- Resolve filepath ---
+        if args.yt_search:
+            query = args.yt_search.strip()
+            if not query:
+                print("[!] --yt-search requires a non-empty query"); sys.exit(1)
+            print(f"[*] Searching YouTube: {query} (max {args.yt_max})")
+            candidates = youtube_search(query, args.yt_max)
+            if not candidates:
+                print("[!] No YouTube results found"); sys.exit(1)
+            chosen = choose_youtube_result(candidates)
+            if not chosen:
+                print("[*] Search cancelled."); sys.exit(0)
+            filepath = chosen
+            _yt_chosen = next((c for c in candidates if c["url"] == chosen), None)
+        else:
+            _yt_chosen = None
+            filepath = os.path.expanduser(args.file) if args.file else \
+                       os.path.expanduser(input("Video file or URL: ").strip())
+
+        if not is_url(filepath) and not os.path.isfile(filepath):
+            print(f"[!] File not found: {filepath}"); sys.exit(1)
+
+        stream_url = filepath
+
+        # --- Replacement audio (--replace-audio): a .sid or any audio file ffmpeg plays ---
+        ra_path = args.replace_audio if args.replace_audio is not None else \
+                  input("Replace the video's audio? [.sid/.mp3 file, Enter=keep]: ").strip()
+        ra_path = os.path.expanduser(ra_path) if ra_path else None
+        ra_sid, ra_c64, ra_psid, ra_dur = False, False, None, None
+        if ra_path:
+            if not os.path.isfile(ra_path):
+                print(f"[!] File not found: {ra_path}"); sys.exit(1)
+            ra_sid = detect_mode(ra_path) == "sid"
+            if ra_sid:
+                if args.c64audio:   ra_c64 = True
+                elif args.macaudio: ra_c64 = False
+                else:
+                    ans = input("Audio output? [m=local/sidplayfp (default), c=C64]: ").strip().lower()
+                    ra_c64 = ans in ("c", "c64")
+                print(f"[*] SID audio: {'C64 hardware (PSID player)' if ra_c64 else 'local (sidplayfp)'}")
+                if ra_c64:
+                    ra_psid = parse_psid(ra_path)
+                    if not ra_psid:
+                        print("[!] PSID parse failed, falling back to local audio")
+                        ra_c64 = False
+                if ra_c64:
+                    _ow = _psid_row_overlap(ra_path)
+                    if _ow:
+                        print(f"\n[!] WARNING: SID binary {_ow}.")
+                        print("[!] The video will still write rows 2-7, but those rows may show")
+                        print("[!] SID driver bytes rendered as PETSCII artifacts.")
+                        if input("Continue anyway? [y/N]: ").strip().lower() != "y":
+                            print("[*] Aborted."); sys.exit(0)
+            else:
+                # C64U LEDs: asked for anything that isn't a .sid
+                ans = input("Flash the C64U's LEDs with the music? [y/N]: ").strip().lower()
+                LEDS = ans in ("y", "yes")
+                if LEDS:
+                    print("[*] LEDs: a silent fake SID at $D400 follows the music.")
+            print(f"[*] Video audio replaced by: {os.path.basename(ra_path)}  (the video loops until it ends)")
+        ra_kind = "sid" if ra_sid else "audio"
+
+        # --- Color mode ---
+        if args.color:      color_mode_init = 0
+        elif args.no_color: color_mode_init = 1
+        else:
+            ans = input("Color mode? [0=rainbow, 1=white, 2=fire] (default 0): ").strip()
+            color_mode_init = int(ans) if ans in ("0","1","2") else 0
+
+        src_label = os.path.basename(filepath) if not is_url(filepath) else filepath
+        print(f"[*] Viz mode: video  source: {src_label}")
+
+        # --- Blend viz overlay ---
+        blend_viz_mode = None
+        if args.showwaves:      blend_viz_mode = "showwaves"
+        elif args.showfreqs:    blend_viz_mode = "showfreqs"
+        elif args.avectorscope: blend_viz_mode = "avectorscope"
+        elif args.showspectrum: blend_viz_mode = "showspectrum"
+        elif args.ahistogram:   blend_viz_mode = "ahistogram"
+        else:
+            ans = input(
+                "Blend audio viz? [0=none, 1=waveform, 2=spectrum, 3=scope, "
+                "4=spectrogram, 5=histogram] (default 0): "
+            ).strip()
+            blend_viz_mode = {
+                "1": "showwaves", "2": "showfreqs", "3": "avectorscope",
+                "4": "showspectrum", "5": "ahistogram",
+            }.get(ans)
+        if blend_viz_mode:
+            print(f"[*] Blend viz: {blend_viz_mode}")
+
+        # --- Viz color (blend mode only) ---
+        if blend_viz_mode:
+            if args.color:      viz_color_mode_init = 0
+            elif args.no_color: viz_color_mode_init = 1
+            else:
+                ans = input("Viz color mode? [0=rainbow, 1=white, 2=fire] (default 2): ").strip()
+                viz_color_mode_init = int(ans) if ans in ("0","1","2") else 2
+        else:
+            viz_color_mode_init = 2
+
+        # --- Color lookup tables for per-pixel dual-color blend ---
+        _cam_wlut, _cam_flut = _build_color_luts(CHARS_CAMERA_DEF)
+        if blend_viz_mode:
+            _viz_chars_def = {
+                "showwaves":    CHARS_DEF,
+                "showfreqs":    CHARS_FREQ_DEF,
+                "avectorscope": CHARS_SCOPE_DEF,
+                "showspectrum": CHARS_SPECTRUM_DEF,
+                "ahistogram":   CHARS_HIST_DEF,
+            }.get(blend_viz_mode, CHARS_DEF)
+            _viz_chars = [t[0] for t in _viz_chars_def]
+            _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
+        else:
+            _viz_chars, _viz_wlut, _viz_flut = None, {}, {}
+
+        # --- Metadata and ticker ---
+        info = {}
+        if ra_path:
+            info = get_sid_info(ra_path) if ra_sid else get_audio_info(ra_path)
+            raw_len = info.get("Song Length", "") if ra_sid else ""
+            if raw_len:
+                try:
+                    parts = raw_len.split(".")[0].split(":")
+                    ra_dur = int(parts[0]) * 60 + int(parts[1])
+                    print(f"[*] SID duration: {raw_len} = {ra_dur}s")
+                except Exception:
+                    pass
+        elif is_url(filepath):
+            info = get_stream_info(filepath) or {}
+            if not info and _yt_chosen:
+                info = {
+                    "Title":    _yt_chosen.get("title", ""),
+                    "Artist":   _yt_chosen.get("uploader", ""),
+                    "Duration": _yt_chosen.get("duration", ""),
+                }
+        else:
+            info = get_audio_info(filepath)
+        show_info_header(info, ra_kind, ra_path or filepath)
+        ticker_str = build_ticker_string(info, ra_kind)
+        if not ticker_str.strip("* "):
+            ticker_str = f"{src_label}   *   SIDVIZ U64 V{VERSION}        "
+
+        # --- Reboot + upload PRG ---
+        if not smoke_test(): sys.exit(1)
+        print("[*] Rebooting C64...")
+        u64_put("machine:reboot")
+        time.sleep(4.0)
+        print(f"[*] Uploading {PRG_REMOTE}...")
+        if not ftp_upload(PRG_LOCAL, PRG_REMOTE): sys.exit(1)
+        print(f"[*] Running {PRG_REMOTE}...")
+        if not run_prg_from_temp(PRG_REMOTE): sys.exit(1)
+        if ra_c64:
+            print("[*] Signalling C64 audio mode to PRG ($C002=1)...")
+            write_byte(C64_AUDIO_FLAG, 1)
+
+        time.sleep(1.0)
+        write_color_tables()
+        if ra_c64:
+            if ra_psid.get("clock") == 2:     # NTSC-only: 60Hz
+                write_mem(0xDC04, [0x95, 0x42])
+            else:                             # PAL / unknown / both: 50Hz
+                write_mem(0xDC04, [0xF8, 0x4C])
+            write_byte(0xDC0E, 0x11)
+        if LEDS:
+            write_mem(LED_SID, [0] * 0x19)    # SID silent (volume 0), all voices off
+
+        _cflag_map = {0: 2, 1: 1, 2: 3}
+        if blend_viz_mode:
+            write_byte(COLOR_FLAG, 5)
+        else:
+            write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
+        send_ticker(ticker_str)
+
+        # --- Display dimensions (always full 23 rows for video) ---
+        cam_ext_rows   = 6
+        cam_height     = HEIGHT + cam_ext_rows   # 23 rows (rows 2-24)
+        cam_frame_size = WIDTH * cam_height      # 920
+        viz_frame_size = WIDTH * cam_height
+
+        _cam_ext_scr = 0x0400 + 2 * WIDTH       # $0450 row 2 screen RAM
+        _cam_ext_col = 0xD800 + 2 * WIDTH       # $D850 row 2 color RAM
+        def _top_colors(cmode, screen=None):
+            if cmode == 0:
+                return bytes(RAINBOW_TAB[col] for _ in range(6) for col in range(WIDTH))
+            lut, default = (_cam_wlut, 1) if cmode == 1 else (_cam_flut, 8)
+            if screen is None:
+                return [default] * (6 * WIDTH)
+            return bytes(lut.get(sc, default) for sc in screen)
+
+        # --- Clear display area ---
+        write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
+        write_mem(0x0540,    [0x20] * (WIDTH * HEIGHT))
+        write_byte(FRAME_FLAG, 1)
+        write_mem(_cam_ext_scr, [0x20] * (cam_ext_rows * WIDTH))
+        for _ in range(3):
+            write_mem(_cam_ext_col, _top_colors(color_mode_init))
+            time.sleep(0.05)
+        print("[*] Video zone cleared.")
+
+        petscii_recorder  = None
+        petscii_queue     = None
+        petscii_thread    = None
+        yt_petscii_audio  = None
+        _prec_ticker_petscii = None
+        _prec_ticker_t0   = None
+        _prec_tmp_video   = None
+        _prec_tmp_audio   = None
+        if args.save_petscii:
+            _prec_ticker_petscii = bytes(ascii_to_petscii(ticker_str))[:253] or b'\x20'
+            _prec_ticker_t0 = time.time()
+            _prec_audio_src = None
+            if ra_path and ra_sid:
+                # the SID is rendered for exactly the time played, then muxed in at the end
+                _prec_tmp_video = args.save_petscii + ".video.tmp.mp4"
+                _prec_tmp_audio = args.save_petscii + ".sid.tmp.wav"
+                _rec_dst = _prec_tmp_video
+            elif ra_path:
+                _prec_audio_src = ra_path
+                _rec_dst = args.save_petscii
+            elif not is_url(filepath):
+                _prec_audio_src = filepath
+                _rec_dst = args.save_petscii
+            else:
+                _prec_tmp_video = args.save_petscii + ".video.tmp"
+                _prec_tmp_audio = args.save_petscii + ".audio.tmp.m4a"
+                yt_petscii_audio = subprocess.Popen(
+                    ["yt-dlp", "-f", "bestaudio/best", "-o", _prec_tmp_audio,
+                     "-q", "--no-playlist"] + _YTDLP_COOKIE_ARGS + [stream_url],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _rec_dst = _prec_tmp_video
+            petscii_recorder = start_petscii_recorder(
+                _rec_dst, WIDTH, 25,
+                audio_source=_prec_audio_src)
+            petscii_queue = queue.Queue(maxsize=10)
+            def _petscii_worker():
+                interval   = 1.0 / FPS
+                last_item  = None
+                next_write = time.monotonic()
+                while True:
+                    wait = next_write - time.monotonic()
+                    if wait > 0:
+                        try:
+                            item = petscii_queue.get(timeout=wait)
+                            if item is None:
+                                break
+                            last_item = item
+                            while True:
+                                try:
+                                    i2 = petscii_queue.get_nowait()
+                                    if i2 is None:
+                                        if last_item is not None:
+                                            sc, col = last_item
+                                            try:
+                                                petscii_recorder.stdin.write(
+                                                    _render_petscii_frame(sc, col, WIDTH, 25, block=_REC_BLOCK))
+                                            except Exception:
+                                                pass
+                                        return
+                                    last_item = i2
+                                except queue.Empty:
+                                    break
+                            continue
+                        except queue.Empty:
+                            pass
+                    if last_item is not None:
+                        sc, col = last_item
+                        try:
+                            petscii_recorder.stdin.write(
+                                _render_petscii_frame(sc, col, WIDTH, 25, block=_REC_BLOCK))
+                        except Exception:
+                            break
+                    next_write += interval
+                    if time.monotonic() > next_write + interval:
+                        next_write = time.monotonic()
+            petscii_thread = threading.Thread(target=_petscii_worker, daemon=True)
+            petscii_thread.start()
+
+        # --- Start processes ---
+        procs        = []
+        yt_vid_proc  = None
+        viz_ffmpeg_proc = None
+        yt_viz_proc  = None
+        audio_proc   = None
+        sid_fifo_proc = None
+        ra_led_proc   = None
+        ra_end_time   = None
+        ra_t0         = time.time()
+
+        def _start_video():
+            """The video's frames (no sound); called again each time the video loops."""
+            if is_url(filepath):
+                y, v = start_yt_video_frames(stream_url, height=cam_height)
+                return [y, v], v
+            v = start_ffmpeg_video_frames(filepath, height=cam_height)
+            return [v], v
+
+        if ra_path:
+            _vps, vid_proc = _start_video()
+            procs += _vps
+            if blend_viz_mode or LEDS:       # LEDs ride on the visualizer's ffmpeg
+                VIZ_MODE = blend_viz_mode or "showwaves"
+                if ra_sid:
+                    make_fifo(FIFO_PATH)
+                    viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(realtime=True, height=cam_height)
+                else:
+                    viz_ffmpeg_proc = start_ffmpeg_waveform_file(ra_path, height=cam_height)
+                procs.append(viz_ffmpeg_proc)
+                VIZ_MODE = "camera"
+            if ra_c64:
+                upload_sid_to_c64(ra_psid)    # the C64 starts playing here
+            ra_t0 = time.time()
+            if ra_sid and viz_ffmpeg_proc:
+                time.sleep(0.3)               # ffmpeg opens the FIFO before sidplayfp writes
+                sid_fifo_proc = start_sidplayfp_fifo(ra_path, ra_dur)
+                procs.append(sid_fifo_proc)
+            if ra_sid and not ra_c64:
+                audio_proc = start_sidplayfp_audio(ra_path, ra_dur)
+            elif not ra_sid:
+                audio_proc = start_ffplay_audio(ra_path)
+            if audio_proc is not None:
+                procs.append(audio_proc)
+            if ra_c64 and ra_dur:
+                ra_end_time = ra_t0 + ra_dur
+            if viz_ffmpeg_proc is not None and not blend_viz_mode:
+                ra_led_proc, viz_ffmpeg_proc = viz_ffmpeg_proc, None   # LEDs only: frames unused
+                def _drain(pr=ra_led_proc):
+                    try:
+                        while pr.stdout.read(65536): pass
+                    except Exception:
+                        pass
+                threading.Thread(target=_drain, daemon=True).start()
+        elif is_url(filepath):
+            yt_vid_proc, vid_proc = start_yt_video_frames(stream_url, height=cam_height)
+            procs += [yt_vid_proc, vid_proc]
+            yt_audio_proc, audio_proc = start_ffplay_stream(stream_url)
+            procs += [yt_audio_proc, audio_proc]
+        else:
+            vid_proc   = start_ffmpeg_video_frames(filepath, height=cam_height)
+            audio_proc = start_ffplay_video_audio(filepath)
+            procs += [vid_proc, audio_proc]
+
+        if blend_viz_mode and not ra_path:
+            VIZ_MODE = blend_viz_mode
+            if is_url(filepath):
+                yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(stream_url, height=cam_height)
+                procs += [yt_viz_proc, viz_ffmpeg_proc]
+            else:
+                viz_ffmpeg_proc = start_ffmpeg_waveform_file(filepath, height=cam_height)
+                procs.append(viz_ffmpeg_proc)
+            VIZ_MODE = "camera"
+
+        if args.save and is_url(filepath):
+            print(f"[*] Saving video to: {args.save}")
+            save_proc = subprocess.Popen(
+                ["yt-dlp", "-f", "bestvideo+bestaudio/best",
+                 "--merge-output-format", "mp4"]
+                + _YTDLP_COOKIE_ARGS + ["-o", args.save, stream_url],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            procs.append(save_proc)
+
+        # --- Background threads ---
+        last_viz_frame  = bytearray(viz_frame_size)
+        viz_lock        = threading.Lock()
+        viz_frame_count = [0]
+
+        if viz_ffmpeg_proc:
+            def _read_viz():
+                buf = bytearray()
+                while True:
+                    try:
+                        chunk = viz_ffmpeg_proc.stdout.read1(65536)
+                        if not chunk: break
+                        buf.extend(chunk)
+                        while len(buf) >= viz_frame_size:
+                            with viz_lock:
+                                last_viz_frame[:] = buf[:viz_frame_size]
+                                viz_frame_count[0] += 1
+                            del buf[:viz_frame_size]
+                    except Exception:
+                        break
+            threading.Thread(target=_read_viz, daemon=True).start()
+
+        latest_vid_frame = [None]
+        vid_frame_lock   = threading.Lock()
+
+        def _read_vid(vp):
+            buf = bytearray()
+            while True:
+                try:
+                    chunk = vp.stdout.read1(65536)
+                    if not chunk: break
+                    buf.extend(chunk)
+                    while len(buf) >= cam_frame_size:
+                        with vid_frame_lock:
+                            latest_vid_frame[0] = bytes(buf[:cam_frame_size])
+                        del buf[:cam_frame_size]
+                except Exception:
+                    break
+        threading.Thread(target=_read_vid, args=(vid_proc,), daemon=True).start()
+        vid_t0 = time.time()
+
+        # --- State + keypress ---
+        _blend_capable = blend_viz_mode is not None  # True if started with blend; never changes
+        VIZ_MODE = blend_viz_mode if blend_viz_mode else "none"  # sync for w-key cycling
+
+        state = {
+            "cam_color":     color_mode_init,
+            "viz_color":     viz_color_mode_init,
+            "color_pending": False,
+            "viz_pending":   None,
+            "quit":          False,
+        }
+        kthread = make_keypress_listener(state)
+        kthread.start()
+
+        frame_num = 0
+        blend_tag = f"+{blend_viz_mode}" if blend_viz_mode else ""
+        controls  = "[c] vid-color, [v] viz-color, [w/0-5] viz, [q] quit" if blend_viz_mode else "[c] color, [q] quit"
+        print(f"[*] Video{blend_tag} streaming to C64 at {FPS}fps\n    {controls}\n")
+
+        try:
+            while not state["quit"]:
+                if audio_proc is not None and audio_proc.poll() is not None:
+                    print("\r\n[*] Audio ended."); break
+                if ra_end_time is not None and time.time() >= ra_end_time:
+                    print("\r\n[*] Song ended."); break
+                if vid_proc.poll() is not None:
+                    if not ra_path:
+                        print("\r\n[*] Video ended."); break
+                    if time.time() - vid_t0 < 1.0:
+                        print("\r\n[!] Video stopped straight away, not looping it."); break
+                    # loop the video until the replacement audio ends
+                    _vps, vid_proc = _start_video()
+                    procs += _vps
+                    threading.Thread(target=_read_vid, args=(vid_proc,), daemon=True).start()
+                    vid_t0 = time.time()
+
+                if viz_ffmpeg_proc is not None and viz_ffmpeg_proc.poll() is not None:
+                    try:
+                        verr = viz_ffmpeg_proc.stderr.read(4096).decode(errors="replace").strip()
+                    except Exception:
+                        verr = ""
+                    print(f"\r\n[!] Viz ffmpeg exited.")
+                    if verr: print(f"[!] ffmpeg viz: {verr[:300]}")
+                    viz_ffmpeg_proc = None
+                    write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                    write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+
+                if state["color_pending"]:
+                    state["color_pending"] = False
+                    if not viz_ffmpeg_proc:
+                        write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                        write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+
+                if state["viz_pending"] is not None and _blend_capable:
+                    new_viz = state["viz_pending"]
+                    state["viz_pending"] = None
+                    _cur_blend = blend_viz_mode or "none"
+                    if new_viz != _cur_blend:
+                        sys.stdout.write(
+                            f"\r\n[*] Switching viz: {VIZ_LABELS.get(_cur_blend, _cur_blend)}"
+                            f" -> {VIZ_LABELS.get(new_viz, new_viz)}\r\n")
+                        sys.stdout.flush()
+
+                        if viz_ffmpeg_proc is not None:
+                            _old_viz = viz_ffmpeg_proc
+                            _kill_proc(_old_viz)
+                            try: _old_viz.stdout.close()
+                            except: pass
+                            time.sleep(0.1)  # let _read_viz thread see EOF and exit
+
+                        if new_viz == "none":
+                            if sid_fifo_proc is not None:
+                                _kill_proc(sid_fifo_proc)
+                                sid_fifo_proc = None
+                            viz_ffmpeg_proc = None
+                            blend_viz_mode  = None
+                            VIZ_MODE        = "none"
+                            write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                            write_mem(_cam_ext_col, _top_colors(state["cam_color"]))
+                        else:
+                            blend_viz_mode = new_viz
+                            VIZ_MODE = new_viz  # _build_viz_filter() reads this; stays set
+                            _viz_chars_def = {
+                                "showwaves":    CHARS_DEF,
+                                "showfreqs":    CHARS_FREQ_DEF,
+                                "avectorscope": CHARS_SCOPE_DEF,
+                                "showspectrum": CHARS_SPECTRUM_DEF,
+                            }.get(blend_viz_mode, CHARS_HIST_DEF)
+                            _viz_chars = [t[0] for t in _viz_chars_def]
+                            _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
+
+                            if ra_path and ra_sid:
+                                # new FIFO pipeline, the tune started where it is now
+                                _kill_proc(sid_fifo_proc)
+                                make_fifo(FIFO_PATH)
+                                viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(
+                                    realtime=True, height=cam_height)
+                                time.sleep(0.3)
+                                sid_fifo_proc = start_sidplayfp_fifo(
+                                    ra_path, ra_dur, start_secs=time.time() - ra_t0)
+                                procs.append(sid_fifo_proc)
+                            elif ra_path:
+                                viz_ffmpeg_proc = start_ffmpeg_waveform_file(
+                                    ra_path, height=cam_height, seek_secs=time.time() - ra_t0)
+                            elif is_url(filepath):
+                                _kill_proc(yt_viz_proc)
+                                yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(
+                                    stream_url, height=cam_height)
+                            else:
+                                viz_ffmpeg_proc = start_ffmpeg_waveform_file(
+                                    filepath, height=cam_height)
+
+                            write_byte(COLOR_FLAG, 5)  # re-enable per-pixel color mode
+                            threading.Thread(target=_read_viz, daemon=True).start()
+
+                            time.sleep(0.1)
+                            if viz_ffmpeg_proc.poll() is not None:
+                                try:
+                                    err = viz_ffmpeg_proc.stderr.read(512).decode(
+                                        errors="replace").strip()
+                                except Exception:
+                                    err = ""
+                                sys.stdout.write(
+                                    f"\r\n[!] New viz ffmpeg exited immediately: {err}\r\n")
+                                sys.stdout.flush()
+
+                with vid_frame_lock:
+                    raw = latest_vid_frame[0]
+                    latest_vid_frame[0] = None
+                if raw is None:
+                    time.sleep(0.010)
+                    continue
+
+                top_raw = raw[:cam_ext_rows * WIDTH]
+                bot_raw = raw[cam_ext_rows * WIDTH:]
+
+                if viz_ffmpeg_proc:
+                    with viz_lock:
+                        vz_top = last_viz_frame[:cam_ext_rows * WIDTH]
+                        vz_bot = last_viz_frame[cam_ext_rows * WIDTH:]
+                    blended_top = bytes(max(c, v) for c, v in zip(top_raw, vz_top))
+                    blended_bot = bytes(max(c, v) for c, v in zip(bot_raw, vz_bot))
+                    cam_cmode = state["cam_color"]
+                    viz_cmode = state["viz_color"]
+                    color_top = bytearray(cam_ext_rows * WIDTH)
+                    for i in range(cam_ext_rows * WIDTH):
+                        col_x = i % WIDTH
+                        cp, vp = top_raw[i], vz_top[i]
+                        if cp >= vp:
+                            color_top[i] = _pixel_color(cp, CHARS_CAMERA, cam_cmode, col_x,
+                                                        _cam_wlut, _cam_flut, RAINBOW_TAB)
+                        else:
+                            color_top[i] = _pixel_color(vp, _viz_chars, viz_cmode, col_x,
+                                                        _viz_wlut, _viz_flut, RAINBOW_TAB)
+                    color_bot = bytearray(HEIGHT * WIDTH)
+                    for i in range(HEIGHT * WIDTH):
+                        col_x = i % WIDTH
+                        cp, vp = bot_raw[i], vz_bot[i]
+                        if cp >= vp:
+                            color_bot[i] = _pixel_color(cp, CHARS_CAMERA, cam_cmode, col_x,
+                                                        _cam_wlut, _cam_flut, RAINBOW_TAB)
+                        else:
+                            color_bot[i] = _pixel_color(vp, _viz_chars, viz_cmode, col_x,
+                                                        _viz_wlut, _viz_flut, RAINBOW_TAB)
+                else:
+                    blended_top = top_raw
+                    blended_bot = bot_raw
+
+                bot_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended_bot)
+                write_mem(FRAME_BUF, bot_screen)
+                write_byte(FRAME_FLAG, 1)
+
+                top_screen = bytes(pixel_to_char(p, CHARS_CAMERA) for p in blended_top)
+                write_mem(_cam_ext_scr, top_screen)
+                if viz_ffmpeg_proc:
+                    write_mem(_cam_ext_col, color_top)
+                    write_mem(WAVE_COL_ADDR, color_bot)
+                else:
+                    write_mem(_cam_ext_col, _top_colors(state["cam_color"], top_screen))
+
+                if petscii_queue is not None:
+                    sc_top = top_screen
+                    sc_bot = bot_screen
+                    if viz_ffmpeg_proc:
+                        col_top = bytes(color_top)
+                        col_bot = bytes(color_bot)
+                    else:
+                        cmode = state["cam_color"]
+                        col_top = bytes(_screen_code_color(sc_top[i], cmode, i % WIDTH,
+                                        _cam_wlut, _cam_flut, RAINBOW_TAB) for i in range(len(sc_top)))
+                        col_bot = bytes(_screen_code_color(sc_bot[i], cmode, i % WIDTH,
+                                        _cam_wlut, _cam_flut, RAINBOW_TAB) for i in range(len(sc_bot)))
+                    _tlen = len(_prec_ticker_petscii)
+                    _tpos = int((time.time() - _prec_ticker_t0) * 50.0 / SCROLL_RATE) % _tlen
+                    ticker_sc  = bytes(_prec_ticker_petscii[(_tpos + i) % _tlen] for i in range(WIDTH))
+                    ticker_col = bytes([13] * WIDTH)
+                    all_sc  = bytes([0x20] * WIDTH) + ticker_sc  + sc_top  + sc_bot
+                    all_col = bytes([0]    * WIDTH) + ticker_col + col_top + col_bot
+                    try:
+                        petscii_queue.put_nowait((all_sc, all_col))
+                    except queue.Full:
+                        pass
+
+                frame_num += 1
+                if blend_viz_mode and viz_ffmpeg_proc:
+                    vid_ind = ["R","W","F"][state["cam_color"]]
+                    viz_ind = ["R","W","F"][state["viz_color"]]
+                    ind = f"vid:{vid_ind} viz:{viz_ind}"
+                else:
+                    ind = ["R","W","F"][state["cam_color"]]
+                vfc  = viz_frame_count[0] if viz_ffmpeg_proc else -1
+                vsuf = f" viz={vfc:05d}" if vfc >= 0 else ""
+                show_frame(frame_num, f"[*] Frame {frame_num:05d} [{ind}]{vsuf}")
+
+        except KeyboardInterrupt:
+            print("\r\n[*] Interrupted.")
+        finally:
+            state["quit"] = True
+            if petscii_queue is not None:
+                petscii_queue.put(None)
+                if petscii_thread is not None:
+                    petscii_thread.join(timeout=60)
+            if petscii_recorder is not None:
+                try:
+                    petscii_recorder.stdin.close()
+                    petscii_recorder.wait(timeout=120)
+                except Exception:
+                    try: petscii_recorder.kill()
+                    except Exception: pass
+            if _prec_tmp_video and _prec_tmp_audio and ra_sid:
+                print("\r\n[*] Rendering the SID for the recording...")
+                subprocess.run(["sidplayfp", f"-t{int(time.time() - ra_t0) + 1}",
+                                f"-w{_prec_tmp_audio}", ra_path],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            if _prec_tmp_video and _prec_tmp_audio:
+                if yt_petscii_audio is not None:
+                    try: yt_petscii_audio.wait(timeout=60)
+                    except Exception: pass
+                print("\r\n[*] Muxing PETSCII audio+video...")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", _prec_tmp_video, "-i", _prec_tmp_audio,
+                     "-c:v", "copy", "-c:a", "aac", "-shortest", args.save_petscii],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for _f in (_prec_tmp_video, _prec_tmp_audio):
+                    try: os.unlink(_f)
+                    except Exception: pass
+            elif yt_petscii_audio is not None:
+                try: yt_petscii_audio.terminate(); yt_petscii_audio.wait(timeout=3)
+                except Exception: pass
+            print("\r\n[*] PETSCII recording saved.")
+            _led_state["stop"] = True
+            if ra_c64:
+                write_byte(C64_AUDIO_FLAG, 0)   # IRQ stops calling the SID play routine
+                time.sleep(0.04)
+            write_mem(0xD400, [0] * 25)
+            write_byte(FRAME_FLAG, 0)
+            write_mem(FRAME_BUF,    [0x20] * (WIDTH * HEIGHT))
+            write_mem(_cam_ext_scr, [0x20] * (cam_ext_rows * WIDTH))
+            write_mem(_cam_ext_col, [0x00] * (cam_ext_rows * WIDTH))
+            write_mem(TICKER_ROW, [0x20] * 40)
+            def _stop(proc):
+                if proc is None: return
+                try:
+                    proc.terminate(); proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.wait()
+                except Exception:
+                    pass
+            _stop(vid_proc)
+            for p in procs: _stop(p)
             try: os.remove(FIFO_PATH)
             except: pass
             if "_term_fd" in state and "_term_old" in state:
@@ -1525,6 +4232,19 @@ def main():
             ans = input("Audio output? [m=local/sidplayfp (default), c=C64]: ").strip().lower()
             c64_audio = ans in ("c", "c64")
         print(f"[*] SID audio: {'C64 hardware (PSID player)' if c64_audio else 'local (sidplayfp)'}")
+
+    # C64U LEDs: asked for anything that isn't a .sid
+    if mode != "sid":
+        ans = input("Flash the C64U's LEDs with the music? [y/N]: ").strip().lower()
+        LEDS = ans in ("y", "yes")
+        if LEDS:
+            print("[*] LEDs: a silent fake SID at $D400 follows the music.")
+
+    # Background picture (--background / --bkgd): asked, converted and previewed before the C64 reboots
+    bkgd = bkgd_setup(args)
+    if bkgd and bkgd["type"] != "petscii" and mode == "sid" and c64_audio:
+        bkgd = bkgd_check_tune(bkgd, filepath)
+    bm = bkgd if (bkgd and bkgd["type"] != "petscii") else None
 
     # Get and display metadata
     if mode == "sid":
@@ -1632,6 +4352,8 @@ def main():
     _cflag_map = {0: 2, 1: 1, 2: 3}
     write_byte(COLOR_FLAG, _cflag_map[color_mode_init])
     send_ticker(ticker_str)
+    if LEDS:
+        write_mem(LED_SID, [0] * 0x19)   # SID silent (volume 0), all voices off
 
     # Rows 2-7: always extend the visualizer to fill the full screen.
     _EXT_ROWS    = 6
@@ -1639,9 +4361,20 @@ def main():
     _ext_scr     = 0x0450               # screen RAM rows 2-7
     _ext_col     = 0xD850               # color RAM rows 2-7
 
-    def _ext_top_colors(cmode):
-        col = [1, 2, 8][cmode]          # white / rainbow→red / fire→orange
-        return [col] * (_EXT_ROWS * WIDTH)
+    # Build per-character color LUTs for the extended rows (mirrors write_color_tables defs).
+    _ext_defs = {
+        "showwaves": CHARS_DEF, "showfreqs": CHARS_FREQ_DEF,
+        "avectorscope": CHARS_SCOPE_DEF, "showspectrum": CHARS_SPECTRUM_DEF,
+    }.get(VIZ_MODE, CHARS_HIST_DEF)
+    _ext_wlut, _ext_flut = _build_color_luts(_ext_defs)
+
+    def _ext_top_colors(cmode, screen=None):
+        if cmode == 0:
+            return bytes(RAINBOW_TAB[col] for _ in range(_EXT_ROWS) for col in range(WIDTH))
+        lut, default = (_ext_wlut, 1) if cmode == 1 else (_ext_flut, 8)
+        if screen is None:
+            return [default] * (_EXT_ROWS * WIDTH)
+        return bytes(lut.get(sc, default) for sc in screen)
 
     # Initialize rows 2-7 with spaces and set color RAM (3× for SRAM reliability)
     write_mem(_ext_scr, [0x20] * (_EXT_ROWS * WIDTH))
@@ -1649,7 +4382,27 @@ def main():
         write_mem(_ext_col, _ext_top_colors(color_mode_init))
         time.sleep(0.05)
 
+    # Background picture: rows 8-24 go to the PRG, rows 2-7 straight to the screen
+    if bm:
+        _DISP_HEIGHT = bm["layout"]["viz"][1]
+        VIZ_W        = bm["layout"]["viz"][3]
+        bkgd_upload_bitmap(bm)
+    elif bkgd:
+        print("[*] Uploading background picture ($C700/$CA00)...")
+        write_mem(BKGD_CHARS, bkgd["chars"][BKGD_TOP:])
+        write_mem(BKGD_COLS,  bkgd["cols"][BKGD_TOP:])
+        write_byte(BKGD_WCOL, bkgd["wavecol"])
+        write_mem(_ext_scr, bkgd["chars"][:BKGD_TOP])
+        for _ in range(3):
+            write_mem(_ext_col, bkgd["cols"][:BKGD_TOP])
+            time.sleep(0.05)
+        write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))   # an empty frame shows the picture at once
+        write_byte(BKGD_FLAG, 1)
+        write_byte(FRAME_FLAG, 1)
+
     # Start audio/waveform processes
+    sid_fifo_proc = None
+    yt_viz_proc   = None
     if mode == "sid":
         make_fifo(FIFO_PATH)
         if c64_audio:
@@ -1683,14 +4436,19 @@ def main():
         ffplay_proc = start_ffplay_audio(filepath)
         procs = [ffplay_proc, ffmpeg_proc]
 
-    frame_size   = WIDTH * _DISP_HEIGHT
-    sid_end_time = (time.time() + sid_duration_secs) if mode == "sid" and sid_duration_secs else None
-    state        = {"color_mode": color_mode_init, "color_pending": False, "quit": False}
-    kthread      = make_keypress_listener(state)
+    playback_start = time.time()
+
+    frame_size     = VIZ_W * _DISP_HEIGHT
+    sid_end_time   = (time.time() + sid_duration_secs) if mode == "sid" and sid_duration_secs else None
+    state          = {"cam_color": color_mode_init, "viz_color": 2,
+                      "color_pending": False, "viz_pending": None, "quit": False}
+    kthread        = make_keypress_listener(state)
     kthread.start()
 
+    frame_src = LatestFrame(ffmpeg_proc.stdout, frame_size)
+    t_first   = None
     frame_num = 0
-    print(f"[*] Streaming to C64 at {FPS}fps -- [c] color, [q] quit\n")
+    print(f"[*] Streaming to C64 at {FPS}fps -- [c] color, [w/0-5] viz (0=off), [q] quit\n")
 
     try:
         while not state["quit"]:
@@ -1705,24 +4463,122 @@ def main():
 
             if state["color_pending"]:
                 state["color_pending"] = False
-                write_byte(COLOR_FLAG, _cflag_map[state["color_mode"]])
-                write_mem(_ext_col, _ext_top_colors(state["color_mode"]))
+                write_byte(COLOR_FLAG, _cflag_map[state["cam_color"]])
+                if not bkgd:
+                    write_mem(_ext_col, _ext_top_colors(state["cam_color"]))
 
-            # Check if data available before blocking read (allows q to work)
-            ready, _, _ = _select.select([ffmpeg_proc.stdout], [], [], 0.5)
-            if not ready:
+            if state["viz_pending"] is not None:
+                new_viz = state["viz_pending"]
+                state["viz_pending"] = None
+                if new_viz != VIZ_MODE:
+                    sys.stdout.write(
+                        f"\r\n[*] Switching viz: {VIZ_LABELS.get(VIZ_MODE, VIZ_MODE)}"
+                        f" -> {VIZ_LABELS.get(new_viz, new_viz)}\r\n")
+                    sys.stdout.flush()
+
+                    _old_ffmpeg = ffmpeg_proc
+                    _kill_proc(_old_ffmpeg)
+                    if _old_ffmpeg is not None:
+                        try: _old_ffmpeg.stdout.close()
+                        except: pass
+
+                    VIZ_MODE = new_viz
+
+                    if new_viz == "none":
+                        if mode == "sid":
+                            _old_sid = sid_fifo_proc
+                            _kill_proc(_old_sid)
+                            sid_fifo_proc = None
+                            procs = [p for p in procs if p not in (_old_ffmpeg, _old_sid)]
+                        elif mode == "stream":
+                            _old_yt = yt_viz_proc
+                            _kill_proc(_old_yt)
+                            yt_viz_proc = None
+                            procs = [p for p in procs if p not in (_old_ffmpeg, _old_yt)]
+                        else:
+                            procs = [p for p in procs if p is not _old_ffmpeg]
+                        ffmpeg_proc = None
+                        if bm:
+                            write_mem(BM_FRAME, [0x20] * (VIZ_W * _DISP_HEIGHT))
+                        else:
+                            write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
+                            if bkgd:   # the picture shows again where the viz was
+                                write_mem(_ext_scr, bkgd["chars"][:BKGD_TOP])
+                                write_mem(_ext_col, bkgd["cols"][:BKGD_TOP])
+                            else:
+                                write_mem(_ext_scr,  [0x20] * (_EXT_ROWS * WIDTH))
+                        write_byte(FRAME_FLAG, 1)
+                    else:
+                        # Rebuild LUTs for the new mode
+                        _ext_defs = {
+                            "showwaves":    CHARS_DEF,
+                            "showfreqs":    CHARS_FREQ_DEF,
+                            "avectorscope": CHARS_SCOPE_DEF,
+                            "showspectrum": CHARS_SPECTRUM_DEF,
+                        }.get(VIZ_MODE, CHARS_HIST_DEF)
+                        _ext_wlut, _ext_flut = _build_color_luts(_ext_defs)
+
+                        if mode == "sid":
+                            _old_sid = sid_fifo_proc
+                            _kill_proc(_old_sid)
+                            make_fifo(FIFO_PATH)
+                            ffmpeg_proc   = start_ffmpeg_waveform_fifo(
+                                realtime=True, height=_DISP_HEIGHT)
+                            time.sleep(0.3)
+                            sid_fifo_proc = start_sidplayfp_fifo(filepath, sid_duration_secs)
+                            procs = [p for p in procs
+                                     if p not in (_old_ffmpeg, _old_sid)] + [ffmpeg_proc, sid_fifo_proc]
+                        elif mode == "stream":
+                            _old_yt = yt_viz_proc
+                            _kill_proc(_old_yt)
+                            yt_viz_proc, ffmpeg_proc = start_ffmpeg_waveform_stream(
+                                stream_url, height=_DISP_HEIGHT)
+                            procs = [p for p in procs
+                                     if p not in (_old_ffmpeg, _old_yt)] + [yt_viz_proc, ffmpeg_proc]
+                        else:
+                            _elapsed = time.time() - playback_start
+                            ffmpeg_proc = start_ffmpeg_waveform_file(
+                                filepath, height=_DISP_HEIGHT, seek_secs=_elapsed)
+                            procs = [p for p in procs if p is not _old_ffmpeg] + [ffmpeg_proc]
+
+                        frame_src = LatestFrame(ffmpeg_proc.stdout, frame_size)
+                        time.sleep(0.1)
+                        if ffmpeg_proc.poll() is not None:
+                            err = ffmpeg_proc.stderr.read(512).decode(errors="replace").strip()
+                            sys.stdout.write(f"\r\n[!] New ffmpeg exited immediately: {err}\r\n")
+                            sys.stdout.flush()
+
+            # Viz is off — idle until user switches back
+            if ffmpeg_proc is None:
+                time.sleep(0.05)
                 continue
 
-            # Blocking read — ffmpeg throttles to FPS naturally via FIFO or file rate
-            raw = ffmpeg_proc.stdout.read(frame_size)
-            if len(raw) < frame_size:
-                print("\r\n[*] Stream ended."); break
+            # The newest frame only: frames the C64 was too slow for are dropped, so the
+            # picture stays with the music (waits up to 0.5 s, which also lets q work)
+            raw = frame_src.get(0.5)
+            if raw is None:
+                if frame_src.eof:
+                    print("\r\n[*] Stream ended."); break
+                continue
+            if t_first is None:
+                t_first = time.time()
+            _el  = time.time() - t_first
+            fsuf = f"  {frame_num / _el:4.1f} fps sent, {frame_src.dropped} dropped" if _el > 1 else ""
+
+            if bm:
+                # bitmap background: the whole frame goes to $C700, the PRG draws it
+                write_mem(BM_FRAME, bkgd_viz_chars(raw, state["cam_color"], _DISP_HEIGHT))
+                write_byte(FRAME_FLAG, 1)
+                frame_num += 1
+                ind = ["R","W","F"][state["cam_color"]]
+                show_frame(frame_num, f"[*] Frame {frame_num:05d} [{ind}]{fsuf}")
+                continue
 
             top_raw = raw[:_EXT_ROWS * WIDTH]
             bot_raw = raw[_EXT_ROWS * WIDTH:]
 
             if VIZ_MODE == "showfreqs":
-                raw_grad = _apply_freq_gradient(raw, state["color_mode"], height=_DISP_HEIGHT)
+                raw_grad = _apply_freq_gradient(raw, state["cam_color"], height=_DISP_HEIGHT)
                 top_raw  = raw_grad[:_EXT_ROWS * WIDTH]
                 bot_raw  = raw_grad[_EXT_ROWS * WIDTH:]
                 top_screen = bytes(pixel_to_char(p, CHARS_FREQ) for p in top_raw)
@@ -1740,19 +4596,26 @@ def main():
                 top_screen = bytes(pixel_to_char(p) for p in top_raw)
                 bot_screen = bytes(pixel_to_char(p) for p in bot_raw)
 
-            write_mem(_ext_scr, top_screen)
-            write_mem(_ext_col, _ext_top_colors(state["color_mode"]))
+            if bkgd:
+                top_screen, top_cols = bkgd_top(bkgd, top_screen, _ext_top_colors(state["cam_color"])[0])
+                write_mem(_ext_scr, top_screen)
+                write_mem(_ext_col, top_cols)
+            else:
+                write_mem(_ext_scr, top_screen)
+                write_mem(_ext_col, _ext_top_colors(state["cam_color"], top_screen))
             write_mem(FRAME_BUF, bot_screen)
             write_byte(FRAME_FLAG, 1)
 
             frame_num += 1
-            ind = ["R","W","F"][state["color_mode"]]
-            print(f"\r[*] Frame {frame_num:05d} [{ind}]", end="", flush=True)
+            ind  = ["R","W","F"][state["cam_color"]]
+            vind = VIZ_LABELS.get(VIZ_MODE, VIZ_MODE)[:3].upper()
+            show_frame(frame_num, f"[*] Frame {frame_num:05d} [{ind}|{vind}]{fsuf}")
 
     except KeyboardInterrupt:
         print("\r\n[*] Interrupted.")
     finally:
         state["quit"] = True
+        _led_state["stop"] = True
         if c64_audio:
             print("\r\n[*] Stopping SID and returning C64 to BASIC...")
             # Step 1: clear c64_audio_flag so the IRQ stops calling the SID
@@ -1768,9 +4631,16 @@ def main():
         else:
             # Local/MP3 mode: silence any residual SID output on C64 display side
             write_mem(0xD400, [0] * 25)
+            if bm:
+                bkgd_halt(bm)            # raster split off, the picture stays
             write_byte(FRAME_FLAG, 0)
             write_mem(FRAME_BUF, [0x20] * (WIDTH * HEIGHT))
             write_mem(_ext_scr, [0x20] * (_EXT_ROWS * WIDTH))
+            if bkgd and not bm:
+                # leave the whole picture on the screen, without the last visualizer frame
+                write_mem(_ext_scr, bkgd["chars"][:BKGD_TOP])
+                write_mem(_ext_col, bkgd["cols"][:BKGD_TOP])
+                write_byte(FRAME_FLAG, 1)
             orig = u64_get("machine:readmem?address=F9&length=2")
             if orig and len(orig) == 2:
                 u64_put("machine:writemem", {"address": "314",
@@ -1790,4 +4660,13 @@ def main():
         print("[*] Done.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        emit("exit", code=0)
+    except SystemExit as e:
+        emit("exit", code=e.code if isinstance(e.code, int) else (0 if e.code is None else 1))
+        raise
+    except BaseException as e:
+        emit("error", message=f"{type(e).__name__}: {e}")
+        emit("exit", code=1)
+        raise

@@ -4,7 +4,7 @@ sidviz_u64.py -- SID/audio waveform + live camera visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 Camera mode: streams webcam footage as PETSCII character art on the C64 screen.
 
-version 1.9.8 (2026-11-18)
+version 1.9.9 (2026-11-18)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -33,7 +33,7 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.9.8"
+VERSION = "1.9.9"
 BUILD   = "2026-11-18"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
@@ -287,6 +287,17 @@ def parse_args():
     p.add_argument("--bkgd-palette",   type=str.lower, choices=["palette", "colodore", "pepto", "deekay"], help="Background: which C64 palette to match")
     p.add_argument("--bkgd-wavecolor", choices=["mode", "picture"], help="Visualizer colours over the picture: the colour mode, or the picture's colours")
     p.add_argument("--version",  action="store_true",    help="Show version and exit")
+    p.add_argument("--save-reu",     metavar="FILE.reu",
+                   help="Save a video (file or link) as a Koalavideo REU: real C64 pictures with sampled sound")
+    p.add_argument("--play-reu",     action="store_true",
+                   help="Send a Koalavideo .reu to the Ultimate's REU and play it (after --save-reu, or a .reu file)")
+    p.add_argument("--reu-shape",    type=int, choices=[1, 2, 3, 4], help="REU video: 1=16:10 2=16:9 3=4:3 4=2.35:1")
+    p.add_argument("--reu-speed",    type=int, choices=[2, 3, 4, 5, 6, 7, 8],
+                   help="REU video: C64 frames a picture (4 = 12.5 fps; 2 = 25 fps, 2.35:1 only)")
+    p.add_argument("--reu-sound",    choices=["6581", "8580", "ua", "none"], help="REU video: SID model, Ultimate Audio, or none")
+    p.add_argument("--reu-dither",   choices=["bayer", "none", "diffusion"], help="REU video: dithering")
+    p.add_argument("--reu-viz",      choices=["showwaves", "showfreqs", "avectorscope", "showspectrum", "ahistogram"],
+                   help="REU video: blend an audio visualizer into the picture")
     p.add_argument("--save-d64",     metavar="FILE.d64",
                    help="Save SID + pre-rendered frames to a bootable D64 disk image")
     p.add_argument("--d64-fps",      type=int, default=10,
@@ -750,6 +761,216 @@ def send_ticker(ticker_str):
     print(f"[*] Ticker: {length} chars")
     write_mem(TICKER_BUF, petscii)
     write_byte(TICKER_LEN, length)
+
+# ---------------------------------------------------------------------------
+# Koalavideo REUs (--save-reu / --play-reu): a video as real C64 pictures with sampled sound,
+# for daddlerTL's Koalavideo v06 player (koalavideo.prg, next to sidviz). See koalavideo.py.
+# ---------------------------------------------------------------------------
+
+import tempfile
+
+KV_PLAYER   = "koalavideo.prg"
+REU_MBOX    = 0x02A7          # reuload.asm's mailbox: command, REU address (3), length (2)
+REU_BUFFER  = 0x2000
+REU_BLOCK   = 0x8000
+# reuload.asm, assembled (64tass -a -B): copies blocks from $2000 into the REU, then starts the player
+REULOAD_PRG = bytes([0x01, 0x08, 0x0B, 0x08, 0xEA, 0x07, 0x9E, 0x32, 0x30, 0x36, 0x31, 0x00, 0x00, 0x00, 0xA2, 0x64, 0xBD, 0x1B, 0x08, 0x9D, 0x40, 0x03, 0xCA, 0x10, 0xF7, 0x4C, 0x40, 0x03, 0x78, 0xA9, 0x00, 0x8D, 0xA7, 0x02, 0x8D, 0x20, 0xD0, 0xAD, 0xA7, 0x02, 0xF0, 0xFB, 0xC9, 0x03, 0xF0, 0x47, 0xA9, 0x00, 0x8D, 0x02, 0xDF, 0xA9, 0x20, 0x8D, 0x03, 0xDF, 0xAD, 0xA8, 0x02, 0x8D, 0x04, 0xDF, 0xAD, 0xA9, 0x02, 0x8D, 0x05, 0xDF, 0xAD, 0xAA, 0x02, 0x8D, 0x06, 0xDF, 0xAD, 0xAB, 0x02, 0x8D, 0x07, 0xDF, 0xAD, 0xAC, 0x02, 0x8D, 0x08, 0xDF, 0xA9, 0x00, 0x8D, 0x0A, 0xDF, 0xAD, 0xA7, 0x02, 0xC9, 0x02, 0xF0, 0x04, 0xA9, 0x90, 0xD0, 0x02, 0xA9, 0x91, 0x8D, 0x01, 0xDF, 0xEE, 0x20, 0xD0, 0xA9, 0x00, 0x8D, 0xA7, 0x02, 0xF0, 0xB0, 0xA9, 0x00, 0x8D, 0xA7, 0x02, 0x58, 0x20, 0x0E, 0x08, 0x4C, 0x7B, 0xE3])
+
+def u64_post_mem(addr, data):
+    """machine:writemem with the data as a binary attachment (one request for a whole block)."""
+    req = urllib.request.Request(f"{U64}/v1/machine:writemem?address={addr:X}", data=bytes(data),
+                                 method="POST", headers={"Content-Type": "application/octet-stream"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status == 200
+    except Exception as e:
+        print(f"\n[!] POST writemem failed: {e}")
+        return False
+
+def _reu_wait():
+    """Until the loader has taken the command (its mailbox goes back to 0)."""
+    for _ in range(200):
+        r = u64_get(f"machine:readmem?address={REU_MBOX:X}&length=1")
+        if r and r[0] == 0:
+            return True
+        time.sleep(0.02)
+    return False
+
+def _reu_check(addr, expect):
+    """Read REU bytes back through the loader and compare (no REU, or a smaller one, fails)."""
+    write_mem(REU_BUFFER, [0] * len(expect))
+    write_mem(REU_MBOX, [2, addr & 255, addr >> 8 & 255, addr >> 16 & 255, len(expect), 0])
+    if not _reu_wait():
+        return False
+    return u64_get(f"machine:readmem?address={REU_BUFFER:X}&length={len(expect)}") == bytes(expect)
+
+def send_reu(path):
+    """Put a Koalavideo .reu into the Ultimate's REU and start the player (no reset in between)."""
+    player = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), KV_PLAYER)
+    if not os.path.isfile(player):
+        print(f"[!] {KV_PLAYER} (daddlerTL's Koalavideo player) not found at {player}"); return False
+    data = open(path, "rb").read().rstrip(b"\0")          # only the part in use
+    if not data.startswith(b"KOALAVIDEO06REU"):
+        print(f"[!] {path} is not a Koalavideo REU"); return False
+    if not smoke_test():
+        return False
+    print("[*] Rebooting C64...")
+    u64_put("machine:reboot")
+    time.sleep(4.0)
+    tmp = os.path.join(tempfile.gettempdir(), "sidviz-reuload.prg")
+    open(tmp, "wb").write(REULOAD_PRG)
+    if not ftp_upload(tmp, "sidviz-reuload.prg") or not run_prg_from_temp("sidviz-reuload.prg"):
+        print("[!] Could not start the REU loader"); return False
+    time.sleep(1.5)
+    post_ok = True
+    t0 = time.time()
+    for i, a in enumerate(range(0, len(data), REU_BLOCK)):
+        block = data[a:a + REU_BLOCK]
+        if post_ok:
+            post_ok = u64_post_mem(REU_BUFFER, block)
+            if not post_ok:
+                print("[!] Falling back to small writes (much slower)")
+        if not post_ok:
+            write_mem(REU_BUFFER, block)
+        n = len(block)
+        write_mem(REU_MBOX, [1, a & 255, a >> 8 & 255, a >> 16 & 255, n & 255, n >> 8 & 255])
+        if not _reu_wait():
+            print("\n[!] The REU loader stopped answering"); return False
+        if i == 0 and not _reu_check(0, data[:16]):
+            print("\n[!] No REU answered. Turn on the REU at 16 MB in the Ultimate's C64 and cartridge")
+            print("    settings (and Ultimate Audio, for an Ultimate Audio video), then try again.")
+            return False
+        done = a + n
+        rate = done / max(0.001, time.time() - t0) / 1024
+        print(f"\r[*] Sending to the REU: {done // 1024} / {len(data) // 1024} KB  ({rate:.0f} KB/s)", end="", flush=True)
+    last = (len(data) - 1) // REU_BLOCK * REU_BLOCK
+    if not _reu_check(last, data[last:last + 16]):
+        print("\n[!] The end of the video didn't stick: is the REU set to 16 MB?"); return False
+    print("\n[*] REU loaded. Starting daddlerTL's Koalavideo player...")
+    prg = open(player, "rb").read()
+    if post_ok:
+        u64_post_mem(prg[0] | prg[1] << 8, prg[2:])
+    else:
+        write_mem(prg[0] | prg[1] << 8, prg[2:])
+    write_byte(REU_MBOX, 3)
+    return True
+
+def _reu_ask(prompt, options, default, flag=None):
+    if flag is not None:
+        return flag
+    ans = input(prompt).strip()
+    return options.get(ans, default)
+
+def save_reu(args):
+    """--save-reu: a video file or link (with --replace-audio, a visualizer blended in) as a Koalavideo REU."""
+    import koalavideo as kv
+    tmpdir = tempfile.mkdtemp(prefix="sidviz_reu_")
+    try:
+        if args.yt_search:
+            cands = youtube_search(args.yt_search.strip(), args.yt_max)
+            src = choose_youtube_result(cands) if cands else None
+            if not src:
+                print("[*] Nothing chosen."); return False
+        else:
+            src = os.path.expanduser(args.file) if args.file else \
+                  os.path.expanduser(input("Video file or URL: ").strip())
+        if is_url(src):
+            print("[*] Downloading the video (yt-dlp)...")
+            dst = os.path.join(tmpdir, "video.mp4")
+            subprocess.run(["yt-dlp", "-q", "--no-playlist", "-f", "bv*[height<=480]+ba/b[height<=480]/b",
+                            "--merge-output-format", "mp4", "-o", dst] + _YTDLP_COOKIE_ARGS + [src])
+            if not os.path.isfile(dst):
+                print("[!] Download failed"); return False
+            src = dst
+        if not os.path.isfile(src):
+            print(f"[!] File not found: {src}"); return False
+        vlen = kv.duration(src) or 0
+
+        # replacement audio: the same choice as video mode
+        ra = args.replace_audio if args.replace_audio is not None else \
+             input("Replace the video's audio? [.sid/.mp3 file, Enter=keep]: ").strip()
+        ra = os.path.expanduser(ra) if ra else None
+        audio, seconds = src, vlen
+        if ra:
+            if not os.path.isfile(ra):
+                print(f"[!] File not found: {ra}"); return False
+            if os.path.splitext(ra)[1].lower() in SID_EXTS:
+                raw = get_sid_info(ra).get("Song Length", "")
+                try:
+                    p = raw.split(".")[0].split(":"); seconds = int(p[0]) * 60 + int(p[1])
+                except Exception:
+                    seconds = vlen or 180
+                audio = os.path.join(tmpdir, "sid.wav")
+                print(f"[*] Rendering the SID ({seconds} s)...")
+                subprocess.run(["sidplayfp", f"-t{int(seconds) + 1}", f"-w{audio}", ra],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                audio, seconds = ra, kv.duration(ra) or vlen
+            print(f"[*] Audio: {os.path.basename(ra)}  (the video loops until it ends)")
+        has_sound = kv.has_audio(audio)
+
+        shape = _reu_ask("Picture shape? [1=16:10 full screen, 2=16:9, 3=4:3, 4=2.35:1] (default 2): ",
+                         {"1": 1, "2": 2, "3": 3, "4": 4}, 2, args.reu_shape)
+        speeds = [s for s in kv.SPEEDS if s != 2 or shape == 4]
+        speed = _reu_ask("Speed? [" + ", ".join(f"{s}={kv.SPEEDS[s]}" for s in speeds) + "] (default 4): ",
+                         {str(s): s for s in speeds}, 4, args.reu_speed)
+        if speed == 2 and shape != 4:
+            print("[!] 25 fps is for 2.35:1 only; using 16.7 fps"); speed = 3
+        model = "none"
+        if has_sound:
+            model = _reu_ask("Sound? [0=SID 6581, 1=SID 8580, 2=Ultimate Audio, 3=none] (default 0): ",
+                             {"0": "6581", "1": "8580", "2": "ua", "3": "none"}, "6581", args.reu_sound)
+        else:
+            print("[*] No sound in the source: a silent video.")
+        pal = _reu_ask("Palette? [0=PALette, 1=Colodore, 2=Pepto, 3=DeeKay] (default 0): ",
+                       {"0": "palette", "1": "colodore", "2": "pepto", "3": "deekay"}, "palette", args.bkgd_palette)
+        dither = _reu_ask("Dither? [0=ordered (Bayer), 1=none, 2=error diffusion] (default 0): ",
+                          {"0": "bayer", "1": "none", "2": "diffusion"}, "bayer", args.reu_dither)
+        viz = None
+        if has_sound:
+            viz = _reu_ask("Blend an audio visualizer into the picture? [0=none, 1=waveform, 2=spectrum, "
+                           "3=scope, 4=spectrogram, 5=histogram] (default 0): ",
+                           {"1": "showwaves", "2": "showfreqs", "3": "avectorscope", "4": "showspectrum",
+                            "5": "ahistogram"}, None, args.reu_viz)
+
+        fps = 50 / speed
+        sound_on = model != "none"
+        nmax = kv.max_pictures(shape, fps, sound_on)
+        if not seconds:
+            print("[!] Can't tell how long the video is"); return False
+        n = min(int(seconds * fps), nmax)
+        if n < int(seconds * fps):
+            print(f"[*] 16 MB holds {nmax / fps:.0f} s at this shape and speed: the first {n / fps:.0f} s go in")
+        secs = n / fps
+        print(f"[*] Koalavideo: {kv.SHAPES[shape][0]}, {kv.SPEEDS[speed]}, sound {model}, "
+              f"{n} pictures ({secs:.1f} s)")
+        klas, t0 = [], time.time()
+        for k in kv.frames(src, shape, fps, secs, BKGD_PALETTES[pal], dither, viz, audio, loop=bool(ra)):
+            klas.append(k)
+            if len(klas) % 25 == 0 or len(klas) == n:
+                print(f"\r[*] Pictures: {len(klas)} / {n}", end="", flush=True)
+            if len(klas) >= n:
+                break
+        print(f"   ({time.time() - t0:.0f} s)")
+        if not klas:
+            print("[!] ffmpeg gave no pictures"); return False
+        samples = kv.sound(audio, len(klas) / fps) if sound_on else None
+        reu, used = kv.build(klas, shape, speed, samples, model)
+        out = os.path.expanduser(args.save_reu)
+        open(out, "wb").write(reu)
+        print(f"[*] Saved {out}  ({used // 1024} KB of 16 MB used)")
+        print("[*] On the Ultimate: REU on at 16 MB, load the .reu into it, then run koalavideo.prg")
+        if model == "ua":
+            print("[*] Ultimate Audio sound: turn on Ultimate Audio in the Ultimate's settings")
+        if args.play_reu or input("Send it to the Ultimate and play it now? [y/N]: ").strip().lower() in ("y", "yes"):
+            return send_reu(out)
+        return True
+    finally:
+        for f in os.listdir(tmpdir):
+            try: os.remove(os.path.join(tmpdir, f))
+            except OSError: pass
+        try: os.rmdir(tmpdir)
+        except OSError: pass
 
 # ---------------------------------------------------------------------------
 # Audio mode detection
@@ -2342,6 +2563,16 @@ def main():
     if args.version:
         print(f"sidviz_u64  v{VERSION}  build {BUILD}")
         sys.exit(0)
+
+    if args.save_reu or args.play_reu:
+        U64 = f"http://{args.ip}"
+        if args.save_reu:
+            ok = save_reu(args)
+        elif args.file and args.file.lower().endswith(".reu"):
+            ok = send_reu(os.path.expanduser(args.file))
+        else:
+            print("[!] --play-reu needs a .reu file (or use it with --save-reu)"); ok = False
+        sys.exit(0 if ok else 1)
 
     if args.save_d64:
         if not args.file:

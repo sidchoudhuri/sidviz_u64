@@ -4,7 +4,7 @@ Real-time waveform visualizer for the Commodore 64, driven by a Mac or Linux mac
 
 ```
 +------------------------------------------------------+
-|  sidviz_u64  v1.9.8  build 2026-11-18                |
+|  sidviz_u64  v1.9.9  build 2026-11-18                |
 +------------------------------------------------------+
 |  File: Commando.sid                                  |
 |  Title        Commando                               |
@@ -355,6 +355,33 @@ Metadata is converted to PETSCII and scrolled across row 1 of the C64 screen. Fi
 |---|---|
 | SID | Title · Author · Released · Song Speed · Song Length · Format · Addresses |
 | Audio / Streaming | Title · Artist · Album · Date · Genre · Duration · Bitrate · Format |
+
+---
+
+## Koalavideo REU videos
+
+`--save-reu FILE.reu` turns a video (a file, a link, or `--yt-search`) into a Koalavideo REU:
+real C64 Koala pictures with sampled sound, for daddlerTL's Koalavideo v06 player. It asks for
+the shape (16:10, 16:9, 4:3, 2.35:1), the speed (6.25 to 25 fps), the sound (SID 6581/8580
+through the Mahoney table, Ultimate Audio, or none), the palette, the dithering and an optional
+blended audio visualizer, and takes `--replace-audio` (a .sid or audio file; the video loops
+until it ends). A 16 MB REU holds about 2 min 20 s at 16:9 and 12.5 fps with sound.
+
+`--play-reu` sends it to the Ultimate and starts the player (after `--save-reu`, or with a .reu
+file). The REU must be on at 16 MB in the Ultimate's C64 and cartridge settings (and Ultimate
+Audio, for an Ultimate Audio video). sidviz starts a small loader (`reuload.asm`), copies the
+video into the REU through the REST API, then starts the player.
+
+```bash
+python3 sidviz_c64.py clip.mp4 --save-reu clip.reu --replace-audio tune.sid --play-reu
+python3 sidviz_c64.py clip.reu --play-reu
+```
+
+**Credits.** Koalavideo (the format and `koalavideo.prg`, the player) is by **daddlerTL**,
+2022-2026, freeware and open source; as he asks, his name stays with it. The Mahoney sample
+tables are from his BREADAMP REUmaker. `koalavideo.prg` is his program, included unchanged and
+not covered by this repository's GPL; `koalavideo.py` writes the REU as his Koalavideo v06
+REUmaker does.
 
 ---
 

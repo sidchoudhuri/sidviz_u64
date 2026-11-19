@@ -4,7 +4,7 @@ sidviz_u64.py -- SID/audio waveform + live camera visualizer -> C64 via U64 API
 Experimental fork: plays SID audio on real C64 hardware via PSID player.
 Camera mode: streams webcam footage as PETSCII character art on the C64 screen.
 
-version 1.9.7 (2026-11-18)
+version 1.9.8 (2026-11-18)
 
 Memory protocol:
   $C000     = frame flag  (Python writes 1, ASM clears to 0)
@@ -33,7 +33,7 @@ Usage:
   2. Run: python3 sidviz_u64.py [file]
 """
 
-VERSION = "1.9.7"
+VERSION = "1.9.8"
 BUILD   = "2026-11-18"
 
 import os, sys, time, subprocess, urllib.request, urllib.parse
@@ -265,6 +265,9 @@ def parse_args():
     p.add_argument("--showspectrum",  action="store_true", help="Force scrolling spectrogram visualization")
     p.add_argument("--ahistogram",    action="store_true", help="Force amplitude histogram visualization")
     p.add_argument("--video",         action="store_true", help="Video file/URL mode: display as PETSCII art on C64")
+    p.add_argument("--replace-audio", metavar="FILE",
+                   help="Video mode: play this .sid or audio file instead of the video's sound "
+                        "(the video loops until it ends)")
     p.add_argument("--camera",        action="store_true", help="Live camera mode: stream webcam as PETSCII art on C64")
     p.add_argument("--camera-device", default="0",         metavar="DEV",
                    help="Camera device: index (0,1,…) or path (/dev/video0). Default: 0")
@@ -947,10 +950,12 @@ def start_ffplay_video_audio(filepath):
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("[*] ffplay video audio started."); return p
 
-def start_sidplayfp_fifo(filepath, duration_secs=None):
+def start_sidplayfp_fifo(filepath, duration_secs=None, start_secs=0):
     cmd = ["sidplayfp"]
     if duration_secs:
         cmd += [f"-t{duration_secs}"]
+    if start_secs >= 1:
+        cmd += [f"-b{int(start_secs)}"]
     cmd += [f"-w{FIFO_PATH}", filepath]
     print(f"[*] sidplayfp FIFO cmd: {' '.join(cmd)}")
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -3199,6 +3204,44 @@ def main():
 
         stream_url = filepath
 
+        # --- Replacement audio (--replace-audio): a .sid or any audio file ffmpeg plays ---
+        ra_path = args.replace_audio if args.replace_audio is not None else \
+                  input("Replace the video's audio? [.sid/.mp3 file, Enter=keep]: ").strip()
+        ra_path = os.path.expanduser(ra_path) if ra_path else None
+        ra_sid, ra_c64, ra_psid, ra_dur = False, False, None, None
+        if ra_path:
+            if not os.path.isfile(ra_path):
+                print(f"[!] File not found: {ra_path}"); sys.exit(1)
+            ra_sid = detect_mode(ra_path) == "sid"
+            if ra_sid:
+                if args.c64audio:   ra_c64 = True
+                elif args.macaudio: ra_c64 = False
+                else:
+                    ans = input("Audio output? [m=local/sidplayfp (default), c=C64]: ").strip().lower()
+                    ra_c64 = ans in ("c", "c64")
+                print(f"[*] SID audio: {'C64 hardware (PSID player)' if ra_c64 else 'local (sidplayfp)'}")
+                if ra_c64:
+                    ra_psid = parse_psid(ra_path)
+                    if not ra_psid:
+                        print("[!] PSID parse failed, falling back to local audio")
+                        ra_c64 = False
+                if ra_c64:
+                    _ow = _psid_row_overlap(ra_path)
+                    if _ow:
+                        print(f"\n[!] WARNING: SID binary {_ow}.")
+                        print("[!] The video will still write rows 2-7, but those rows may show")
+                        print("[!] SID driver bytes rendered as PETSCII artifacts.")
+                        if input("Continue anyway? [y/N]: ").strip().lower() != "y":
+                            print("[*] Aborted."); sys.exit(0)
+            else:
+                # C64U LEDs: asked for anything that isn't a .sid
+                ans = input("Flash the C64U's LEDs with the music? [y/N]: ").strip().lower()
+                LEDS = ans in ("y", "yes")
+                if LEDS:
+                    print("[*] LEDs: a silent fake SID at $D400 follows the music.")
+            print(f"[*] Video audio replaced by: {os.path.basename(ra_path)}  (the video loops until it ends)")
+        ra_kind = "sid" if ra_sid else "audio"
+
         # --- Color mode ---
         if args.color:      color_mode_init = 0
         elif args.no_color: color_mode_init = 1
@@ -3255,7 +3298,17 @@ def main():
 
         # --- Metadata and ticker ---
         info = {}
-        if is_url(filepath):
+        if ra_path:
+            info = get_sid_info(ra_path) if ra_sid else get_audio_info(ra_path)
+            raw_len = info.get("Song Length", "") if ra_sid else ""
+            if raw_len:
+                try:
+                    parts = raw_len.split(".")[0].split(":")
+                    ra_dur = int(parts[0]) * 60 + int(parts[1])
+                    print(f"[*] SID duration: {raw_len} = {ra_dur}s")
+                except Exception:
+                    pass
+        elif is_url(filepath):
             info = get_stream_info(filepath) or {}
             if not info and _yt_chosen:
                 info = {
@@ -3265,8 +3318,8 @@ def main():
                 }
         else:
             info = get_audio_info(filepath)
-        show_info_header(info, "audio", filepath)
-        ticker_str = build_ticker_string(info, "audio")
+        show_info_header(info, ra_kind, ra_path or filepath)
+        ticker_str = build_ticker_string(info, ra_kind)
         if not ticker_str.strip("* "):
             ticker_str = f"{src_label}   *   SIDVIZ U64 V{VERSION}        "
 
@@ -3279,9 +3332,20 @@ def main():
         if not ftp_upload(PRG_LOCAL, PRG_REMOTE): sys.exit(1)
         print(f"[*] Running {PRG_REMOTE}...")
         if not run_prg_from_temp(PRG_REMOTE): sys.exit(1)
+        if ra_c64:
+            print("[*] Signalling C64 audio mode to PRG ($C002=1)...")
+            write_byte(C64_AUDIO_FLAG, 1)
 
         time.sleep(1.0)
         write_color_tables()
+        if ra_c64:
+            if ra_psid.get("clock") == 2:     # NTSC-only: 60Hz
+                write_mem(0xDC04, [0x95, 0x42])
+            else:                             # PAL / unknown / both: 50Hz
+                write_mem(0xDC04, [0xF8, 0x4C])
+            write_byte(0xDC0E, 0x11)
+        if LEDS:
+            write_mem(LED_SID, [0] * 0x19)    # SID silent (volume 0), all voices off
 
         _cflag_map = {0: 2, 1: 1, 2: 3}
         if blend_viz_mode:
@@ -3328,7 +3392,15 @@ def main():
             _prec_ticker_petscii = bytes(ascii_to_petscii(ticker_str))[:253] or b'\x20'
             _prec_ticker_t0 = time.time()
             _prec_audio_src = None
-            if not is_url(filepath):
+            if ra_path and ra_sid:
+                # the SID is rendered for exactly the time played, then muxed in at the end
+                _prec_tmp_video = args.save_petscii + ".video.tmp.mp4"
+                _prec_tmp_audio = args.save_petscii + ".sid.tmp.wav"
+                _rec_dst = _prec_tmp_video
+            elif ra_path:
+                _prec_audio_src = ra_path
+                _rec_dst = args.save_petscii
+            elif not is_url(filepath):
                 _prec_audio_src = filepath
                 _rec_dst = args.save_petscii
             else:
@@ -3392,8 +3464,55 @@ def main():
         viz_ffmpeg_proc = None
         yt_viz_proc  = None
         audio_proc   = None
+        sid_fifo_proc = None
+        ra_led_proc   = None
+        ra_end_time   = None
+        ra_t0         = time.time()
 
-        if is_url(filepath):
+        def _start_video():
+            """The video's frames (no sound); called again each time the video loops."""
+            if is_url(filepath):
+                y, v = start_yt_video_frames(stream_url, height=cam_height)
+                return [y, v], v
+            v = start_ffmpeg_video_frames(filepath, height=cam_height)
+            return [v], v
+
+        if ra_path:
+            _vps, vid_proc = _start_video()
+            procs += _vps
+            if blend_viz_mode or LEDS:       # LEDs ride on the visualizer's ffmpeg
+                VIZ_MODE = blend_viz_mode or "showwaves"
+                if ra_sid:
+                    make_fifo(FIFO_PATH)
+                    viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(realtime=True, height=cam_height)
+                else:
+                    viz_ffmpeg_proc = start_ffmpeg_waveform_file(ra_path, height=cam_height)
+                procs.append(viz_ffmpeg_proc)
+                VIZ_MODE = "camera"
+            if ra_c64:
+                upload_sid_to_c64(ra_psid)    # the C64 starts playing here
+            ra_t0 = time.time()
+            if ra_sid and viz_ffmpeg_proc:
+                time.sleep(0.3)               # ffmpeg opens the FIFO before sidplayfp writes
+                sid_fifo_proc = start_sidplayfp_fifo(ra_path, ra_dur)
+                procs.append(sid_fifo_proc)
+            if ra_sid and not ra_c64:
+                audio_proc = start_sidplayfp_audio(ra_path, ra_dur)
+            elif not ra_sid:
+                audio_proc = start_ffplay_audio(ra_path)
+            if audio_proc is not None:
+                procs.append(audio_proc)
+            if ra_c64 and ra_dur:
+                ra_end_time = ra_t0 + ra_dur
+            if viz_ffmpeg_proc is not None and not blend_viz_mode:
+                ra_led_proc, viz_ffmpeg_proc = viz_ffmpeg_proc, None   # LEDs only: frames unused
+                def _drain(pr=ra_led_proc):
+                    try:
+                        while pr.stdout.read(65536): pass
+                    except Exception:
+                        pass
+                threading.Thread(target=_drain, daemon=True).start()
+        elif is_url(filepath):
             yt_vid_proc, vid_proc = start_yt_video_frames(stream_url, height=cam_height)
             procs += [yt_vid_proc, vid_proc]
             yt_audio_proc, audio_proc = start_ffplay_stream(stream_url)
@@ -3403,7 +3522,7 @@ def main():
             audio_proc = start_ffplay_video_audio(filepath)
             procs += [vid_proc, audio_proc]
 
-        if blend_viz_mode:
+        if blend_viz_mode and not ra_path:
             VIZ_MODE = blend_viz_mode
             if is_url(filepath):
                 yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(stream_url, height=cam_height)
@@ -3447,11 +3566,11 @@ def main():
         latest_vid_frame = [None]
         vid_frame_lock   = threading.Lock()
 
-        def _read_vid():
+        def _read_vid(vp):
             buf = bytearray()
             while True:
                 try:
-                    chunk = vid_proc.stdout.read1(65536)
+                    chunk = vp.stdout.read1(65536)
                     if not chunk: break
                     buf.extend(chunk)
                     while len(buf) >= cam_frame_size:
@@ -3460,7 +3579,8 @@ def main():
                         del buf[:cam_frame_size]
                 except Exception:
                     break
-        threading.Thread(target=_read_vid, daemon=True).start()
+        threading.Thread(target=_read_vid, args=(vid_proc,), daemon=True).start()
+        vid_t0 = time.time()
 
         # --- State + keypress ---
         _blend_capable = blend_viz_mode is not None  # True if started with blend; never changes
@@ -3485,8 +3605,18 @@ def main():
             while not state["quit"]:
                 if audio_proc is not None and audio_proc.poll() is not None:
                     print("\r\n[*] Audio ended."); break
+                if ra_end_time is not None and time.time() >= ra_end_time:
+                    print("\r\n[*] Song ended."); break
                 if vid_proc.poll() is not None:
-                    print("\r\n[*] Video ended."); break
+                    if not ra_path:
+                        print("\r\n[*] Video ended."); break
+                    if time.time() - vid_t0 < 1.0:
+                        print("\r\n[!] Video stopped straight away, not looping it."); break
+                    # loop the video until the replacement audio ends
+                    _vps, vid_proc = _start_video()
+                    procs += _vps
+                    threading.Thread(target=_read_vid, args=(vid_proc,), daemon=True).start()
+                    vid_t0 = time.time()
 
                 if viz_ffmpeg_proc is not None and viz_ffmpeg_proc.poll() is not None:
                     try:
@@ -3523,6 +3653,9 @@ def main():
                             time.sleep(0.1)  # let _read_viz thread see EOF and exit
 
                         if new_viz == "none":
+                            if sid_fifo_proc is not None:
+                                _kill_proc(sid_fifo_proc)
+                                sid_fifo_proc = None
                             viz_ffmpeg_proc = None
                             blend_viz_mode  = None
                             VIZ_MODE        = "none"
@@ -3540,7 +3673,20 @@ def main():
                             _viz_chars = [t[0] for t in _viz_chars_def]
                             _viz_wlut, _viz_flut = _build_color_luts(_viz_chars_def)
 
-                            if is_url(filepath):
+                            if ra_path and ra_sid:
+                                # new FIFO pipeline, the tune started where it is now
+                                _kill_proc(sid_fifo_proc)
+                                make_fifo(FIFO_PATH)
+                                viz_ffmpeg_proc = start_ffmpeg_waveform_fifo(
+                                    realtime=True, height=cam_height)
+                                time.sleep(0.3)
+                                sid_fifo_proc = start_sidplayfp_fifo(
+                                    ra_path, ra_dur, start_secs=time.time() - ra_t0)
+                                procs.append(sid_fifo_proc)
+                            elif ra_path:
+                                viz_ffmpeg_proc = start_ffmpeg_waveform_file(
+                                    ra_path, height=cam_height, seek_secs=time.time() - ra_t0)
+                            elif is_url(filepath):
                                 _kill_proc(yt_viz_proc)
                                 yt_viz_proc, viz_ffmpeg_proc = start_ffmpeg_waveform_stream(
                                     stream_url, height=cam_height)
@@ -3665,6 +3811,12 @@ def main():
                 except Exception:
                     try: petscii_recorder.kill()
                     except Exception: pass
+            if _prec_tmp_video and _prec_tmp_audio and ra_sid:
+                print("\r\n[*] Rendering the SID for the recording...")
+                subprocess.run(["sidplayfp", f"-t{int(time.time() - ra_t0) + 1}",
+                                f"-w{_prec_tmp_audio}", ra_path],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
             if _prec_tmp_video and _prec_tmp_audio:
                 if yt_petscii_audio is not None:
                     try: yt_petscii_audio.wait(timeout=60)
@@ -3681,6 +3833,10 @@ def main():
                 try: yt_petscii_audio.terminate(); yt_petscii_audio.wait(timeout=3)
                 except Exception: pass
             print("\r\n[*] PETSCII recording saved.")
+            _led_state["stop"] = True
+            if ra_c64:
+                write_byte(C64_AUDIO_FLAG, 0)   # IRQ stops calling the SID play routine
+                time.sleep(0.04)
             write_mem(0xD400, [0] * 25)
             write_byte(FRAME_FLAG, 0)
             write_mem(FRAME_BUF,    [0x20] * (WIDTH * HEIGHT))

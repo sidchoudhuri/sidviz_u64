@@ -2,7 +2,7 @@
 ; 64tass assembler
 ; autostart SYS 2064
 ;
-; version 1.9.7 (2026-11-18)
+; version 1.9.8 (2026-11-18)
 ;
 ; Single PRG handles all modes via $C002 flag:
 ;   $C002 = $00  Mac/MP3 mode   — no SID player, normal display

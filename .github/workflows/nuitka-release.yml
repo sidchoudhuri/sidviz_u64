@@ -44,4 +44,5 @@ jobs:
           files: |
             build/*
             sidviz.prg
+            sidviz_d64.prg
           
